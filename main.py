@@ -56,11 +56,11 @@ def normalize(data: np.ndarray, filename) -> np.ndarray:
         min, max = 0, 90
     if 'change' in filename.lower():
         min, max = -2, 2
-    # TODO: Frane che valori hanno?
+    if 'frane' in filename.lower():
+        min, max = 0, 8
 
-    # Eliminazione valori sotto soglia con il valore minimo
-    invalid_mask = (np.isnan(data)) | (
-        np.isinf(data)) | (data < min) | (data > max)
+    # Eliminazione valori inf e nan
+    invalid_mask = (np.isnan(data)) | (np.isinf(data))
     data[invalid_mask] = np.nan
     print(f"Number of invalid values (NaN or Inf): {np.sum(invalid_mask)}")
 
