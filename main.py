@@ -39,6 +39,7 @@ def plot_histogram(data: np.ndarray, title='Histogram') -> Figure:
 
 
 def normalize(data: np.ndarray, filename) -> np.ndarray:
+    """Normalizza i dati in un array numpy in base al tipo di immagine."""
     if len(data.shape) < 2:
         raise ValueError("Data must be at least 2D array.")
 
@@ -47,29 +48,26 @@ def normalize(data: np.ndarray, filename) -> np.ndarray:
             f"{filename} is already in uint8 format, skipping normalization.")
         return data
 
-    print(f"data shape: {data.shape}, dtype: {data.dtype}")
-
-    min, max = 0, 10000
+    min_val, max_val = 0, 10000
     if 'ndvi' in filename.lower():
-        min, max = -1, 1
-    if 'slope' in filename.lower():
-        min, max = 0, 90
-    if 'change' in filename.lower():
-        min, max = -2, 2
-    if 'frane' in filename.lower():
-        min, max = 0, 8
+        min_val, max_val = -1, 1
+    elif 'slope' in filename.lower():
+        min_val, max_val = 0, 90
+    elif 'change' in filename.lower():
+        min_val, max_val = -2, 2
+    elif 'frane' in filename.lower():
+        min_val, max_val = 0, 8
 
-    # Eliminazione valori inf e nan
-    invalid_mask = (np.isnan(data)) | (np.isinf(data))
-    data[invalid_mask] = np.nan
-    print(f"Number of invalid values (NaN or Inf): {np.sum(invalid_mask)}")
+    # Creiamo una maschera per i valori validi
+    mask = np.isfinite(data) & (data >= min_val) & (data <= max_val * 1.5)
 
-    # Clippiamo i dati per evitare valori fuori range
-    data = np.clip(data, min, max)
+    # Clippiamo i dati per rimuovere i valori fuori range
+    data[~mask] = np.nan
+    data[mask] = np.clip(data[mask], min_val, max_val)
 
     # Normalizziamo i dati
-    data = (data - min) / (max - min)
-    print(f"Normalizing {filename} with range: {min} - {max}")
+    print(f"Normalizing with range: {min_val} - {max_val}")
+    data[mask] = (data[mask] - min_val) / (max_val - min_val)
 
     return data
 
@@ -78,7 +76,7 @@ def get_colormap(filename: str) -> str:
     """Determina la colormap da usare in base al nome del file."""
     if 'slope' in filename.lower():
         return 'gray_r'
-    elif 'ndvi' in filename.lower():
+    elif any(keyword in filename.lower() for keyword in ['ndvi', 'frane']):
         return 'viridis'
     else:
         return 'gray'
