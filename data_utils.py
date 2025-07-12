@@ -3,7 +3,7 @@
 from enum import Enum
 import os
 import numpy as np
-from typing import Literal
+from typing import Literal, Tuple
 
 import rasterio
 
@@ -93,3 +93,33 @@ def generate_dataset_mask(comune: ComuneType) -> np.ndarray:
     src.close()
 
     return mask
+
+
+def get_random_patch(data: np.ndarray, patch_size: int, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Estrae un patch casuale di dimensioni patch_size x patch_size da un array 2D. Altezza e larghezza sono gli ultimi due assi dell'array."""
+    assert patch_size > 0, "Patch size must be positive."
+    assert len(mask.shape) == 2, "Mask must be a 2D array."
+    assert len(data.shape) >= 2, "Data must be at least a 2D array."
+    assert data.shape[-2:] == mask.shape, "Data and mask must have the same spatial dimensions."
+    assert min(
+        data.shape[-2:]) >= patch_size, "Data must be larger than patch size."
+
+    height, width = data.shape[-2:]
+    max_y = height - patch_size
+    max_x = width - patch_size
+
+    start_y = np.random.randint(0, max_y + 1)
+    start_x = np.random.randint(0, max_x + 1)
+
+    end_y = start_y + patch_size
+    end_x = start_x + patch_size
+
+    patch = data[..., start_y:end_y, start_x:end_x]
+    patch_mask = mask[start_y:end_y, start_x:end_x]
+
+    # Se il patch non ha almeno l'80% di area valida, lo scartiamo
+    if patch_mask.sum() < ((patch_size ** 2) * 0.8):
+        # Troviamo un nuovo patch
+        return get_random_patch(data, patch_size, mask)
+
+    return patch, patch_mask
