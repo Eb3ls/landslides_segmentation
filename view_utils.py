@@ -8,7 +8,7 @@ import napari
 import numpy as np
 import rasterio
 
-from data_utils import normalize, print_info
+from data_utils import get_normalized_data, print_info
 
 
 def save_to_napari(fig: Figure, viewer: napari.Viewer,  name="") -> None:
@@ -61,42 +61,32 @@ def view_dataset(viewer: napari.Viewer, directory: str) -> None:
     for filename in os.listdir(directory):
         path = os.path.join(directory, filename)
 
-        with rasterio.open(path) as src:
+        src = rasterio.open(path)
 
-            print_info(src)
-            data = src.read()
+        print_info(src)
 
-            # Impostiamo il tipo comune a float32
-            if data.dtype != np.float32:
-                data = data.astype(np.float32)
+        data = get_normalized_data(src)
 
-            # Impostiamo a NaN i valori di nodata
-            if src.nodata is not None:
-                data[data == src.nodata] = np.nan
+        # Se immagine RGB + NIR separiamo
+        if len(data.shape) == 3 and data.shape[0] == 4:
+            rgb_image = data[:3, :, :]
+            rgb_image = rgb_image.transpose(1, 2, 0)
 
-            # Normalizziamo i dati
-            data_norm = normalize(data, filename)
+            nir_image = data[3, :, :]
 
-            # Se immagine RGB + NIR separiamo
-            if len(data_norm.shape) == 3 and data_norm.shape[0] == 4:
-                rgb_image = data_norm[:3, :, :]
-                rgb_image = rgb_image.transpose(1, 2, 0)
+            # Aggiungiamo l'immagine RGB e il suo istogramma a napari
+            add_image_and_histogram(
+                viewer, rgb_image, filename, ty=' RGB')
 
-                nir_image = data_norm[3, :, :]
+            # Aggiungiamo l'immagine NIR e il suo istogramma a napari
+            add_image_and_histogram(
+                viewer, nir_image, filename, ty=' NIR')
 
-                # Aggiungiamo l'immagine RGB e il suo istogramma a napari
-                add_image_and_histogram(
-                    viewer, rgb_image, filename, ty=' RGB')
+        else:
+            # Aggiungiamo l'immagine a napari
+            add_image_and_histogram(viewer, data, filename)
 
-                # Aggiungiamo l'immagine NIR e il suo istogramma a napari
-                add_image_and_histogram(
-                    viewer, nir_image, filename, ty=' NIR')
-
-            else:
-                # Aggiungiamo l'immagine a napari
-                add_image_and_histogram(viewer, data_norm, filename)
-
-            src.close()
+        src.close()
 
     # Nascondiamo tutte le immagini inizialmente
     for layer in viewer.layers:
