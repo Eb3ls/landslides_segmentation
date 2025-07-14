@@ -148,18 +148,26 @@ def get_super_resolution_stack(
 
 
 def get_random_patch(
-    data: np.ndarray, patch_size: int, mask: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Estrae un patch casuale di dimensioni patch_size x patch_size da un array 2D. Altezza e larghezza sono gli ultimi due assi dell'array."""
+    data: Tuple[np.ndarray, np.ndarray], patch_size: int, mask: np.ndarray
+) -> Tuple[Tuple[np.ndarray, np.ndarray], np.ndarray]:
+    """
+    Estrae la stessa patch casuale di dimensioni patch_size x patch_size da due stack.
+    Altezza e larghezza sono gli ultimi due assi dell'array.
+    """
+
+    first, second = data
+    assert (
+        first.shape == second.shape
+    ), "Sentinel and drone data must have the same shape."
     assert patch_size > 0, "Patch size must be positive."
     assert len(mask.shape) == 2, "Mask must be a 2D array."
-    assert len(data.shape) >= 2, "Data must be at least a 2D array."
+    assert len(first.shape) >= 2, "Data must be at least a 2D array."
     assert (
-        data.shape[-2:] == mask.shape
+        first.shape[-2:] == mask.shape
     ), "Data and mask must have the same spatial dimensions."
-    assert min(data.shape[-2:]) >= patch_size, "Data must be larger than patch size."
+    assert min(first.shape[-2:]) >= patch_size, "Data must be larger than patch size."
 
-    height, width = data.shape[-2:]
+    height, width = first.shape[-2:]
     max_y = height - patch_size
     max_x = width - patch_size
 
@@ -169,7 +177,8 @@ def get_random_patch(
     end_y = start_y + patch_size
     end_x = start_x + patch_size
 
-    patch = data[..., start_y:end_y, start_x:end_x]
+    first_patch = first[..., start_y:end_y, start_x:end_x]
+    second_patch = second[..., start_y:end_y, start_x:end_x]
     patch_mask = mask[start_y:end_y, start_x:end_x]
 
     # Se il patch non ha almeno l'80% di area valida, lo scartiamo
@@ -177,4 +186,4 @@ def get_random_patch(
         # Troviamo un nuovo patch
         return get_random_patch(data, patch_size, mask)
 
-    return patch, patch_mask
+    return (first_patch, second_patch), patch_mask
