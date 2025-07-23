@@ -9,7 +9,7 @@ ComuneType = Literal["Brisighella", "Casola-Valsenio", "Modigliana", "Predappio"
 MAIN_DIR = "Comuni"
 
 
-def normalize(data: np.ndarray, filename) -> np.ndarray:
+def normalize(data: np.ndarray, filename: str = "") -> np.ndarray:
     """Normalizza i dati in un array numpy in base al tipo di immagine."""
 
     assert len(data.shape) >= 2, "Data must be at least 2D array."
@@ -100,7 +100,6 @@ def get_super_resolution_stack(
 
     for filename in os.listdir(directory):
         # Saltiamo i file non rilevanti
-        # TODO: L'NDVI é da prendere da copernicus
         if any(
             substr in filename.lower()
             for substr in ["change", "frane", "slope", "ndvi"]

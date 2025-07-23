@@ -15,8 +15,6 @@ def main():
     view_dataset(viewer, directory)
     napari.run()
 
-    get_super_resolution_stack("Casola-Valsenio")
-
 
 if __name__ == "__main__":
     main()

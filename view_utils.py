@@ -60,6 +60,7 @@ def add_image_and_histogram(
     save_to_napari(fig, viewer, name=f"{filename + ty} Histogram")
 
 
+# TODO: Spostare nel main del file apposito e riorganizzare meglio tutte le funzioni
 def view_dataset(viewer: napari.Viewer, directory: str) -> None:
     """Visualizza tutti i file tiff in una directory con napari. Per ognuno di essi, crea un'immagine e il suo istogramma."""
     for filename in os.listdir(directory):
