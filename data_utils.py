@@ -20,6 +20,8 @@ def normalize(data: np.ndarray, filename: str = "") -> np.ndarray:
         min_val, max_val = -2, 2
     elif "ndvi" in filename.lower():
         min_val, max_val = -1, 1
+    elif "cgr" in filename.lower() or "agea" in filename.lower():
+        min_val, max_val = 0, 255
     elif "slope" in filename.lower():
         min_val, max_val = 0, 90
     elif "frane" in filename.lower():
@@ -50,7 +52,7 @@ def print_info(dataset) -> None:
     print(f"----- \n")
 
 
-def get_normalized_data(src) -> np.ndarray:
+def get_data(src, to_norm: bool) -> np.ndarray:
     """Legge e normalizza i dati da un file raster."""
     data = src.read()
 
@@ -62,10 +64,10 @@ def get_normalized_data(src) -> np.ndarray:
     if src.nodata is not None:
         data[data == src.nodata] = np.nan
 
-    # Normalizziamo i dati
-    data_norm = normalize(data, src.name)
+    if to_norm:
+        data = normalize(data, src.name)
 
-    return data_norm
+    return data
 
 
 def generate_dataset_mask(comune: ComuneType) -> np.ndarray:
@@ -109,7 +111,7 @@ def get_super_resolution_stack(
         path = os.path.join(directory, filename)
 
         with rasterio.open(path) as src:
-            data = get_normalized_data(src)
+            data = get_data(src, True)
 
             # Otteniamo i canali come liste di array 2D
             bands = list(data)

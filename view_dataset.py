@@ -1,18 +1,33 @@
 import os
 import napari
-from data_utils import get_super_resolution_stack
-from view_utils import view_dataset
+import rasterio
+from data_utils import (
+    get_data,
+    print_info,
+)
+from view_utils import view_data
 
 
 def main():
-    directory = "Comuni/Casola-Valsenio"
+    directory = "Comuni/"
 
     if not os.path.exists(directory):
-        print("Directory 'Brisighella' does not exist. Please check the path.")
+        print("Directory does not exist.")
         exit()
 
     viewer = napari.Viewer()
-    view_dataset(viewer, directory)
+    for comune in os.listdir(directory):
+        for filename in os.listdir(directory + comune):
+            path = os.path.join(directory + comune, filename)
+
+            with rasterio.open(path) as src:
+                print_info(src)
+                data = get_data(src, True)
+                view_data(data, path, viewer)
+
+    # Nascondiamo tutte le immagini inizialmente
+    for layer in viewer.layers:
+        layer.visible = False
     napari.run()
 
 

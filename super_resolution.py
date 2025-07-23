@@ -1,4 +1,3 @@
-import os
 import random
 import napari
 import torch
@@ -15,7 +14,6 @@ from data_utils import (
     get_super_resolution_stack,
     get_random_patch,
     generate_dataset_mask,
-    normalize,
 )
 
 
@@ -257,9 +255,9 @@ def visualize_results(
             low_rgb = low_res_np[:3, :, :]  # RGB
             high_rgb = high_res_np[:3, :, :]  # RGB
             pred_rgb = pred_np[:3, :, :]  # RGB
-            low_rgb = low_rgb.transpose(1, 2, 0)  # (H, W, C)
-            high_rgb = high_rgb.transpose(1, 2, 0)  # (
-            pred_rgb = pred_rgb.transpose(1, 2, 0)  # (H, W, C)
+            low_rgb = low_rgb.transpose(1, 2, 0)
+            high_rgb = high_rgb.transpose(1, 2, 0)
+            pred_rgb = pred_rgb.transpose(1, 2, 0)
 
             low_nir = low_res_np[3:, :, :]  # NIR
             high_nir = high_res_np[3:, :, :]  # NIR
@@ -294,9 +292,9 @@ def main():
 
     # Parametri di configurazione
     train_comune = "Predappio"
-    eval_comune = "Brisighella"
+    eval_comune = "Predappio"
 
-    patch_size = 256
+    patch_size = 128
     num_patches = 500
     batch_size = 16
     num_epochs = 10
@@ -332,9 +330,10 @@ def main():
             worker_init_fn=seed_workers,
             # Velocizziamo il caricamento dei dati su GPU se disponibile
             pin_memory=True if device.type == "cuda" else False,
+            persistent_workers=True,
         )
 
-        # Creazione
+        # Creazione del modello
         print("Creating model...")
         model = UNet(n_channels=n_channels_in, n_classes=n_channels_out).to(device)
 
