@@ -17,111 +17,109 @@ from data_utils import (
 )
 
 
-class DoubleConv(nn.Module):
-    """Blocco di doppia convoluzione utilizzato in U-Net."""
+class RCAB(nn.Module):
+    """Residual Channel Attention Block"""
 
-    def __init__(self, in_channels: int, out_channels: int):
-        super(DoubleConv, self).__init__()
-        self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.double_conv(x)
-
-
-class Down(nn.Module):
-    """Downscaling con maxpool seguita da doppia convoluzione."""
-
-    def __init__(self, in_channels: int, out_channels: int):
-        super(Down, self).__init__()
-        self.maxpool_conv = nn.Sequential(
-            nn.MaxPool2d(2), DoubleConv(in_channels, out_channels)
-        )
+    def __init__(self, n_channels: int, reduction: int = 16):
+        super(RCAB, self).__init__()
+        self.conv1 = nn.Conv2d(n_channels, n_channels, kernel_size=3, padding=1)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(n_channels, n_channels, kernel_size=3, padding=1)
+        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv3 = nn.Conv2d(n_channels, n_channels // reduction, kernel_size=1)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.conv4 = nn.Conv2d(n_channels // reduction, n_channels, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.maxpool_conv(x)
+        residual = x
+
+        # Primo blocco
+        out = self.conv1(x)
+        out = self.relu1(out)
+        out = self.conv2(out)
+
+        # Channel attention
+        attention = self.global_avg_pool(out)
+        attention = self.conv3(attention)
+        attention = self.relu2(attention)
+        attention = self.conv4(attention)
+        attention = self.sigmoid(attention)
+
+        # Applichiamo il peso
+        out = out * attention
+
+        # Residual connection
+        out = out + residual
+
+        return out
 
 
-class Up(nn.Module):
-    """Upscaling seguita da doppia convoluzione."""
+class ResidualGroup(nn.Module):
+    """Gruppo di blocchi Residual Channel Attention Block"""
 
-    def __init__(self, in_channels: int, out_channels: int, bilinear: bool = True):
-        super(Up, self).__init__()
-
-        if bilinear:
-            self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-        else:
-            self.up = nn.ConvTranspose2d(
-                in_channels, in_channels // 2, kernel_size=2, stride=2
-            )
-
-        self.conv = DoubleConv(in_channels, out_channels)
-
-    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        x1 = self.up(x1)
-
-        # Input is CHW
-        diffY = x2.size()[2] - x1.size()[2]
-        diffX = x2.size()[3] - x1.size()[3]
-
-        x1 = nn.functional.pad(
-            x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2]
+    def __init__(self, n_channels: int, reduction: int = 16, n_blocks: int = 4):
+        super(ResidualGroup, self).__init__()
+        self.blocks = nn.Sequential(
+            *[RCAB(n_channels, reduction) for _ in range(n_blocks)]
         )
-
-        x = torch.cat([x2, x1], dim=1)
-        return self.conv(x)
-
-
-class OutConv(nn.Module):
-    """Layer di convoluzione di output."""
-
-    def __init__(self, in_channels: int, out_channels: int):
-        super(OutConv, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        self.conv = nn.Conv2d(n_channels, n_channels, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
+        residual = x
+        out = self.blocks(x)
+        out = self.conv(out)
+        # Residual connection
+        out = out + residual
+        return out
 
 
-class UNet(nn.Module):
-    """Modello U-Net per super risoluzione."""
+class RCAN(nn.Module):
+    """Residual Channel Attention Network"""
 
-    def __init__(self, n_channels: int, n_classes: int, bilinear: bool = True):
-        super(UNet, self).__init__()
+    def __init__(
+        self,
+        in_channels: int,
+        n_channels: int,
+        reduction: int = 16,
+        n_groups: int = 10,
+        scale: int = 5,
+    ):
+        super(RCAN, self).__init__()
+        self.in_channels = in_channels
         self.n_channels = n_channels
-        self.n_classes = n_classes
-        self.bilinear = bilinear
+        self.reduction = reduction
 
-        self.inc = DoubleConv(n_channels, 64)
-        self.down1 = Down(64, 128)
-        self.down2 = Down(128, 256)
-        self.down3 = Down(256, 512)
-        factor = 2 if bilinear else 1
-        self.down4 = Down(512, 1024 // factor)
-        self.up1 = Up(1024, 512 // factor, bilinear)
-        self.up2 = Up(512, 256 // factor, bilinear)
-        self.up3 = Up(256, 128 // factor, bilinear)
-        self.up4 = Up(128, 64, bilinear)
-        self.outc = OutConv(64, n_classes)
+        self.conv1 = nn.Conv2d(in_channels, n_channels, kernel_size=3, padding=1)
+        self.groups = nn.ModuleList(
+            [ResidualGroup(n_channels, reduction) for _ in range(n_groups)]
+        )
+        self.conv2 = nn.Conv2d(n_channels, n_channels, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(
+            n_channels, n_channels * (scale**2), kernel_size=3, padding=1
+        )
+        self.pixel_shuffle = nn.PixelShuffle(scale)
+        self.conv4 = nn.Conv2d(n_channels, in_channels, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
-        logits = self.outc(x)
-        return logits
+
+        # Feature extraction
+        out = self.conv1(x)
+        feat = out
+
+        # RIR (Residual In Residual)
+        for group in self.groups:
+            out = group(out)
+        out = self.conv2(out)
+
+        # Residual connection
+        out = out + feat
+
+        out = self.conv3(out)
+        out = self.pixel_shuffle(out)
+        out = self.conv4(out)
+
+        return out
 
 
 # TODO: Usare dataset di piú comuni
@@ -149,7 +147,7 @@ class SuperResolutionDataset(Dataset):
     def __getitem__(self, _) -> Tuple[torch.Tensor, torch.Tensor]:
 
         (low_res_patch, high_res_patch), _ = get_random_patch(
-            self.stack_post, self.patch_size, self.mask
+            self.stack_post, self.patch_size * 5, self.mask
         )
 
         # Convertiamo a tensori e assicuriamo il formato corretto
@@ -159,6 +157,14 @@ class SuperResolutionDataset(Dataset):
         # Settiamo i valori NaN a 0
         low_res_tensor = torch.nan_to_num(low_res_tensor, nan=0.0)
         high_res_tensor = torch.nan_to_num(high_res_tensor, nan=0.0)
+
+        low_res_tensor = torch.nn.functional.interpolate(
+            # Necessario aggiungere una dimensione batch
+            low_res_tensor.unsqueeze(0),
+            scale_factor=0.2,
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
 
         return low_res_tensor, high_res_tensor
 
@@ -180,7 +186,7 @@ def train_model(
         epoch_loss = 0.0
 
         with tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}") as pbar:
-            for batch_idx, (low_res, high_res) in enumerate(pbar):
+            for _, (low_res, high_res) in enumerate(pbar):
                 low_res = low_res.to(device)
                 high_res = high_res.to(device)
 
@@ -290,13 +296,16 @@ def seed_workers(worker_id: int) -> None:
 def main():
     """Funzione principale per addestrare e valutare il modello di super risoluzione."""
 
+    # Puliamo la memoria CUDA
+    torch.cuda.empty_cache()
+
     # Parametri di configurazione
     train_comune = "Predappio"
     eval_comune = "Predappio"
 
     patch_size = 128
-    num_patches = 500
-    batch_size = 16
+    num_patches = 1000
+    batch_size = 8
     num_epochs = 10
 
     # Dispositivo
@@ -335,7 +344,13 @@ def main():
 
         # Creazione del modello
         print("Creating model...")
-        model = UNet(n_channels=n_channels_in, n_classes=n_channels_out).to(device)
+        model = RCAN(
+            in_channels=n_channels_in,
+            n_channels=64,
+            scale=5,
+            reduction=16,
+            n_groups=3,
+        ).to(device)
 
         # Loss and optimizer con miglioramenti
         criterion = nn.MSELoss()
