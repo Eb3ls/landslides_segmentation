@@ -2,30 +2,20 @@ import os
 import numpy as np
 from typing import Literal, Tuple
 import rasterio
+from torch import Tensor, norm
+import torch
 
 
 ComuneType = Literal["Brisighella", "Casola-Valsenio", "Modigliana", "Predappio"]
 
-MAIN_DIR = "Comuni"
+MAIN_DIR = "Comuni/"
 
 
-def normalize(data: np.ndarray, filename: str = "") -> np.ndarray:
+def normalize(data: np.ndarray, min_val: float, max_val: float) -> np.ndarray:
     """Normalizza i dati in un array numpy in base al tipo di immagine."""
 
     assert len(data.shape) >= 2, "Data must be at least 2D array."
     assert data.dtype == np.float32, "Data must be of type float32."
-
-    min_val, max_val = 0, 10000
-    if "change" in filename.lower():
-        min_val, max_val = -2, 2
-    elif "ndvi" in filename.lower():
-        min_val, max_val = -1, 1
-    elif "cgr" in filename.lower() or "agea" in filename.lower():
-        min_val, max_val = 0, 255
-    elif "slope" in filename.lower():
-        min_val, max_val = 0, 90
-    elif "frane" in filename.lower():
-        min_val, max_val = 0, 8
 
     # Creiamo una maschera per i valori validi
     mask = ~np.isnan(data)
@@ -65,13 +55,27 @@ def get_data(src, to_norm: bool) -> np.ndarray:
         data[data == src.nodata] = np.nan
 
     if to_norm:
-        data = normalize(data, src.name)
+        name = src.name.lower()
+        if "change" in name:
+            return normalize(data, -2, 2)
+        elif "ndvi" in name:
+            return normalize(data, -1, 1)
+        elif "slope" in name:
+            return normalize(data, 0, 90)
+        elif "frane" in name:
+            return normalize(data, 0, 8)
+        elif "cgr" in name or "agea" in name:
+            assert data.shape[0] == 4, "Cgr and Agea data must have 4 bands."
+            return normalize(data, 0, 255)
+        else:
+            assert data.shape[0] == 4, "Satellite data must have 4 bands."
+            return normalize(data, 0, 10000)
 
     return data
 
 
 def generate_dataset_mask(comune: ComuneType) -> np.ndarray:
-    """Dato un comune prende l'immagine Cgr e ritorna una maschera 0-1 per indicarne l'area valida."""
+    """Dato un comune prende l'immagine Cgr e ritorna una maschera 2D per indicarne l'area valida."""
 
     directory = os.path.join(MAIN_DIR, comune)
     assert os.path.exists(directory), f"Directory '{directory}' does not exist."
@@ -80,6 +84,7 @@ def generate_dataset_mask(comune: ComuneType) -> np.ndarray:
     assert os.path.exists(file_path), f"File '{file_path}' does not exist."
 
     with rasterio.open(file_path) as src:
+        # Leggiamo il quarto canale (NIR) per la maschera
         data = src.read(4)
         mask = data != src.nodata
 
@@ -188,3 +193,66 @@ def get_random_patch(
         return get_random_patch(data, patch_size, mask)
 
     return (first_patch, second_patch), patch_mask
+
+
+def augment_data(
+    in_data: Tensor,
+    out_data: Tensor,
+    prob: float = 0.5,
+) -> Tuple[Tensor, Tensor]:
+
+    # Maschera per i valori validi
+    valid_mask = ~torch.isnan(in_data)
+    in_data = torch.nan_to_num(in_data, nan=0.0)
+
+    # Flip orizzontale
+    if np.random.rand() < prob:
+        in_data = torch.flip(in_data, dims=[2])
+        out_data = torch.flip(out_data, dims=[2])
+
+    # Flip verticale
+    if np.random.rand() < prob:
+        in_data = torch.flip(in_data, dims=[1])
+        out_data = torch.flip(out_data, dims=[1])
+
+    # Rotazione casuale di 0, 90, 180 o 270 gradi
+    if np.random.rand() < prob:
+        k = np.random.randint(0, 4)
+        in_data = torch.rot90(in_data, k=k, dims=[1, 2])
+        out_data = torch.rot90(out_data, k=k, dims=[1, 2])
+
+    # Scegliamo se applicare luminosità o contrasto
+    do_brightness = False
+
+    if do_brightness and np.random.rand() < prob:
+        # Luminosità random tra 0 e 0.2
+        offset = np.random.uniform(0, 0.2)
+        in_data = torch.where(valid_mask, in_data + offset, in_data)
+        in_data = torch.clamp(in_data, 0, 1)
+
+    if not do_brightness and np.random.rand() < prob:
+        # Contrasto random tra 0.7 e 1.3
+        factor = np.random.uniform(0.7, 1.3)
+
+        # Conta pixel validi per canale
+        counts = valid_mask.sum(dim=[1, 2], keepdim=True).float()
+        assert counts.min() > 0, "All pixels in at least one channel are invalid."
+
+        # Somma solo pixel validi per canale
+        sums = (in_data * valid_mask.float()).sum(dim=[1, 2], keepdim=True)
+
+        # Media = somma / count (evita divisione per zero)
+        channel_means = sums / (counts)
+
+        # Applica contrast solo ai pixel validi
+        in_data = torch.where(
+            valid_mask,
+            (in_data - channel_means) * factor + channel_means,
+            in_data,
+        )
+        in_data = torch.clamp(in_data, 0, 1)
+
+    # Ripristiniamo i NaN
+    in_data[~valid_mask] = float("nan")
+
+    return in_data, out_data

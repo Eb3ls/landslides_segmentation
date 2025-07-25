@@ -11,10 +11,16 @@ from tqdm import tqdm
 
 from data_utils import (
     ComuneType,
+    augment_data,
     get_super_resolution_stack,
     get_random_patch,
     generate_dataset_mask,
 )
+
+# Directory per salvare immagini e modelli
+save_dir = "Trash/"
+# Nome del modello da salvare e caricare
+save_name = "super_resolution_model.pth"
 
 
 class RCAB(nn.Module):
@@ -82,13 +88,15 @@ class RCAN(nn.Module):
         in_channels: int,
         n_channels: int,
         reduction: int = 16,
+        # Numero di blocchi Residual Group
         n_groups: int = 10,
-        scale: int = 5,
     ):
         super(RCAN, self).__init__()
         self.in_channels = in_channels
         self.n_channels = n_channels
         self.reduction = reduction
+
+        scale = 5
 
         self.conv1 = nn.Conv2d(in_channels, n_channels, kernel_size=3, padding=1)
         self.groups = nn.ModuleList(
@@ -127,11 +135,16 @@ class SuperResolutionDataset(Dataset):
     """Dataset per il training della super risoluzione."""
 
     def __init__(
-        self, comune: ComuneType, patch_size: int = 256, num_patches: int = 1000
+        self,
+        comune: ComuneType,
+        patch_size: int = 256,
+        num_patches: int = 1000,
+        to_augment: bool = False,
     ):
         self.comune = comune
         self.patch_size = patch_size
         self.num_patches = num_patches
+        self.to_augment = to_augment
 
         print(f"Loading data for {comune}...")
 
@@ -154,6 +167,12 @@ class SuperResolutionDataset(Dataset):
         low_res_tensor = torch.from_numpy(low_res_patch).float()
         high_res_tensor = torch.from_numpy(high_res_patch).float()
 
+        # Augmentiamo i dati
+        if self.to_augment:
+            low_res_patch, high_res_patch = augment_data(
+                low_res_tensor, high_res_tensor
+            )
+
         # Settiamo i valori NaN a 0
         low_res_tensor = torch.nan_to_num(low_res_tensor, nan=0.0)
         high_res_tensor = torch.nan_to_num(high_res_tensor, nan=0.0)
@@ -172,12 +191,14 @@ class SuperResolutionDataset(Dataset):
 def train_model(
     model: nn.Module,
     dataloader: DataLoader,
-    criterion: nn.Module,
-    optimizer: optim.Optimizer,
     device: torch.device,
     num_epochs: int = 10,
 ) -> list:
     """Addestra il modello di super risoluzione."""
+
+    # Loss and optimizer
+    criterion = nn.MSELoss()
+    optimizer = optim.AdamW(model.parameters())
 
     model.train()
     losses = []
@@ -237,12 +258,13 @@ def visualize_results(
     dataset: SuperResolutionDataset,
     device: torch.device,
     num_samples: int = 3,
+    run_napari: bool = True,
 ) -> None:
     """Visualizza i risultati del modello con miglioramenti di contrasto e gestione RGB."""
 
     model.eval()
-    viewer = napari.Viewer()
 
+    images = []
     with torch.no_grad():
         for i in range(num_samples):
             # Ottieni un campione
@@ -252,31 +274,89 @@ def visualize_results(
             # Genera predizione
             pred = model(low_res_batch).squeeze(0).cpu()
 
+            # Reupscaliamo l'immagine a bassa risoluzione per avere un confronto diretto
+            low_res = torch.nn.functional.interpolate(
+                low_res.unsqueeze(0),
+                scale_factor=5,
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+
             # Converti a numpy per visualizzazione
             low_res_np = low_res.cpu().numpy()
             high_res_np = high_res.cpu().numpy()
             pred_np = pred.numpy()
 
-            # Aggiungiamo i layer a napari RGB+NIR separati
-            low_rgb = low_res_np[:3, :, :]  # RGB
-            high_rgb = high_res_np[:3, :, :]  # RGB
-            pred_rgb = pred_np[:3, :, :]  # RGB
+            # Clippiamo i valori per evitare valori fuori range
+            # Gestirlo nel modello puó peggiorare la qualitá?
+            pred_np = np.clip(pred_np, 0, 1)
+
+            # Separiamo RGB+NIR
+
+            # RGB
+            low_rgb = low_res_np[:3, :, :]
+            high_rgb = high_res_np[:3, :, :]
+            pred_rgb = pred_np[:3, :, :]
             low_rgb = low_rgb.transpose(1, 2, 0)
             high_rgb = high_rgb.transpose(1, 2, 0)
             pred_rgb = pred_rgb.transpose(1, 2, 0)
 
-            low_nir = low_res_np[3:, :, :]  # NIR
-            high_nir = high_res_np[3:, :, :]  # NIR
-            pred_nir = pred_np[3:, :, :]  # NIR
+            # NIR
+            low_nir = low_res_np[3, :, :]
+            high_nir = high_res_np[3, :, :]
+            pred_nir = pred_np[3, :, :]
 
-            viewer.add_image(low_rgb, name=f"Low RGB")
-            viewer.add_image(high_rgb, name=f"High RGB")
-            viewer.add_image(pred_rgb, name=f"Predicted RGB")
-            viewer.add_image(low_nir, name=f"Low NIR")
-            viewer.add_image(high_nir, name=f"High NIR")
-            viewer.add_image(pred_nir, name=f"Predicted NIR")
+            images.append((low_rgb, high_rgb, pred_rgb, low_nir, high_nir, pred_nir))
 
-    napari.run()
+    if run_napari:
+        viewer = napari.Viewer()
+        for img_set in images:
+            low_rgb, high_rgb, pred_rgb, low_nir, high_nir, pred_nir = img_set
+            viewer.add_image(low_rgb, name="Low Resolution RGB")
+            viewer.add_image(high_rgb, name="High Resolution RGB")
+            viewer.add_image(pred_rgb, name="Predicted RGB")
+            viewer.add_image(low_nir, name="Low Resolution NIR")
+            viewer.add_image(high_nir, name="High Resolution NIR")
+            viewer.add_image(pred_nir, name="Predicted NIR")
+        napari.run()
+
+    # Salviamo le immagini come file PNG
+    for i, img_set in enumerate(images):
+        low_rgb, high_rgb, pred_rgb, low_nir, high_nir, pred_nir = img_set
+        plt.figure(figsize=(15, 10))
+
+        plt.subplot(2, 3, 1)
+        plt.imshow(low_rgb)
+        plt.title("Low Resolution RGB")
+        plt.axis("off")
+
+        plt.subplot(2, 3, 2)
+        plt.imshow(high_rgb)
+        plt.title("High Resolution RGB")
+        plt.axis("off")
+
+        plt.subplot(2, 3, 3)
+        plt.imshow(pred_rgb)
+        plt.title("Predicted RGB")
+        plt.axis("off")
+
+        plt.subplot(2, 3, 4)
+        plt.imshow(low_nir, cmap="gray")
+        plt.title("Low Resolution NIR")
+        plt.axis("off")
+
+        plt.subplot(2, 3, 5)
+        plt.imshow(high_nir, cmap="gray")
+        plt.title("High Resolution NIR")
+        plt.axis("off")
+
+        plt.subplot(2, 3, 6)
+        plt.imshow(pred_nir, cmap="gray")
+        plt.title("Predicted NIR")
+        plt.axis("off")
+
+        plt.tight_layout()
+        plt.savefig(f"{save_dir}/super_resolution_sample_{i}.png")
 
 
 def save_model(model: nn.Module, path: str) -> None:
@@ -293,18 +373,33 @@ def seed_workers(worker_id: int) -> None:
     torch.manual_seed(worker_seed + worker_id)
 
 
+def load_model(path: str, model_class: nn.Module, device: torch.device) -> nn.Module:
+    """Carica un modello salvato da file."""
+    # Inizializziamo il modello
+    model = model_class.to(device)
+    # Carichiamo i pesi
+    model.load_state_dict(torch.load(path, map_location=device))
+
+    return model
+
+
+# TODO: algoritmo di valutazione differenza tra input e output
+# Alcune immagini non sono coerenti, quindi dobbiamo capire come gestirle
 def main():
     """Funzione principale per addestrare e valutare il modello di super risoluzione."""
 
     # Puliamo la memoria CUDA
     torch.cuda.empty_cache()
 
+    # Impostare True per caricare il modello esistente e valutarlo
+    to_load_model = False
+
     # Parametri di configurazione
     train_comune = "Predappio"
     eval_comune = "Predappio"
 
     patch_size = 128
-    num_patches = 1000
+    num_patches = 500
     batch_size = 8
     num_epochs = 10
 
@@ -319,68 +414,60 @@ def main():
         torch.cuda.manual_seed(42)
 
     try:
-        # Creazione del dataset
-        train_dataset = SuperResolutionDataset(train_comune, patch_size, num_patches)
+
+        # Dataset di valutazione
         eval_dataset = SuperResolutionDataset(eval_comune, patch_size, num_patches)
 
-        # Printiamo shape in input e output
-        sample_low, sample_high = train_dataset[0]
-        n_channels_in = sample_low.shape[0]
-        n_channels_out = sample_high.shape[0]
+        # Creazione del modello
+        model = RCAN(
+            in_channels=4,
+            n_channels=64,
+            n_groups=3,
+        ).to(device)
 
-        print(f"Input channels: {n_channels_in}, Output channels: {n_channels_out}")
+        if to_load_model:
+            # Caricamento del modello esistente
+            model = load_model(save_dir + save_name, model, device)
+            visualize_results(model, eval_dataset, device)
+            return
 
-        # Creiamo i data loader
+        # Altrimenti alleniamo il modello
+
+        # Dataset di addestramento
+        train_dataset = SuperResolutionDataset(
+            train_comune, patch_size, num_patches, to_augment=True
+        )
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
-            # Parallelizziamo la generazione dei batch
             num_workers=4,
-            worker_init_fn=seed_workers,
-            # Velocizziamo il caricamento dei dati su GPU se disponibile
             pin_memory=True if device.type == "cuda" else False,
             persistent_workers=True,
         )
 
-        # Creazione del modello
-        print("Creating model...")
-        model = RCAN(
-            in_channels=n_channels_in,
-            n_channels=64,
-            scale=5,
-            reduction=16,
-            n_groups=3,
-        ).to(device)
-
-        # Loss and optimizer con miglioramenti
-        criterion = nn.MSELoss()
-        optimizer = optim.AdamW(model.parameters())
-
         # Allenamento
         print("Starting training...")
-        losses = train_model(
-            model, train_loader, criterion, optimizer, device, num_epochs
-        )
+        losses = train_model(model, train_loader, device, num_epochs)
 
-        # Valutazione
-        print("Evaluating model...")
-        val_loss = evaluate_model(model, train_loader, device)
-        print(f"Validation Loss: {val_loss:.6f}")
-
-        # Plot training losses
+        # Plottiamo la loss del training
         plt.figure(figsize=(12, 8))
         plt.plot(losses)
         plt.title("Training Loss")
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
         plt.grid(True)
+        plt.savefig(f"{save_dir}super_resolution_training_loss.png")
         plt.show()
 
-        # Risultati
+        print("Evaluating model...")
+        val_loss = evaluate_model(model, train_loader, device)
+        print(f"Validation Loss: {val_loss:.6f}")
+
         visualize_results(model, eval_dataset, device)
 
         # Salvataggio del modello
-        save_model(model, "super_resolution_model.pth")
+        save_model(model, save_dir + save_name)
 
     except Exception as e:
         print(f"Error occurred during training: {e}")

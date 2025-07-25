@@ -4,6 +4,9 @@ from matplotlib import pyplot as plt
 from matplotlib.figure import Figure
 import napari
 import numpy as np
+import torch
+
+from data_utils import augment_data
 
 
 def save_to_napari(fig: Figure, viewer: napari.Viewer, name="") -> None:
@@ -56,7 +59,12 @@ def add_image_and_histogram(
     save_to_napari(fig, viewer, name=f"{filename + ty} Histogram")
 
 
-def view_data(data: np.ndarray, filename: str, viewer: napari.Viewer) -> None:
+def view_data(
+    data: np.ndarray,
+    filename: str,
+    viewer: napari.Viewer,
+    add_augmented: bool = False,
+) -> None:
     # Se immagine RGB + NIR separiamo
     if len(data.shape) == 3 and data.shape[0] == 4:
         rgb_image = data[:3, :, :]
@@ -70,6 +78,12 @@ def view_data(data: np.ndarray, filename: str, viewer: napari.Viewer) -> None:
 
         # Aggiungiamo l'immagine NIR e il suo istogramma a napari
         viewer.add_image(nir_image, name=filename + " NIR", colormap="gray_r")
+
+        if add_augmented:
+            tensor_data = torch.tensor(data)
+            augmented, _ = augment_data(tensor_data, tensor_data)
+            augmented = augmented.numpy()
+            view_data(augmented, filename + " Augmented", viewer)
 
     else:
         # Aggiungiamo l'immagine a napari
