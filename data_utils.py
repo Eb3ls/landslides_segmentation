@@ -2,8 +2,9 @@ import os
 import numpy as np
 from typing import Literal, Tuple
 import rasterio
-from torch import Tensor, norm
+from torch import Tensor
 import torch
+from torch.utils.data import Dataset
 
 
 ComuneType = Literal["Brisighella", "Casola-Valsenio", "Modigliana", "Predappio"]
@@ -256,3 +257,63 @@ def augment_data(
     in_data[~valid_mask] = float("nan")
 
     return in_data, out_data
+
+
+# TODO: Usare dataset di piú comuni
+class SuperResolutionDataset(Dataset):
+    """Dataset per il training della super risoluzione."""
+
+    def __init__(
+        self,
+        comune: ComuneType,
+        scale: int,
+        patch_size: int = 256,
+        num_patches: int = 1000,
+        to_augment: bool = False,
+    ):
+        self.comune = comune
+        self.scale = scale
+        self.patch_size = patch_size
+        self.num_patches = num_patches
+        self.to_augment = to_augment
+
+        print(f"Loading data for {comune}...")
+
+        # Generiamo la maschera del dataset
+        self.mask = generate_dataset_mask(comune)
+
+        # Carichiamo gli stack di dati
+        _, self.stack_post = get_super_resolution_stack(comune)
+
+    def __len__(self) -> int:
+        return self.num_patches
+
+    def __getitem__(self, _) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        (low_res_patch, high_res_patch), _ = get_random_patch(
+            self.stack_post, self.patch_size * self.scale, self.mask
+        )
+
+        # Convertiamo a tensori e assicuriamo il formato corretto
+        low_res_tensor = torch.from_numpy(low_res_patch).float()
+        high_res_tensor = torch.from_numpy(high_res_patch).float()
+
+        # Augmentiamo i dati
+        if self.to_augment:
+            low_res_patch, high_res_patch = augment_data(
+                low_res_tensor, high_res_tensor
+            )
+
+        # Settiamo i valori NaN a 0
+        low_res_tensor = torch.nan_to_num(low_res_tensor, nan=0.0)
+        high_res_tensor = torch.nan_to_num(high_res_tensor, nan=0.0)
+
+        low_res_tensor = torch.nn.functional.interpolate(
+            # Necessario aggiungere una dimensione batch
+            low_res_tensor.unsqueeze(0),
+            scale_factor=1 / self.scale,
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+
+        return low_res_tensor, high_res_tensor

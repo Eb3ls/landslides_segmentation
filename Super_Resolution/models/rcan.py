@@ -3,22 +3,23 @@ import napari
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 import numpy as np
-from typing import Tuple
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
+
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from data_utils import (
-    ComuneType,
-    augment_data,
-    get_super_resolution_stack,
-    get_random_patch,
-    generate_dataset_mask,
+    SuperResolutionDataset,
 )
 
 # Directory per salvare immagini e modelli
-save_dir = "Trash/"
+save_dir = "RCAN/"
 # Nome del modello da salvare e caricare
 save_name = "super_resolution_model.pth"
 
@@ -130,75 +131,21 @@ class RCAN(nn.Module):
         return out
 
 
-# TODO: Usare dataset di piú comuni
-class SuperResolutionDataset(Dataset):
-    """Dataset per il training della super risoluzione."""
-
-    def __init__(
-        self,
-        comune: ComuneType,
-        patch_size: int = 256,
-        num_patches: int = 1000,
-        to_augment: bool = False,
-    ):
-        self.comune = comune
-        self.patch_size = patch_size
-        self.num_patches = num_patches
-        self.to_augment = to_augment
-
-        print(f"Loading data for {comune}...")
-
-        # Generiamo la maschera del dataset
-        self.mask = generate_dataset_mask(comune)
-
-        # Carichiamo gli stack di dati
-        _, self.stack_post = get_super_resolution_stack(comune)
-
-    def __len__(self) -> int:
-        return self.num_patches
-
-    def __getitem__(self, _) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        (low_res_patch, high_res_patch), _ = get_random_patch(
-            self.stack_post, self.patch_size * 5, self.mask
-        )
-
-        # Convertiamo a tensori e assicuriamo il formato corretto
-        low_res_tensor = torch.from_numpy(low_res_patch).float()
-        high_res_tensor = torch.from_numpy(high_res_patch).float()
-
-        # Augmentiamo i dati
-        if self.to_augment:
-            low_res_patch, high_res_patch = augment_data(
-                low_res_tensor, high_res_tensor
-            )
-
-        # Settiamo i valori NaN a 0
-        low_res_tensor = torch.nan_to_num(low_res_tensor, nan=0.0)
-        high_res_tensor = torch.nan_to_num(high_res_tensor, nan=0.0)
-
-        low_res_tensor = torch.nn.functional.interpolate(
-            # Necessario aggiungere una dimensione batch
-            low_res_tensor.unsqueeze(0),
-            scale_factor=0.2,
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0)
-
-        return low_res_tensor, high_res_tensor
-
-
 def train_model(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
     num_epochs: int = 10,
+    show_progress: bool = True,
 ) -> list:
     """Addestra il modello di super risoluzione."""
 
     # Loss and optimizer
     criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters())
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_epochs, eta_min=1e-6
+    )
 
     model.train()
     losses = []
@@ -206,7 +153,9 @@ def train_model(
     for epoch in range(num_epochs):
         epoch_loss = 0.0
 
-        with tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}") as pbar:
+        with tqdm(
+            dataloader, desc=f"Epoch {epoch+1}/{num_epochs}", disable=not show_progress
+        ) as pbar:
             for _, (low_res, high_res) in enumerate(pbar):
                 low_res = low_res.to(device)
                 high_res = high_res.to(device)
@@ -224,6 +173,8 @@ def train_model(
 
                 epoch_loss += loss.item()
                 pbar.set_postfix({"Loss": f"{loss.item():.6f}"})
+
+        scheduler.step()
 
         avg_loss = epoch_loss / len(dataloader)
         losses.append(avg_loss)
@@ -398,10 +349,14 @@ def main():
     train_comune = "Predappio"
     eval_comune = "Predappio"
 
+    scale = 5
     patch_size = 128
-    num_patches = 500
+    num_patches = 10000
     batch_size = 8
-    num_epochs = 10
+    num_epochs = 25
+    num_grups = 20
+    run_napari = False
+    show_progress = True
 
     # Dispositivo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -416,14 +371,18 @@ def main():
     try:
 
         # Dataset di valutazione
-        eval_dataset = SuperResolutionDataset(eval_comune, patch_size, num_patches)
+        eval_dataset = SuperResolutionDataset(
+            eval_comune, scale, patch_size, num_patches
+        )
 
         # Creazione del modello
         model = RCAN(
             in_channels=4,
             n_channels=64,
-            n_groups=3,
+            n_groups=num_grups,
         ).to(device)
+
+        print(sum(p.numel() for p in model.parameters()))
 
         if to_load_model:
             # Caricamento del modello esistente
@@ -435,27 +394,27 @@ def main():
 
         # Dataset di addestramento
         train_dataset = SuperResolutionDataset(
-            train_comune, patch_size, num_patches, to_augment=True
+            train_comune, scale, patch_size, num_patches, to_augment=True
         )
 
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             num_workers=4,
-            pin_memory=True if device.type == "cuda" else False,
             persistent_workers=True,
         )
 
         # Allenamento
         print("Starting training...")
-        losses = train_model(model, train_loader, device, num_epochs)
+        losses = train_model(model, train_loader, device, num_epochs, show_progress)
 
-        # Plottiamo la loss del training
+        # Plottiamo la loss del training logaritmica
         plt.figure(figsize=(12, 8))
         plt.plot(losses)
         plt.title("Training Loss")
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
+        plt.yscale("log")
         plt.grid(True)
         plt.savefig(f"{save_dir}super_resolution_training_loss.png")
         plt.show()
@@ -464,7 +423,7 @@ def main():
         val_loss = evaluate_model(model, train_loader, device)
         print(f"Validation Loss: {val_loss:.6f}")
 
-        visualize_results(model, eval_dataset, device)
+        visualize_results(model, eval_dataset, device, run_napari=run_napari)
 
         # Salvataggio del modello
         save_model(model, save_dir + save_name)
