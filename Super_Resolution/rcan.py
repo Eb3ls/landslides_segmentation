@@ -19,9 +19,9 @@ from data_utils import (
 )
 
 # Directory per salvare immagini e modelli
-save_dir = "RCAN/"
+save_dir = "Super_Resolution/Trash/"
 # Nome del modello da salvare e caricare
-save_name = "super_resolution_model.pth"
+save_name = "rcan.pth"
 
 
 class RCAB(nn.Module):
@@ -343,19 +343,19 @@ def main():
     torch.cuda.empty_cache()
 
     # Impostare True per caricare il modello esistente e valutarlo
-    to_load_model = False
+    to_load_model = True
 
     # Parametri di configurazione
     train_comune = "Predappio"
-    eval_comune = "Predappio"
+    eval_comune = "Modigliana"
 
     scale = 5
     patch_size = 128
-    num_patches = 10000
+    num_patches = 100
     batch_size = 8
-    num_epochs = 25
-    num_grups = 20
-    run_napari = False
+    num_epochs = 5
+    num_groups = 20
+    run_napari = True
     show_progress = True
 
     # Dispositivo
@@ -363,10 +363,11 @@ def main():
     print(f"Using device: {device}")
 
     # Seed per riproducibilità
-    torch.manual_seed(42)
-    np.random.seed(42)
+    seed = 42
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
+        torch.cuda.manual_seed(seed)
 
     try:
 
@@ -379,7 +380,7 @@ def main():
         model = RCAN(
             in_channels=4,
             n_channels=64,
-            n_groups=num_grups,
+            n_groups=num_groups,
         ).to(device)
 
         print(sum(p.numel() for p in model.parameters()))

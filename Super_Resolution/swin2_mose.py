@@ -18,7 +18,7 @@ print(model_weights)
 
 
 device = "cuda"
-path = "swin2_mose/weights/config-70.yml"
+path = "Super_Resolution/swin2_mose_files/config-70.yml"
 
 # load config
 cfg = load_config(path)

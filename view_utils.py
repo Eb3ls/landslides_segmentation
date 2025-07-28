@@ -52,7 +52,12 @@ def add_image_and_histogram(
 ) -> None:
     """Aggiunge un'immagine e il suo istogramma a napari."""
     # Aggiungiamo l'immagine a napari
-    viewer.add_image(data, name=filename + ty, colormap=get_colormap(filename))
+    viewer.add_image(
+        data,
+        name=filename + ty,
+        colormap=get_colormap(filename),
+        contrast_limits=[0, 1],
+    )
 
     # Creiamo e salviamo l'istogramma
     fig = plot_histogram(data, title=f"Histogram of {filename + ty}")
@@ -74,10 +79,14 @@ def view_data(
         nir_image = data[3, :, :]
 
         # Aggiungiamo l'immagine RGB e il suo istogramma a napari
-        viewer.add_image(rgb_image, name=filename + " RGB", colormap="gray_r")
+        viewer.add_image(
+            rgb_image, name=filename + " RGB", colormap="gray_r", contrast_limits=[0, 1]
+        )
 
         # Aggiungiamo l'immagine NIR e il suo istogramma a napari
-        viewer.add_image(nir_image, name=filename + " NIR", colormap="gray_r")
+        viewer.add_image(
+            nir_image, name=filename + " NIR", colormap="gray_r", contrast_limits=[0, 1]
+        )
 
         if add_augmented:
             tensor_data = torch.tensor(data)

@@ -308,12 +308,13 @@ class SuperResolutionDataset(Dataset):
         low_res_tensor = torch.nan_to_num(low_res_tensor, nan=0.0)
         high_res_tensor = torch.nan_to_num(high_res_tensor, nan=0.0)
 
-        low_res_tensor = torch.nn.functional.interpolate(
-            # Necessario aggiungere una dimensione batch
-            low_res_tensor.unsqueeze(0),
-            scale_factor=1 / self.scale,
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0)
+        if self.scale > 1:
+            low_res_tensor = torch.nn.functional.interpolate(
+                # Necessario aggiungere una dimensione batch
+                low_res_tensor.unsqueeze(0),
+                scale_factor=1 / self.scale,
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
 
         return low_res_tensor, high_res_tensor
