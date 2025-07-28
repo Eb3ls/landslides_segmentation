@@ -4,7 +4,6 @@ from matplotlib import pyplot as plt
 from matplotlib.figure import Figure
 import napari
 import numpy as np
-import torch
 
 from data_utils import augment_data
 
@@ -35,10 +34,23 @@ def plot_histogram(data: np.ndarray, title="Histogram") -> Figure:
 
 
 def get_colormap(filename: str) -> str:
-    """Determina la colormap da usare in base al nome del file."""
-    if "slope" in filename.lower():
-        return "gray_r"
-    elif any(keyword in filename.lower() for keyword in ["ndvi", "frane"]):
+    """Determina la colormap da usare in base al nome del file.
+
+    Args:
+        filename: Nome del file o path per cui determinare la colormap
+
+    Returns:
+        Nome della colormap da utilizzare
+    """
+    fl = filename.lower()
+
+    if "slope" in fl:
+        return "terrain"
+    elif "change" in fl:
+        return "RdBu_r"
+    elif "ndvi" in fl:
+        return "RdYlGn"
+    elif "frane" in fl:
         return "viridis"
     else:
         return "gray"
@@ -51,12 +63,11 @@ def add_image_and_histogram(
     ty: Literal[" RGB", " NIR", ""] = "",
 ) -> None:
     """Aggiunge un'immagine e il suo istogramma a napari."""
-    # Aggiungiamo l'immagine a napari
+    # Aggiungiamo l'immagine a napari, lasciamo che calcoli automaticamente i limiti di contrasto, la visualizzazione é migliore
     viewer.add_image(
         data,
         name=filename + ty,
         colormap=get_colormap(filename),
-        contrast_limits=[0, 1],
     )
 
     # Creiamo e salviamo l'istogramma
@@ -68,7 +79,6 @@ def view_data(
     data: np.ndarray,
     filename: str,
     viewer: napari.Viewer,
-    add_augmented: bool = False,
 ) -> None:
     # Se immagine RGB + NIR separiamo
     if len(data.shape) == 3 and data.shape[0] == 4:
@@ -79,20 +89,10 @@ def view_data(
         nir_image = data[3, :, :]
 
         # Aggiungiamo l'immagine RGB e il suo istogramma a napari
-        viewer.add_image(
-            rgb_image, name=filename + " RGB", colormap="gray_r", contrast_limits=[0, 1]
-        )
+        viewer.add_image(rgb_image, name=filename + " RGB", contrast_limits=[0, 1])
 
         # Aggiungiamo l'immagine NIR e il suo istogramma a napari
-        viewer.add_image(
-            nir_image, name=filename + " NIR", colormap="gray_r", contrast_limits=[0, 1]
-        )
-
-        if add_augmented:
-            tensor_data = torch.tensor(data)
-            augmented, _ = augment_data(tensor_data, tensor_data)
-            augmented = augmented.numpy()
-            view_data(augmented, filename + " Augmented", viewer)
+        viewer.add_image(nir_image, name=filename + " NIR", contrast_limits=[0, 1])
 
     else:
         # Aggiungiamo l'immagine a napari

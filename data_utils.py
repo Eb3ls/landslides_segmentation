@@ -1,5 +1,4 @@
 import os
-import napari
 import numpy as np
 from typing import Literal, Tuple
 import rasterio
@@ -146,7 +145,7 @@ def get_super_resolution_stack(
         comune: Nome del comune da processare
 
     Returns:
-        Tupla contenente ((sentinel_pre, agea), (sentinel_post, cgr))
+        Tupla contenente ((sentinel_pre, agea), (sentinel_post, cgr)) senza NaN
 
     Raises:
         FileNotFoundError: Se la directory del comune non esiste
@@ -163,6 +162,9 @@ def get_super_resolution_stack(
     sentinel_pre_stack = []
     sentinel_post_stack = []
 
+    # Prendiamo la maschera del comune
+    mask = generate_dataset_mask(comune)
+
     for filename in os.listdir(directory):
         # Saltiamo i file non rilevanti
         if any(
@@ -175,6 +177,8 @@ def get_super_resolution_stack(
 
         with rasterio.open(path) as src:
             data = get_data(src, True)
+
+            data[:, ~mask] = 0
 
             # Otteniamo i canali come liste di array 2D
             bands = list(data)
@@ -221,6 +225,7 @@ def get_super_resolution_stack(
 def check_similarity(
     first_img: np.ndarray,
     second_img: np.ndarray,
+    mask: np.ndarray,
     threshold: float = 0.9,
 ) -> bool:
     """Controlla se una immagine non ha errori o distorsioni significative.
@@ -228,37 +233,51 @@ def check_similarity(
     Args:
         first_img: Primo array numpy (CHW o HW) senza NaN
         second_img: Secondo array numpy (CHW o HW) senza NaN
+        mask: Maschera della stessa dimensione delle immmagini che indica i pixel validi da considerare
         threshold: Soglia di similarità (0-1, default 0.9)
 
     Returns:
         True se la similarità è >= threshold, False altrimenti
 
     Raises:
-        ValueError: Se i dati non hanno la stessa forma o se non sono almeno 2D
+        ValueError: Se i dati non hanno la stessa forma o se non sono almeno 2D o se la maschera non è valida
     """
 
-    if first_img.shape != second_img.shape:
-        raise ValueError("Sentinel and drone data must have the same shape")
+    if first_img.shape != second_img.shape or first_img.shape[1:] != mask.shape:
+        raise ValueError("Data must have the same shape")
     if len(first_img.shape) != 2 and len(first_img.shape) != 3:
         raise ValueError("Data must be a 2D or 3D array")
 
-    # Calcola la similarità strutturale media (MSSIM) tra le due immagini
-    mssim = structural_similarity(first_img, second_img, data_range=1, channel_axis=0)
+    _, ssim_img = structural_similarity(  # type: ignore
+        first_img,
+        second_img,
+        data_range=1,
+        channel_axis=0 if len(first_img.shape) == 3 else None,
+        full=True,
+    )
 
-    # structural_similarity può ritornare un valore singolo o una tupla
-    # Se è una tupla, prendiamo il primo elemento (il valore MSSIM)
-    if isinstance(mssim, tuple):
-        mssim = mssim[0]
+    valid_pixels = np.sum(mask)
+    if valid_pixels == 0:
+        raise ValueError("No valid pixels in the mask")
 
-    # Convertiamo a float standard per garantire compatibilità
-    mssim = float(mssim)
+    if len(ssim_img.shape) == 2:
+        # Caso 2D: applichiamo direttamente la maschera
+        ssim_masked = ssim_img[mask]
+    else:
+        # Caso 3D: la maschera si applica alle ultime due dimensioni
+        ssim_masked = ssim_img[..., mask]
+    mssim = ssim_masked.mean()
 
-    print(f"Mean Structural Similarity Index (MSSIM): {mssim:.4f}")
+    assert mssim >= 0 and mssim <= 1, "MSSIM must be between 0 and 1"
     return mssim >= threshold
 
 
 def get_random_patch(
-    first_img: np.ndarray, second_img: np.ndarray, patch_size: int, mask: np.ndarray
+    first_img: np.ndarray,
+    second_img: np.ndarray,
+    patch_size: int,
+    mask: np.ndarray,
+    return_similar: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Estrae la stessa patch casuale di dimensioni patch_size x patch_size da due stack.
 
@@ -302,9 +321,14 @@ def get_random_patch(
     second_patch = second_img[..., start_y:end_y, start_x:end_x]
     patch_mask = mask[start_y:end_y, start_x:end_x]
 
+    # Se il patch non ha almeno l'80% di area valida, ne estraiamo un altro
+    if patch_mask.sum() < ((patch_size**2) * 0.8):
+        return get_random_patch(first_img, second_img, patch_size, mask, return_similar)
+
     # Creiamo i tensori da numpy
     first_tensor = torch.from_numpy(first_patch).unsqueeze(0)
     second_tensor = torch.from_numpy(second_patch).unsqueeze(0)
+    mask_tensor = torch.from_numpy(patch_mask).unsqueeze(0).unsqueeze(0).float()
 
     # Downgradiamo entrambi i patch di 5 volte per controllare che i dati siano simili
     first_downsampled = F.interpolate(
@@ -313,44 +337,26 @@ def get_random_patch(
     second_downsampled = F.interpolate(
         second_tensor, scale_factor=0.2, mode="bilinear", align_corners=False
     ).squeeze(0)
+    mask_downsampled = (
+        F.interpolate(mask_tensor, scale_factor=0.2, mode="nearest")
+        .squeeze(0)
+        .squeeze(0)
+    ).bool()
 
     first_downsampled = first_downsampled.numpy()
     second_downsampled = second_downsampled.numpy()
-
-    print(f"Patch sum: {patch_mask.sum()} pixels")
-    print(f"Percentuale coperta: {patch_mask.sum() / (patch_size**2) * 100:.2f}%")
+    mask_downsampled = mask_downsampled.numpy()
 
     # Controlliamo la similarità tra i patch
-    if not check_similarity(first_downsampled, second_downsampled):
-        viewer = napari.Viewer()
-        rgb_a = first_downsampled[:3].transpose(
-            1, 2, 0
-        )  # Cambiamo l'ordine dei canali per napari
-        rgb_b = second_downsampled[:3].transpose(
-            1, 2, 0
-        )  # Cambiamo l'ordine dei canali per napari
-        viewer.add_image(rgb_a, name="First Patch RGB")
-        viewer.add_image(rgb_b, name="Second Patch RGB")
-        napari.run()
+    sim = check_similarity(
+        first_downsampled, second_downsampled, mask_downsampled, 0.20
+    )
 
-    # Se il patch non ha almeno l'80% di area valida, lo scartiamo
-    if patch_mask.sum() < ((patch_size**2) * 0.8):
-        viewer = napari.Viewer()
-        # Visualizziamo i patch per debug
-        rgb_a = first_patch[:3].transpose(
-            1, 2, 0
-        )  # Cambiamo l'ordine dei canali per napari
-        rgb_b = second_patch[:3].transpose(
-            1, 2, 0
-        )  # Cambiamo l'ordine dei canali per napari
-        viewer.add_image(rgb_a, name="First Patch ERR RGB")
-        viewer.add_image(rgb_b, name="Second Patch ERR RGB")
-        napari.run()
-
-        # Troviamo un nuovo patch
-        return get_random_patch(first_img, second_img, patch_size, mask)
-
-    return first_patch, second_patch, patch_mask
+    if sim == return_similar:
+        return first_patch, second_patch, patch_mask
+    else:
+        # Se non é quello che vogliamo, ne estraiamo un altro
+        return get_random_patch(first_img, second_img, patch_size, mask, return_similar)
 
 
 def augment_data(
@@ -405,22 +411,24 @@ def augment_data(
         factor = np.random.uniform(0.7, 1.3)
 
         # Conta pixel validi per canale
-        counts = patch_mask.sum(dim=[1, 2], keepdim=True)
+        mask_expanded = patch_mask.unsqueeze(0).expand_as(in_data)
+        counts = mask_expanded.sum(dim=[1, 2], keepdim=True)
         if counts.min() <= 0:
             raise ValueError("All pixels in at least one channel are invalid")
 
         # Somma solo pixel validi per canale
-        sums = (in_data * patch_mask).sum(dim=[1, 2], keepdim=True)
+        sums = (in_data * mask_expanded).sum(dim=[1, 2], keepdim=True)
 
-        # Media = somma / count (evita divisione per zero)
-        channel_means = sums / (counts)
+        # Media = somma / count
+        channel_means = sums / counts
 
         # Applica contrast solo ai pixel validi
         in_data = torch.where(
-            patch_mask,
-            (in_data - channel_means) * factor + channel_means,
-            in_data,
+            patch_mask,  # CONDIZIONE
+            (in_data - channel_means) * factor + channel_means,  # SE VERO
+            in_data,  # SE FALSO
         )
+
         in_data = torch.clamp(in_data, 0, 1)
 
     return in_data, out_data
@@ -458,10 +466,6 @@ class SuperResolutionDataset(Dataset):
 
         # Carichiamo gli stack di dati
         _, self.stack_post = get_super_resolution_stack(comune)
-
-        # Impostiamo a 0 i pixel non validi
-        self.stack_post[0][:, ~self.mask] = 0
-        self.stack_post[1][:, ~self.mask] = 0
 
     def __len__(self) -> int:
         return self.num_patches
