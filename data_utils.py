@@ -325,38 +325,38 @@ def get_random_patch(
     if patch_mask.sum() < ((patch_size**2) * 0.8):
         return get_random_patch(first_img, second_img, patch_size, mask, return_similar)
 
-    # Creiamo i tensori da numpy
-    first_tensor = torch.from_numpy(first_patch).unsqueeze(0)
-    second_tensor = torch.from_numpy(second_patch).unsqueeze(0)
-    mask_tensor = torch.from_numpy(patch_mask).unsqueeze(0).unsqueeze(0).float()
+    # # Creiamo i tensori da numpy
+    # first_tensor = torch.from_numpy(first_patch).unsqueeze(0)
+    # second_tensor = torch.from_numpy(second_patch).unsqueeze(0)
+    # mask_tensor = torch.from_numpy(patch_mask).unsqueeze(0).unsqueeze(0).float()
 
-    # Downgradiamo entrambi i patch di 5 volte per controllare che i dati siano simili
-    first_downsampled = F.interpolate(
-        first_tensor, scale_factor=0.2, mode="bilinear", align_corners=False
-    ).squeeze(0)
-    second_downsampled = F.interpolate(
-        second_tensor, scale_factor=0.2, mode="bilinear", align_corners=False
-    ).squeeze(0)
-    mask_downsampled = (
-        F.interpolate(mask_tensor, scale_factor=0.2, mode="nearest")
-        .squeeze(0)
-        .squeeze(0)
-    ).bool()
+    # # Downgradiamo entrambi i patch di 5 volte per controllare che i dati siano simili
+    # first_downsampled = F.interpolate(
+    #     first_tensor, scale_factor=0.2, mode="bilinear", align_corners=False
+    # ).squeeze(0)
+    # second_downsampled = F.interpolate(
+    #     second_tensor, scale_factor=0.2, mode="bilinear", align_corners=False
+    # ).squeeze(0)
+    # mask_downsampled = (
+    #     F.interpolate(mask_tensor, scale_factor=0.2, mode="nearest")
+    #     .squeeze(0)
+    #     .squeeze(0)
+    # ).bool()
 
-    first_downsampled = first_downsampled.numpy()
-    second_downsampled = second_downsampled.numpy()
-    mask_downsampled = mask_downsampled.numpy()
+    # first_downsampled = first_downsampled.numpy()
+    # second_downsampled = second_downsampled.numpy()
+    # mask_downsampled = mask_downsampled.numpy()
 
-    # Controlliamo la similarità tra i patch
-    sim = check_similarity(
-        first_downsampled, second_downsampled, mask_downsampled, 0.20
-    )
+    # # Controlliamo la similarità tra i patch
+    # sim = check_similarity(
+    #     first_downsampled, second_downsampled, mask_downsampled, 0.20
+    # )
 
-    if sim == return_similar:
-        return first_patch, second_patch, patch_mask
-    else:
-        # Se non é quello che vogliamo, ne estraiamo un altro
-        return get_random_patch(first_img, second_img, patch_size, mask, return_similar)
+    # if sim == return_similar:
+    return first_patch, second_patch, patch_mask
+    # else:
+    #     # Se non é quello che vogliamo, ne estraiamo un altro
+    #     return get_random_patch(first_img, second_img, patch_size, mask, return_similar)
 
 
 def augment_data(
