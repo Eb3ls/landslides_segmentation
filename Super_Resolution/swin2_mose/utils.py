@@ -6,7 +6,7 @@ import os
 # Aggiungi la directory corrente al path per assicurarti che model.py sia trovato
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from swin2_mose_files.model import Swin2MoSE
+from swin2_mose.model import Swin2MoSE
 
 
 def to_shape(t1, t2):

@@ -15,8 +15,8 @@ from timm.layers.drop import DropPath
 from timm.layers.helpers import to_2tuple
 from timm.layers.weight_init import trunc_normal_
 
-from swin2_mose_files.libs import window_reverse, Mlp, window_partition
-from swin2_mose_files.moe import MoE
+from swin2_mose.libs import window_reverse, Mlp, window_partition
+from swin2_mose.moe import MoE
 
 
 class WindowAttention(nn.Module):

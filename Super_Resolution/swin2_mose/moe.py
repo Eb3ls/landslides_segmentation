@@ -17,7 +17,7 @@ import torch.nn as nn
 from torch.distributions.normal import Normal
 from copy import deepcopy
 
-from swin2_mose_files.libs import Mlp as MLP
+from swin2_mose.libs import Mlp as MLP
 
 
 class SparseDispatcher(object):

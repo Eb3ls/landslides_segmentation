@@ -8,6 +8,7 @@ import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
+from Super_Resolution.config import Config
 from Super_Resolution.model_utils import (
     evaluate_model,
     load_model,
@@ -19,9 +20,6 @@ from Super_Resolution.model_utils import (
 from data_utils import (
     SuperResolutionDataset,
 )
-
-# Directory per salvare immagini e modelli
-save_dir = "Super_Resolution/Trash/"
 
 
 class RCAB(nn.Module):
@@ -84,31 +82,33 @@ class ResidualGroup(nn.Module):
 class RCAN(nn.Module):
     """Residual Channel Attention Network"""
 
-    def __init__(
-        self,
-        in_channels: int,
-        n_channels: int,
-        reduction: int = 16,
-        # Numero di blocchi Residual Group
-        n_groups: int = 10,
-    ):
+    def __init__(self, config: Config):
         super(RCAN, self).__init__()
-        self.in_channels = in_channels
-        self.n_channels = n_channels
-        self.reduction = reduction
+        self.in_channels = 4
+        self.n_channels = config.model.feature_extraction_channels
+        self.reduction = config.model.reduction_channels
 
-        scale = 5
+        scale = config.model.scale
 
-        self.conv1 = nn.Conv2d(in_channels, n_channels, kernel_size=3, padding=1)
-        self.groups = nn.ModuleList(
-            [ResidualGroup(n_channels, reduction) for _ in range(n_groups)]
+        self.conv1 = nn.Conv2d(
+            self.in_channels, self.n_channels, kernel_size=3, padding=1
         )
-        self.conv2 = nn.Conv2d(n_channels, n_channels, kernel_size=3, padding=1)
+        self.groups = nn.ModuleList(
+            [
+                ResidualGroup(self.n_channels, self.reduction)
+                for _ in range(config.model.residual_groups)
+            ]
+        )
+        self.conv2 = nn.Conv2d(
+            self.n_channels, self.n_channels, kernel_size=3, padding=1
+        )
         self.conv3 = nn.Conv2d(
-            n_channels, n_channels * (scale**2), kernel_size=3, padding=1
+            self.n_channels, self.n_channels * (scale**2), kernel_size=3, padding=1
         )
         self.pixel_shuffle = nn.PixelShuffle(scale)
-        self.conv4 = nn.Conv2d(n_channels, in_channels, kernel_size=3, padding=1)
+        self.conv4 = nn.Conv2d(
+            self.n_channels, self.in_channels, kernel_size=3, padding=1
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
 
@@ -139,80 +139,60 @@ def main():
     # Puliamo la memoria CUDA
     torch.cuda.empty_cache()
 
-    # Impostare True per caricare il modello esistente e valutarlo
-    to_load_model = False
-    load_name = "rcan_ncc_ssim"
-
-    # Parametri di configurazione
-    train_comune = "Predappio"
-    eval_comune = "Modigliana"
-    save_name = "rcan_ncc_ssim"
-
-    scale = 5
-    patch_size = 128
-    num_patches = 10
-    batch_size = 8
-    num_epochs = 10
-    num_groups = 8
-    run_napari = False
-    show_progress = True
+    config = Config()
 
     # Dispositivo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # Seed per riproducibilità
-    seed = 43
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    torch.manual_seed(config.train.seed)
+    np.random.seed(config.train.seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed(config.train.seed)
 
     try:
 
         # Dataset di valutazione
-        eval_dataset = SuperResolutionDataset(
-            eval_comune, scale, patch_size, num_patches
+        test_dataset = SuperResolutionDataset(
+            config.test.comune,
+            config.model.scale,
+            config.test.dataset_size,
+            config.model.patch_size,
         )
 
         # Creazione del modello
-        model = RCAN(
-            in_channels=4,
-            n_channels=64,
-            n_groups=num_groups,
-        ).to(device)
+        model = RCAN(config).to(device)
 
-        print(sum(p.numel() for p in model.parameters()))
+        print(f"Parametri: {sum(p.numel() for p in model.parameters())}")
 
-        if to_load_model:
+        if config.test.load_model:
             # Caricamento del modello esistente
-            model = load_model(save_dir + load_name, model, device)
-            visualize_predictions(
-                model,
-                eval_dataset,
-                device,
-                path=save_dir + load_name,
-                run_napari=run_napari,
-            )
+            model = load_model(config, model, device)
+            visualize_predictions(model, test_dataset, device, config)
             return
 
         # Altrimenti alleniamo il modello
 
         # Dataset di addestramento
         train_dataset = SuperResolutionDataset(
-            train_comune, scale, patch_size, num_patches, to_augment=True
+            config.train.comune,
+            config.model.scale,
+            config.model.patch_size,
+            config.train.dataset_size,
+            config.train.augment_data,
         )
 
         train_loader = DataLoader(
             train_dataset,
-            batch_size=batch_size,
-            num_workers=4,
+            config.train.batch_size,
+            num_workers=config.train.workers,
             persistent_workers=True,
         )
 
         # Allenamento
         print("Starting training...")
-        losses = train_model(model, train_loader, device, num_epochs, show_progress)
+        losses = train_model(model, train_loader, device, config)
 
         # Plottiamo la loss del training logaritmica
         plt.figure(figsize=(12, 8))
@@ -222,21 +202,17 @@ def main():
         plt.ylabel("Loss")
         plt.yscale("log")
         plt.grid(True)
-        plt.savefig(f"{save_dir}{save_name}_loss.png")
+        plt.savefig(f"{config.model.dir_path}{config.model.name}/loss.png")
         plt.show()
 
         print("Evaluating model...")
         metrics = evaluate_model(model, train_loader, device)
-        save_metrics(
-            metrics, f"{save_dir}{save_name}_metrics.json", model_name=save_name
-        )
+        save_metrics(metrics, config)
 
-        visualize_predictions(
-            model, eval_dataset, device, save_dir + save_name, run_napari=run_napari
-        )
+        visualize_predictions(model, test_dataset, device, config)
 
         # Salvataggio del modello
-        save_model(model, save_dir + save_name + ".pth")
+        save_model(model, config)
 
     except Exception as e:
         print(f"Error occurred during training: {e}")

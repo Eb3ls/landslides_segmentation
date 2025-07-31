@@ -8,30 +8,33 @@ import matplotlib.pyplot as plt
 import napari
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+# LPIPS genera warning sul modo in cui carica i pesi
 from piq import ssim, psnr, LPIPS, SSIMLoss
 from datetime import datetime
+from Super_Resolution.config import Config
 from data_utils import SuperResolutionDataset
 
 
-def save_metrics(metrics_dict: dict, save_path: str, model_name: str) -> None:
+def save_metrics(metrics_dict: dict, config: Config) -> None:
     """Salva le metriche di valutazione in un file JSON.
 
     Args:
         metrics_dict: Dizionario contenente le metriche
-        save_path: Percorso dove salvare il file
-        model_name: Nome del modello
+        config: Configurazione del modello
     """
 
     metrics_data = {
         "timestamp": datetime.now().isoformat(),
-        "model_name": model_name,
+        "model_name": config.model.name,
         "metrics": metrics_dict,
+        "model_config": str(config.model),
     }
 
-    with open(save_path, "w") as f:
+    with open(f"{config.model.dir_path}{config.model.name}/metrics.json", "w") as f:
         json.dump(metrics_data, f, indent=4)
 
-    print(f"Metrics saved to {save_path}")
+    print(f"Metrics saved to {config.model.dir_path}{config.model.name}/metrics.json")
 
 
 def _cc_single_torch(
@@ -103,9 +106,8 @@ def train_model(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-    num_epochs: int = 10,
-    show_progress: bool = True,
-) -> list:
+    config: Config,
+) -> list[float]:
     """Addestra il modello di super risoluzione."""
 
     # Loss and optimizer
@@ -113,17 +115,19 @@ def train_model(
     # TODO guardare possibili optimizers
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=num_epochs, eta_min=1e-6
+        optimizer, T_max=config.train.epochs, eta_min=1e-6
     )
 
     model.train()
     losses = []
 
-    for epoch in range(num_epochs):
+    for epoch in range(config.train.epochs):
         epoch_loss = 0.0
 
         with tqdm(
-            dataloader, desc=f"Epoch {epoch+1}/{num_epochs}", disable=not show_progress
+            dataloader,
+            desc=f"Epoch {epoch+1}/{config.train.epochs}",
+            disable=not config.train.show_progress,
         ) as pbar:
             for _, (low_res, high_res) in enumerate(pbar):
                 # Spopstiamo i tensori sul dispositivo per velocizzare il training
@@ -145,7 +149,7 @@ def train_model(
 
         avg_loss = epoch_loss / len(dataloader)
         losses.append(avg_loss)
-        print(f"Epoch [{epoch+1}/{num_epochs}], Average Loss: {avg_loss:.6f}")
+        print(f"Epoch [{epoch+1}/{config.train.epochs}], Average Loss: {avg_loss:.6f}")
 
     return losses
 
@@ -204,9 +208,7 @@ def visualize_predictions(
     model: nn.Module,
     dataset: SuperResolutionDataset,
     device: torch.device,
-    path: str,
-    num_samples: int = 2,
-    run_napari: bool = True,
+    config: Config,
 ) -> None:
     """Visualizza i risultati del modello con miglioramenti di contrasto e gestione RGB."""
 
@@ -214,7 +216,7 @@ def visualize_predictions(
 
     images = []
     with torch.no_grad():
-        for i in range(num_samples):
+        for i in range(config.test.image_samples):
             # Ottieni un campione
             low_res, high_res = dataset[i]
             low_res_batch = low_res.unsqueeze(0).to(device)
@@ -225,7 +227,7 @@ def visualize_predictions(
             # Reupscaliamo l'immagine a bassa risoluzione per avere un confronto diretto
             low_res = torch.nn.functional.interpolate(
                 low_res.unsqueeze(0),
-                scale_factor=5,
+                scale_factor=config.model.scale,
                 mode="bilinear",
                 align_corners=False,
             ).squeeze(0)
@@ -256,7 +258,7 @@ def visualize_predictions(
 
             images.append((low_rgb, high_rgb, pred_rgb, low_nir, high_nir, pred_nir))
 
-    if run_napari:
+    if config.test.run_napari:
         viewer = napari.Viewer()
         for img_set in images:
             low_rgb, high_rgb, pred_rgb, low_nir, high_nir, pred_nir = img_set
@@ -304,11 +306,12 @@ def visualize_predictions(
         plt.axis("off")
 
         plt.tight_layout()
-        plt.savefig(f"{path}_{i}.png")
+        plt.savefig(config.model.dir_path + config.model.name + f"/sample_{i}.png")
 
 
-def save_model(model: nn.Module, path: str) -> None:
+def save_model(model: nn.Module, config: Config) -> None:
     """Salva il modello su disco."""
+    path = config.model.dir_path + config.model.name + "/model.pth"
     torch.save(model.state_dict(), path)
     print(f"Model saved to {path}")
 
@@ -321,11 +324,14 @@ def seed_workers(worker_id: int) -> None:
     torch.manual_seed(worker_seed + worker_id)
 
 
-def load_model(path: str, model_class: nn.Module, device: torch.device) -> nn.Module:
+def load_model(
+    config: Config, model_class: nn.Module, device: torch.device
+) -> nn.Module:
     """Carica un modello salvato da file."""
     # Inizializziamo il modello
     model = model_class.to(device)
     # Carichiamo i pesi
-    model.load_state_dict(torch.load(path + ".pth", map_location=device))
+    path = config.model.dir_path + config.model.name + "/model.pth"
+    model.load_state_dict(torch.load(path, map_location=device))
 
     return model
