@@ -5,4 +5,9 @@ Comuni
 __pycache__
 *.pth
 Trash
-Super_Resolution/rcan/
+Super_Resolution/rcan/*
+Super_Resolution/swin2mose/*
+
+# Files to keep
+!Super_Resolution/swin2mose/moe.py
+!Super_Resolution/swin2mose/utils.py

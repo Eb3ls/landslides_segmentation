@@ -17,7 +17,7 @@ import torch.nn as nn
 from torch.distributions.normal import Normal
 from copy import deepcopy
 
-from swin2_mose.libs import Mlp as MLP
+from Super_Resolution.swin2mose.utils import Mlp as MLP
 
 
 class SparseDispatcher(object):
@@ -51,7 +51,7 @@ class SparseDispatcher(object):
     `Tensor`s for expert i only the batch elements for which `gates[b, i] > 0`.
     """
 
-    def __init__(self, num_experts, gates):
+    def __init__(self, num_experts: int, gates: torch.Tensor):
         """Create a SparseDispatcher."""
 
         self._gates = gates
@@ -163,13 +163,13 @@ class MoE(nn.Module):
 
     def __init__(
         self,
-        input_size,
-        output_size,
-        num_experts,
-        hidden_size,
+        input_size: int,
+        output_size: int,
+        num_experts: int,
+        hidden_size: int,
         experts=None,
-        noisy_gating=True,
-        k=4,
+        noisy_gating: bool = True,
+        k: int = 4,
         x_gating=None,
         with_noise=True,
         with_smart_merger=None,
@@ -310,7 +310,7 @@ class MoE(nn.Module):
         if self.noisy_gating and self.k < self.num_experts and train:
             load = (
                 self._prob_in_top_k(
-                    clean_logits, noisy_logits, noise_stddev, top_logits
+                    clean_logits, noisy_logits, noise_stddev, top_logits  # type: ignore
                 )
             ).sum(0)
         else:

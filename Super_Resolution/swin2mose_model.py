@@ -1,22 +1,41 @@
-#
-# Source code: https://github.com/IMPLabUniPr/swin2-mose
-#
-# ----------------------------------------------------------------------------
-# https://arxiv.org/abs/2404.18924
-# ----------------------------------------------------------------------------
+import sys
+import os
 
-import math
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from matplotlib import pyplot as plt
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint as checkpoint
+from torch import nn, Tensor
+from torch.utils.data import DataLoader
+
+from typing import Literal
+
 from timm.layers.drop import DropPath
-from timm.layers.helpers import to_2tuple
 from timm.layers.weight_init import trunc_normal_
 
-from swin2_mose.libs import window_reverse, Mlp, window_partition
-from swin2_mose.moe import MoE
+from Super_Resolution.config import Config
+from Super_Resolution.model_utils import (
+    evaluate_model,
+    load_model,
+    save_model,
+    train_model,
+    visualize_predictions,
+    save_metrics,
+)
+from Super_Resolution.swin2mose.moe import MoE
+from Super_Resolution.swin2mose.utils import (
+    Mlp,
+    PatchEmbed,
+    PatchUnEmbed,
+    Upsample,
+    Upsample_hf,
+    UpsampleOneStep,
+    window_partition,
+    window_reverse,
+)
+from data_utils import SuperResolutionDataset
 
 
 class WindowAttention(nn.Module):
@@ -171,12 +190,10 @@ class WindowAttention(nn.Module):
         B_, N, C = x.shape
         qkv_bias = None
         if self.q_bias is not None:
+            assert self.v_bias is not None, "v_bias must be set when q_bias is set"
+            v_bias: torch.Tensor = self.v_bias
             qkv_bias = torch.cat(
-                (
-                    self.q_bias,
-                    torch.zeros_like(self.v_bias, requires_grad=False),
-                    self.v_bias,
-                )
+                (self.q_bias, torch.zeros_like(v_bias, requires_grad=False), v_bias)
             )
         qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
         qkv = qkv.reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
@@ -249,73 +266,29 @@ class WindowAttention(nn.Module):
         x = self.proj_drop(x)
         return x
 
-    def lepe_pos(self, v):
-        B, NH, HW, NW = v.shape
-        C = NH * NW
-        H = W = int(math.sqrt(HW))
-        v = v.transpose(-2, -1).contiguous().view(B, C, H, W)
-        lepe = self.get_v(v)
-        lepe = lepe.reshape(-1, self.num_heads, NW, HW)
-        lepe = lepe.permute(0, 1, 3, 2).contiguous()
-        return lepe
-
-    def extra_repr(self) -> str:
-        return (
-            f"dim={self.dim}, window_size={self.window_size}, "
-            f"pretrained_window_size={self.pretrained_window_size}, num_heads={self.num_heads}"
-        )
-
-    def flops(self, N):
-        # calculate flops for 1 window with token length of N
-        flops = 0
-        # qkv = self.qkv(x)
-        flops += N * self.dim * 3 * self.dim
-        # attn = (q @ k.transpose(-2, -1))
-        flops += self.num_heads * N * (self.dim // self.num_heads) * N
-        #  x = (attn @ v)
-        flops += self.num_heads * N * N * (self.dim // self.num_heads)
-        # x = self.proj(x)
-        flops += N * self.dim * self.dim
-        return flops
-
 
 class SwinTransformerBlock(nn.Module):
-    r"""Swin Transformer Block.
-    Args:
-        dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resulotion.
-        num_heads (int): Number of attention heads.
-        window_size (int): Window size.
-        shift_size (int): Shift size for SW-MSA.
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
-        drop (float, optional): Dropout rate. Default: 0.0
-        attn_drop (float, optional): Attention dropout rate. Default: 0.0
-        drop_path (float, optional): Stochastic depth rate. Default: 0.0
-        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-        pretrained_window_size (int): Window size in pre-training.
-    """
+    """Swin Transformer Block."""
 
     def __init__(
         self,
-        dim,
-        input_resolution,
-        num_heads,
-        window_size=7,
-        shift_size=0,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        drop=0.0,
-        attn_drop=0.0,
-        drop_path=0.0,
+        dim: int,
+        input_resolution: list[int],
+        num_heads: int,
+        window_size: int = 7,
+        shift_size: int = 0,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+        drop_path: float | list[float] = 0.0,
         act_layer=nn.GELU,
         norm_layer=nn.LayerNorm,
-        pretrained_window_size=0,
-        use_lepe=False,
-        use_cpb_bias=True,
-        MoE_config=None,
-        use_rpe_bias=False,
+        pretrained_window_size: int = 0,
+        use_lepe: bool = False,
+        use_cpb_bias: bool = True,
+        MoE_config: dict | None = None,
+        use_rpe_bias: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -335,16 +308,20 @@ class SwinTransformerBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
             dim,
-            window_size=to_2tuple(self.window_size),
+            window_size=(self.window_size, self.window_size),
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             attn_drop=attn_drop,
             proj_drop=drop,
-            pretrained_window_size=to_2tuple(pretrained_window_size),
+            pretrained_window_size=(pretrained_window_size, pretrained_window_size),
             use_lepe=use_lepe,
             use_cpb_bias=use_cpb_bias,
             use_rpe_bias=use_rpe_bias,
         )
+
+        if isinstance(drop_path, list) or drop_path is None:
+            print("Using list of drop_path values")
+            raise TypeError("drop_path must be a single value, not a list")
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -470,117 +447,38 @@ class SwinTransformerBlock(nn.Module):
             f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
         )
 
-    def flops(self):
-        flops = 0
-        H, W = self.input_resolution
-        # norm1
-        flops += self.dim * H * W
-        # W-MSA/SW-MSA
-        nW = H * W / self.window_size / self.window_size
-        flops += nW * self.attn.flops(self.window_size * self.window_size)
-        # mlp
-        flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio
-        # norm2
-        flops += self.dim * H * W
-        return flops
-
-
-class PatchMerging(nn.Module):
-    r"""Patch Merging Layer.
-    Args:
-        input_resolution (tuple[int]): Resolution of input feature.
-        dim (int): Number of input channels.
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-    """
-
-    def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.input_resolution = input_resolution
-        self.dim = dim
-        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
-        self.norm = norm_layer(2 * dim)
-
-    def forward(self, x):
-        """
-        x: B, H*W, C
-        """
-        H, W = self.input_resolution
-        B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
-        assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
-
-        x = x.view(B, H, W, C)
-
-        x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
-        x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
-        x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
-        x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
-        x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
-        x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
-
-        x = self.reduction(x)
-        x = self.norm(x)
-
-        return x
-
-    def extra_repr(self) -> str:
-        return f"input_resolution={self.input_resolution}, dim={self.dim}"
-
-    def flops(self):
-        H, W = self.input_resolution
-        flops = (H // 2) * (W // 2) * 4 * self.dim * 2 * self.dim
-        flops += H * W * self.dim // 2
-        return flops
-
 
 class BasicLayer(nn.Module):
-    """A basic Swin Transformer layer for one stage.
-    Args:
-        dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resolution.
-        depth (int): Number of blocks.
-        num_heads (int): Number of attention heads.
-        window_size (int): Local window size.
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
-        drop (float, optional): Dropout rate. Default: 0.0
-        attn_drop (float, optional): Attention dropout rate. Default: 0.0
-        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
-        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
-        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
-        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
-        pretrained_window_size (int): Local window size in pre-training.
+    """
+    Basic Layer for Swin Transformer
     """
 
     def __init__(
         self,
-        dim,
-        input_resolution,
-        depth,
-        num_heads,
-        window_size,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        drop=0.0,
-        attn_drop=0.0,
-        drop_path=0.0,
+        dim: int,
+        input_resolution: list[int],
+        depth: int,
+        num_heads: int,
+        window_size: int,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+        drop_path: float | list[float] = 0.0,
         norm_layer=nn.LayerNorm,
         downsample=None,
-        use_checkpoint=False,
-        pretrained_window_size=0,
-        use_lepe=False,
-        use_cpb_bias=True,
-        MoE_config=None,
-        use_rpe_bias=False,
+        use_lepe: bool = False,
+        pretrained_window_size: int = 0,
+        use_cpb_bias: bool = True,
+        MoE_config: dict | None = None,
+        use_rpe_bias: bool = False,
     ):
-
-        super().__init__()
+        super(BasicLayer, self).__init__()
         self.dim = dim
         self.input_resolution = input_resolution
         self.depth = depth
-        self.use_checkpoint = use_checkpoint
 
-        # build blocks
+        # Costruiamo i blocchi
         self.blocks = nn.ModuleList(
             [
                 SwinTransformerBlock(
@@ -607,153 +505,57 @@ class BasicLayer(nn.Module):
             ]
         )
 
-        # patch merging layer
+        # Patch merging layer
         if downsample is not None:
             self.downsample = downsample(
-                input_resolution, dim=dim, norm_layer=norm_layer
+                dim=dim,
+                input_resolution=input_resolution,
+                norm_layer=norm_layer,
             )
         else:
             self.downsample = None
 
-    def forward(self, x, x_size):
+    def forward(self, x: Tensor) -> tuple[Tensor, float]:
         loss_moe_all = 0
-        for blk in self.blocks:
-            if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x, x_size)
-            else:
-                x = blk(x, x_size)
-
-            if not torch.is_tensor(x):
-                x, loss_moe = x
+        for block in self.blocks:
+            result = block(x)
+            if isinstance(result, tuple):
+                x, loss_moe = result
                 loss_moe_all += loss_moe or 0
+            else:
+                x = result
 
         if self.downsample is not None:
             x = self.downsample(x)
         return x, loss_moe_all
 
-    def extra_repr(self) -> str:
-        return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
-
-    def flops(self):
-        flops = 0
-        for blk in self.blocks:
-            flops += blk.flops()
-        if self.downsample is not None:
-            flops += self.downsample.flops()
-        return flops
-
-    def _init_respostnorm(self):
-        for blk in self.blocks:
-            nn.init.constant_(blk.norm1.bias, 0)
-            nn.init.constant_(blk.norm1.weight, 0)
-            nn.init.constant_(blk.norm2.bias, 0)
-            nn.init.constant_(blk.norm2.weight, 0)
-
-
-class PatchEmbed(nn.Module):
-    r"""Image to Patch Embedding
-    Args:
-        img_size (int): Image size.  Default: 224.
-        patch_size (int): Patch token size. Default: 4.
-        in_chans (int): Number of input image channels. Default: 3.
-        embed_dim (int): Number of linear projection output channels. Default: 96.
-        norm_layer (nn.Module, optional): Normalization layer. Default: None
-    """
-
-    def __init__(
-        self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None
-    ):
-        super().__init__()
-        img_size = to_2tuple(img_size)
-        patch_size = to_2tuple(patch_size)
-        patches_resolution = [
-            img_size[0] // patch_size[0],
-            img_size[1] // patch_size[1],
-        ]
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.patches_resolution = patches_resolution
-        self.num_patches = patches_resolution[0] * patches_resolution[1]
-
-        self.in_chans = in_chans
-        self.embed_dim = embed_dim
-
-        self.proj = nn.Conv2d(
-            in_chans, embed_dim, kernel_size=patch_size, stride=patch_size
-        )
-        if norm_layer is not None:
-            self.norm = norm_layer(embed_dim)
-        else:
-            self.norm = None
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        # FIXME look at relaxing size constraints
-        # assert H == self.img_size[0] and W == self.img_size[1],
-        #     f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj(x).flatten(2).transpose(1, 2)  # B Ph*Pw C
-        if self.norm is not None:
-            x = self.norm(x)
-        return x
-
-    def flops(self):
-        Ho, Wo = self.patches_resolution
-        flops = (
-            Ho
-            * Wo
-            * self.embed_dim
-            * self.in_chans
-            * (self.patch_size[0] * self.patch_size[1])
-        )
-        if self.norm is not None:
-            flops += Ho * Wo * self.embed_dim
-        return flops
-
 
 class RSTB(nn.Module):
-    """Residual Swin Transformer Block (RSTB).
-
-    Args:
-        dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resolution.
-        depth (int): Number of blocks.
-        num_heads (int): Number of attention heads.
-        window_size (int): Local window size.
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
-        drop (float, optional): Dropout rate. Default: 0.0
-        attn_drop (float, optional): Attention dropout rate. Default: 0.0
-        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
-        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
-        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
-        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
-        img_size: Input image size.
-        patch_size: Patch size.
-        resi_connection: The convolutional block before residual connection.
+    """
+    Residual Swin Transformer Block (RSTB)
     """
 
     def __init__(
         self,
-        dim,
-        input_resolution,
-        depth,
-        num_heads,
-        window_size,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        drop=0.0,
-        attn_drop=0.0,
-        drop_path=0.0,
+        dim: int,
+        input_resolution: list[int],
+        depth: int,
+        num_heads: int,
+        window_size: int,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+        drop_path: float | list[float] = 0.0,
         norm_layer=nn.LayerNorm,
         downsample=None,
-        use_checkpoint=False,
-        img_size=224,
-        patch_size=4,
-        resi_connection="1conv",
-        use_lepe=False,
-        use_cpb_bias=True,
-        MoE_config=None,
-        use_rpe_bias=False,
+        img_size: int = 128,
+        patch_size: int = 4,
+        resi_connection: Literal["1conv", "3conv"] = "1conv",
+        use_lepe: bool = False,
+        use_cpb_bias: bool = True,
+        MoE_config: dict | None = None,
+        use_rpe_bias: bool = False,
     ):
         super(RSTB, self).__init__()
 
@@ -773,17 +575,17 @@ class RSTB(nn.Module):
             drop_path=drop_path,
             norm_layer=norm_layer,
             downsample=downsample,
-            use_checkpoint=use_checkpoint,
             use_lepe=use_lepe,
             use_cpb_bias=use_cpb_bias,
             MoE_config=MoE_config,
             use_rpe_bias=use_rpe_bias,
         )
 
+        # Tipo di connessione residua da adottare
         if resi_connection == "1conv":
             self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
         elif resi_connection == "3conv":
-            # to save parameters and memory
+            # Diminuisce i canali per poi riespanderli alla fine
             self.conv = nn.Sequential(
                 nn.Conv2d(dim, dim // 4, 3, 1, 1),
                 nn.LeakyReLU(negative_slope=0.2, inplace=True),
@@ -797,7 +599,6 @@ class RSTB(nn.Module):
             patch_size=patch_size,
             in_chans=dim,
             embed_dim=dim,
-            norm_layer=None,
         )
 
         self.patch_unembed = PatchUnEmbed(
@@ -805,10 +606,9 @@ class RSTB(nn.Module):
             patch_size=patch_size,
             in_chans=dim,
             embed_dim=dim,
-            norm_layer=None,
         )
 
-    def forward(self, x, x_size):
+    def forward(self, x: Tensor, x_size: list[int]) -> tuple[Tensor, Tensor | None]:
         loss_moe = None
         res = self.residual_group(x, x_size)
 
@@ -816,265 +616,103 @@ class RSTB(nn.Module):
             res, loss_moe = res
 
         res = self.patch_embed(self.conv(self.patch_unembed(res, x_size)))
-        return res + x, loss_moe
-
-    def flops(self):
-        flops = 0
-        flops += self.residual_group.flops()
-        H, W = self.input_resolution
-        flops += H * W * self.dim * self.dim * 9
-        flops += self.patch_embed.flops()
-        flops += self.patch_unembed.flops()
-
-        return flops
-
-
-class PatchUnEmbed(nn.Module):
-    r"""Image to Patch Unembedding
-
-    Args:
-        img_size (int): Image size.  Default: 224.
-        patch_size (int): Patch token size. Default: 4.
-        in_chans (int): Number of input image channels. Default: 3.
-        embed_dim (int): Number of linear projection output channels. Default: 96.
-        norm_layer (nn.Module, optional): Normalization layer. Default: None
-    """
-
-    def __init__(
-        self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None
-    ):
-        super().__init__()
-        img_size = to_2tuple(img_size)
-        patch_size = to_2tuple(patch_size)
-        patches_resolution = [
-            img_size[0] // patch_size[0],
-            img_size[1] // patch_size[1],
-        ]
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.patches_resolution = patches_resolution
-        self.num_patches = patches_resolution[0] * patches_resolution[1]
-
-        self.in_chans = in_chans
-        self.embed_dim = embed_dim
-
-    def forward(self, x, x_size):
-        B, HW, C = x.shape
-        x = x.transpose(1, 2).view(B, self.embed_dim, x_size[0], x_size[1])  # B Ph*Pw C
-        return x
-
-    def flops(self):
-        flops = 0
-        return flops
-
-
-class Upsample(nn.Sequential):
-    """Upsample module.
-
-    Args:
-        scale (int): Scale factor. Supported scales: 2^n and 3.
-        num_feat (int): Channel number of intermediate features.
-    """
-
-    def __init__(self, scale, num_feat):
-        m = []
-        if (scale & (scale - 1)) == 0:  # scale = 2^n
-            for _ in range(int(math.log(scale, 2))):
-                m.append(nn.Conv2d(num_feat, 4 * num_feat, 3, 1, 1))
-                m.append(nn.PixelShuffle(2))
-        elif scale == 3:
-            m.append(nn.Conv2d(num_feat, 9 * num_feat, 3, 1, 1))
-            m.append(nn.PixelShuffle(3))
-        else:
-            raise ValueError(
-                f"scale {scale} is not supported. " "Supported scales: 2^n and 3."
-            )
-        super(Upsample, self).__init__(*m)
-
-
-class Upsample_hf(nn.Sequential):
-    """Upsample module.
-
-    Args:
-        scale (int): Scale factor. Supported scales: 2^n and 3.
-        num_feat (int): Channel number of intermediate features.
-    """
-
-    def __init__(self, scale, num_feat):
-        m = []
-        if (scale & (scale - 1)) == 0:  # scale = 2^n
-            for _ in range(int(math.log(scale, 2))):
-                m.append(nn.Conv2d(num_feat, 4 * num_feat, 3, 1, 1))
-                m.append(nn.PixelShuffle(2))
-        elif scale == 3:
-            m.append(nn.Conv2d(num_feat, 9 * num_feat, 3, 1, 1))
-            m.append(nn.PixelShuffle(3))
-        else:
-            raise ValueError(
-                f"scale {scale} is not supported. " "Supported scales: 2^n and 3."
-            )
-        super(Upsample_hf, self).__init__(*m)
-
-
-class UpsampleOneStep(nn.Sequential):
-    """UpsampleOneStep module (the difference with Upsample is that it always only has 1conv + 1pixelshuffle)
-       Used in lightweight SR to save parameters.
-
-    Args:
-        scale (int): Scale factor. Supported scales: 2^n and 3.
-        num_feat (int): Channel number of intermediate features.
-
-    """
-
-    def __init__(self, scale, num_feat, num_out_ch, input_resolution=None):
-        self.num_feat = num_feat
-        self.input_resolution = input_resolution
-        m = []
-        m.append(nn.Conv2d(num_feat, (scale**2) * num_out_ch, 3, 1, 1))
-        m.append(nn.PixelShuffle(scale))
-        super(UpsampleOneStep, self).__init__(*m)
-
-    def flops(self):
-        H, W = self.input_resolution
-        flops = H * W * self.num_feat * 3 * 9
-        return flops
+        return x + res, loss_moe
 
 
 class Swin2MoSE(nn.Module):
-    r"""Swin2-MoSE
-
-    Args:
-        img_size (int | tuple(int)): Input image size. Default 64
-        patch_size (int | tuple(int)): Patch size. Default: 1
-        in_chans (int): Number of input image channels. Default: 3
-        embed_dim (int): Patch embedding dimension. Default: 96
-        depths (tuple(int)): Depth of each Swin Transformer layer.
-        num_heads (tuple(int)): Number of attention heads in different layers.
-        window_size (int): Window size. Default: 7
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
-        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
-        drop_rate (float): Dropout rate. Default: 0
-        attn_drop_rate (float): Attention dropout rate. Default: 0
-        drop_path_rate (float): Stochastic depth rate. Default: 0.1
-        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
-        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
-        patch_norm (bool): If True, add normalization after patch embedding. Default: True
-        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
-        upscale: Upscale factor. 2/3/4/8 for image SR, 1 for denoising and compress artifact reduction
-        img_range: Image range. 1. or 255.
-        upsampler: The reconstruction reconstruction module. 'pixelshuffle'/'pixelshuffledirect'/'nearest+conv'/None
-        resi_connection: The convolutional block before residual connection. '1conv'/'3conv'
-    """
-
     def __init__(
         self,
-        img_size=64,
-        patch_size=1,
-        in_chans=3,
-        embed_dim=96,
-        depths=[6, 6, 6, 6],
-        num_heads=[6, 6, 6, 6],
-        window_size=7,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        drop_rate=0.0,
-        attn_drop_rate=0.0,
-        drop_path_rate=0.1,
+        img_size: int = 128,
+        patch_size: int = 1,
+        embed_dim: int = 96,
+        depths: list[int] = [6, 6, 6, 6],
+        num_heads: list[int] = [6, 6, 6, 6],
+        window_size: int = 7,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        dropout_rate: float = 0.0,
+        attn_dropout_rate: float = 0.0,
+        drop_path_rate: float = 0.1,
         norm_layer=nn.LayerNorm,
-        ape=False,
-        patch_norm=True,
-        use_checkpoint=False,
-        upscale=2,
-        img_range=1.0,
-        upsampler="",
-        resi_connection="1conv",
-        use_lepe=False,
-        use_cpb_bias=True,
-        MoE_config=None,
-        use_rpe_bias=False,
-        **kwargs,
+        ape: bool = False,
+        patch_norm: bool = True,
+        upscale: int = 5,
+        upsampler: str = "pixelshuffle",
+        resi_connection: Literal["1conv", "3conv"] = "1conv",
+        use_lepe: bool = False,
+        use_cpb_bias: bool = True,
+        MoE_config: dict | None = None,
+        use_rpe_bias: bool = False,
     ):
         super(Swin2MoSE, self).__init__()
-        num_in_ch = in_chans
-        num_out_ch = in_chans
+        num_in_ch = 4
+        num_out_ch = 4
         num_feat = 64
-        self.img_range = img_range
-        if in_chans == 3:
-            rgb_mean = (0.4488, 0.4371, 0.4040)
-            self.mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
-        else:
-            self.mean = torch.zeros(1, 1, 1, 1)
         self.upscale = upscale
         self.upsampler = upsampler
         self.window_size = window_size
 
-        #####################################################################################################
-        ################################### 1, shallow feature extraction ###################################
-        self.conv_first = nn.Conv2d(num_in_ch, embed_dim, 3, 1, 1)
+        ############ 1. Shallow feature extraction ############
+        self.conv_first = nn.Conv2d(
+            num_in_ch, embed_dim, kernel_size=3, stride=1, padding=1
+        )
 
-        #####################################################################################################
-        ################################### 2, deep feature extraction ######################################
+        ############ 2. Deep feature extraction ############
         self.num_layers = len(depths)
         self.embed_dim = embed_dim
         self.ape = ape
-        self.patch_norm = patch_norm
         self.num_features = embed_dim
         self.mlp_ratio = mlp_ratio
 
-        # split image into non-overlapping patches
+        # Layer di embedding in non overlapping patch
         self.patch_embed = PatchEmbed(
             img_size=img_size,
             patch_size=patch_size,
             in_chans=embed_dim,
             embed_dim=embed_dim,
-            norm_layer=norm_layer if self.patch_norm else None,
         )
         num_patches = self.patch_embed.num_patches
-        patches_resolution = self.patch_embed.patches_resolution
+        patches_resolution = self.patch_embed.patch_resolution
         self.patches_resolution = patches_resolution
 
-        # merge non-overlapping patches into image
+        # Layer di unembedding
         self.patch_unembed = PatchUnEmbed(
             img_size=img_size,
             patch_size=patch_size,
             in_chans=embed_dim,
             embed_dim=embed_dim,
-            norm_layer=norm_layer if self.patch_norm else None,
         )
 
-        # absolute position embedding
+        # Absolute Positional Embedding
         if self.ape:
             self.absolute_pos_embed = nn.Parameter(
                 torch.zeros(1, num_patches, embed_dim)
             )
-            trunc_normal_(self.absolute_pos_embed, std=0.02)
+            nn.init.trunc_normal_(self.absolute_pos_embed, std=0.02)
 
-        self.pos_drop = nn.Dropout(p=drop_rate)
+        self.pos_drop = nn.Dropout(p=dropout_rate)
 
-        # stochastic depth
-        dpr = [
-            x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))
-        ]  # stochastic depth decay rule
+        # Stochastic Depth (Drop Path)
+        dpr: list[float] = [
+            x.item() for x in torch.linspace(0, drop_path_rate, steps=sum(depths))
+        ]
 
-        # build Residual Swin Transformer blocks (RSTB)
+        # Costruiamo i Residual Swin Transformer Blocks (RSTB)
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
             layer = RSTB(
                 dim=embed_dim,
-                input_resolution=(patches_resolution[0], patches_resolution[1]),
+                input_resolution=patches_resolution,
                 depth=depths[i_layer],
                 num_heads=num_heads[i_layer],
                 window_size=window_size,
-                mlp_ratio=self.mlp_ratio,
+                mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias,
-                drop=drop_rate,
-                attn_drop=attn_drop_rate,
-                drop_path=dpr[
-                    sum(depths[:i_layer]) : sum(depths[: i_layer + 1])
-                ],  # no impact on SR results
+                drop=dropout_rate,
+                attn_drop=attn_dropout_rate,
+                drop_path=dpr[sum(depths[:i_layer]) : sum(depths[: i_layer + 1])],
                 norm_layer=norm_layer,
-                downsample=None,
-                use_checkpoint=use_checkpoint,
+                downsample=None,  # No downsampling in RSTB
                 img_size=img_size,
                 patch_size=patch_size,
                 resi_connection=resi_connection,
@@ -1085,25 +723,24 @@ class Swin2MoSE(nn.Module):
             )
             self.layers.append(layer)
 
-        if self.upsampler == "pixelshuffle_hf":
+        if self.upsampler == "pixelshuffle":
             self.layers_hf = nn.ModuleList()
             for i_layer in range(self.num_layers):
                 layer = RSTB(
                     dim=embed_dim,
-                    input_resolution=(patches_resolution[0], patches_resolution[1]),
+                    input_resolution=patches_resolution,
                     depth=depths[i_layer],
                     num_heads=num_heads[i_layer],
                     window_size=window_size,
                     mlp_ratio=self.mlp_ratio,
                     qkv_bias=qkv_bias,
-                    drop=drop_rate,
-                    attn_drop=attn_drop_rate,
+                    drop=dropout_rate,
+                    attn_drop=attn_dropout_rate,
                     drop_path=dpr[
                         sum(depths[:i_layer]) : sum(depths[: i_layer + 1])
                     ],  # no impact on SR results
                     norm_layer=norm_layer,
                     downsample=None,
-                    use_checkpoint=use_checkpoint,
                     img_size=img_size,
                     patch_size=patch_size,
                     resi_connection=resi_connection,
@@ -1116,11 +753,10 @@ class Swin2MoSE(nn.Module):
 
         self.norm = norm_layer(self.num_features)
 
-        # build the last conv layer in deep feature extraction
+        # Costruiamo l'ultimo layer di convoluzione
         if resi_connection == "1conv":
             self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
         elif resi_connection == "3conv":
-            # to save parameters and memory
             self.conv_after_body = nn.Sequential(
                 nn.Conv2d(embed_dim, embed_dim // 4, 3, 1, 1),
                 nn.LeakyReLU(negative_slope=0.2, inplace=True),
@@ -1129,8 +765,7 @@ class Swin2MoSE(nn.Module):
                 nn.Conv2d(embed_dim // 4, embed_dim, 3, 1, 1),
             )
 
-        #####################################################################################################
-        ################################ 3, high quality image reconstruction ################################
+        ############ 3. Ricostruzione dell'immagine ############
         if self.upsampler == "pixelshuffle":
             # for classical SR
             self.conv_before_upsample = nn.Sequential(
@@ -1189,8 +824,6 @@ class Swin2MoSE(nn.Module):
             # for image denoising and JPEG compression artifact reduction
             self.conv_last = nn.Conv2d(embed_dim, num_out_ch, 3, 1, 1)
 
-        self.apply(self._init_weights)
-
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=0.02)
@@ -1200,11 +833,9 @@ class Swin2MoSE(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    @torch.jit.ignore
     def no_weight_decay(self):
         return {"absolute_pos_embed"}
 
-    @torch.jit.ignore
     def no_weight_decay_keywords(self):
         return {"relative_position_bias_table"}
 
@@ -1403,13 +1034,94 @@ class Swin2MoSE(nn.Module):
         else:
             return x[:, :, : H * self.upscale, : W * self.upscale], loss_moe
 
-    def flops(self):
-        flops = 0
-        H, W = self.patches_resolution
-        flops += H * W * 3 * self.embed_dim * 9
-        flops += self.patch_embed.flops()
-        for i, layer in enumerate(self.layers):
-            flops += layer.flops()
-        flops += H * W * 3 * self.embed_dim * self.embed_dim
-        flops += self.upsample.flops()
-        return flops
+
+def main():
+    """Funzione principale per addestrare e valutare il modello di super risoluzione."""
+
+    # Puliamo la memoria CUDA
+    torch.cuda.empty_cache()
+
+    config = Config()
+
+    # Dispositivo
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Seed per riproducibilità
+    torch.manual_seed(config.train.seed)
+    np.random.seed(config.train.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(config.train.seed)
+
+    try:
+
+        # Dataset di valutazione
+        test_dataset = SuperResolutionDataset(
+            config.test.comune,
+            config.model.scale,
+            config.test.dataset_size,
+            config.model.patch_size,
+        )
+
+        # Creazione del modello
+        model = Swin2MoSE(config).to(device)
+
+        print(f"Parametri: {sum(p.numel() for p in model.parameters())}")
+
+        if config.test.load_model:
+            # Caricamento del modello esistente
+            model = load_model(config, model, device)
+            visualize_predictions(model, test_dataset, device, config)
+            return
+
+        # Altrimenti alleniamo il modello
+
+        # Dataset di addestramento
+        train_dataset = SuperResolutionDataset(
+            config.train.comune,
+            config.model.scale,
+            config.model.patch_size,
+            config.train.dataset_size,
+            config.train.augment_data,
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            config.train.batch_size,
+            num_workers=config.train.workers,
+            persistent_workers=True,
+        )
+
+        # Allenamento
+        print("Starting training...")
+        losses = train_model(model, train_loader, device, config)
+
+        # Plottiamo la loss del training logaritmica
+        plt.figure(figsize=(12, 8))
+        plt.plot(losses)
+        plt.title("Training Loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.yscale("log")
+        plt.grid(True)
+        plt.savefig(f"{config.model.dir_path}{config.model.name}/loss.png")
+        plt.show()
+
+        print("Evaluating model...")
+        metrics = evaluate_model(model, train_loader, device)
+        save_metrics(metrics, config)
+
+        visualize_predictions(model, test_dataset, device, config)
+
+        # Salvataggio del modello
+        save_model(model, config)
+
+    except Exception as e:
+        print(f"Error occurred during training: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
