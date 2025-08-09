@@ -1,6 +1,7 @@
 import os
 import yaml
 from dataclasses import dataclass
+from typing import Literal, Optional
 from data_utils import ComuneType
 
 
@@ -10,9 +11,28 @@ class ModelConfig:
     dir_path: str
     scale: int
     patch_size: int
+
+
+@dataclass
+class RCANModelConfig(ModelConfig):
     residual_groups: int
     feature_extraction_channels: int
     reduction_channels: int
+
+
+@dataclass
+class Swin2MoseModelConfig(ModelConfig):
+    embed_dim: int
+    depths: list[int]
+    num_heads: list[int]
+    window_size: int
+    mlp_ratio: float
+    upsampler: str
+    resi_connection: Literal["1conv", "3conv"]
+    MoE_config: Optional[dict]
+    use_lepe: bool
+    use_cpb_bias: bool
+    use_rpe_bias: bool
 
 
 @dataclass
@@ -37,7 +57,7 @@ class TestConfig:
 
 
 class Config:
-    def __init__(self, config_path: str = "Super_Resolution/rcan/config.yml"):
+    def __init__(self, config_path):
         with open(config_path, "r") as f:
             config_dict = yaml.safe_load(f)
 
@@ -51,3 +71,29 @@ class Config:
 
     def __repr__(self):
         return f"Config(model={self.model}, train={self.train}, test={self.test})"
+
+
+class ConfigRCAN(Config):
+    def __init__(self, config_path="Super_Resolution/rcan/config.yml"):
+        with open(config_path, "r") as f:
+            config_dict = yaml.safe_load(f)
+
+        self.model = RCANModelConfig(**config_dict["model"])
+        self.train = TrainConfig(**config_dict["train"])
+        self.test = TestConfig(**config_dict["test"])
+
+        if not os.path.exists(os.path.join(self.model.dir_path, self.model.name)):
+            os.makedirs(os.path.join(self.model.dir_path, self.model.name))
+
+
+class ConfigSwin2Mose(Config):
+    def __init__(self, config_path="Super_Resolution/swin2mose/config.yml"):
+        with open(config_path, "r") as f:
+            config_dict = yaml.safe_load(f)
+
+        self.model = Swin2MoseModelConfig(**config_dict["model"])
+        self.train = TrainConfig(**config_dict["train"])
+        self.test = TestConfig(**config_dict["test"])
+
+        if not os.path.exists(os.path.join(self.model.dir_path, self.model.name)):
+            os.makedirs(os.path.join(self.model.dir_path, self.model.name))

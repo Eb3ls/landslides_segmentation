@@ -8,7 +8,7 @@ import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
-from Super_Resolution.config import Config
+from Super_Resolution.config import ConfigRCAN
 from Super_Resolution.model_utils import (
     evaluate_model,
     load_model,
@@ -82,7 +82,7 @@ class ResidualGroup(nn.Module):
 class RCAN(nn.Module):
     """Residual Channel Attention Network"""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: ConfigRCAN):
         super(RCAN, self).__init__()
         self.in_channels = 4
         self.n_channels = config.model.feature_extraction_channels
@@ -139,7 +139,7 @@ def main():
     # Puliamo la memoria CUDA
     torch.cuda.empty_cache()
 
-    config = Config()
+    config = ConfigRCAN()
 
     # Dispositivo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

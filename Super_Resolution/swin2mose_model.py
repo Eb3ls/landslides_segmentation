@@ -15,7 +15,7 @@ from typing import Literal
 from timm.layers.drop import DropPath
 from timm.layers.weight_init import trunc_normal_
 
-from Super_Resolution.config import Config
+from Super_Resolution.config import ConfigSwin2Mose
 from Super_Resolution.model_utils import (
     evaluate_model,
     load_model,
@@ -622,12 +622,8 @@ class RSTB(nn.Module):
 class Swin2MoSE(nn.Module):
     def __init__(
         self,
-        img_size: int = 128,
+        cfg: ConfigSwin2Mose,
         patch_size: int = 1,
-        embed_dim: int = 96,
-        depths: list[int] = [6, 6, 6, 6],
-        num_heads: list[int] = [6, 6, 6, 6],
-        window_size: int = 7,
         mlp_ratio: float = 4.0,
         qkv_bias: bool = True,
         dropout_rate: float = 0.0,
@@ -636,40 +632,34 @@ class Swin2MoSE(nn.Module):
         norm_layer=nn.LayerNorm,
         ape: bool = False,
         patch_norm: bool = True,
-        upscale: int = 5,
         upsampler: str = "pixelshuffle",
-        resi_connection: Literal["1conv", "3conv"] = "1conv",
-        use_lepe: bool = False,
-        use_cpb_bias: bool = True,
-        MoE_config: dict | None = None,
-        use_rpe_bias: bool = False,
     ):
         super(Swin2MoSE, self).__init__()
         num_in_ch = 4
         num_out_ch = 4
         num_feat = 64
-        self.upscale = upscale
+        self.upscale = cfg.model.scale
         self.upsampler = upsampler
-        self.window_size = window_size
+        self.window_size = cfg.model.window_size
 
         ############ 1. Shallow feature extraction ############
         self.conv_first = nn.Conv2d(
-            num_in_ch, embed_dim, kernel_size=3, stride=1, padding=1
+            num_in_ch, cfg.model.embed_dim, kernel_size=3, stride=1, padding=1
         )
 
         ############ 2. Deep feature extraction ############
-        self.num_layers = len(depths)
-        self.embed_dim = embed_dim
+        self.num_layers = len(cfg.model.depths)
+        self.embed_dim = cfg.model.embed_dim
         self.ape = ape
-        self.num_features = embed_dim
+        self.num_features = cfg.model.embed_dim
         self.mlp_ratio = mlp_ratio
 
         # Layer di embedding in non overlapping patch
         self.patch_embed = PatchEmbed(
-            img_size=img_size,
+            img_size=cfg.model.patch_size,
             patch_size=patch_size,
-            in_chans=embed_dim,
-            embed_dim=embed_dim,
+            in_chans=self.embed_dim,
+            embed_dim=self.embed_dim,
         )
         num_patches = self.patch_embed.num_patches
         patches_resolution = self.patch_embed.patch_resolution
@@ -677,16 +667,16 @@ class Swin2MoSE(nn.Module):
 
         # Layer di unembedding
         self.patch_unembed = PatchUnEmbed(
-            img_size=img_size,
+            img_size=cfg.model.patch_size,
             patch_size=patch_size,
-            in_chans=embed_dim,
-            embed_dim=embed_dim,
+            in_chans=self.embed_dim,
+            embed_dim=self.embed_dim,
         )
 
         # Absolute Positional Embedding
         if self.ape:
             self.absolute_pos_embed = nn.Parameter(
-                torch.zeros(1, num_patches, embed_dim)
+                torch.zeros(1, num_patches, self.embed_dim)
             )
             nn.init.trunc_normal_(self.absolute_pos_embed, std=0.02)
 
@@ -694,32 +684,37 @@ class Swin2MoSE(nn.Module):
 
         # Stochastic Depth (Drop Path)
         dpr: list[float] = [
-            x.item() for x in torch.linspace(0, drop_path_rate, steps=sum(depths))
+            x.item()
+            for x in torch.linspace(0, drop_path_rate, steps=sum(cfg.model.depths) + 1)
         ]
 
         # Costruiamo i Residual Swin Transformer Blocks (RSTB)
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
             layer = RSTB(
-                dim=embed_dim,
-                input_resolution=patches_resolution,
-                depth=depths[i_layer],
-                num_heads=num_heads[i_layer],
-                window_size=window_size,
+                dim=self.embed_dim,
+                input_resolution=self.patches_resolution,
+                depth=cfg.model.depths[i_layer],
+                num_heads=cfg.model.num_heads[i_layer],
+                window_size=cfg.model.window_size,
                 mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias,
                 drop=dropout_rate,
                 attn_drop=attn_dropout_rate,
-                drop_path=dpr[sum(depths[:i_layer]) : sum(depths[: i_layer + 1])],
+                drop_path=dpr[
+                    sum(cfg.model.depths[:i_layer]) : sum(
+                        cfg.model.depths[: i_layer + 1]
+                    )
+                ],
                 norm_layer=norm_layer,
                 downsample=None,  # No downsampling in RSTB
-                img_size=img_size,
+                img_size=cfg.model.patch_size,
                 patch_size=patch_size,
-                resi_connection=resi_connection,
-                use_lepe=use_lepe,
-                use_cpb_bias=use_cpb_bias,
-                MoE_config=MoE_config,
-                use_rpe_bias=use_rpe_bias,
+                resi_connection=cfg.model.resi_connection,
+                use_lepe=cfg.model.use_lepe,
+                use_cpb_bias=cfg.model.use_cpb_bias,
+                MoE_config=cfg.model.MoE_config,
+                use_rpe_bias=cfg.model.use_rpe_bias,
             )
             self.layers.append(layer)
 
@@ -727,85 +722,87 @@ class Swin2MoSE(nn.Module):
             self.layers_hf = nn.ModuleList()
             for i_layer in range(self.num_layers):
                 layer = RSTB(
-                    dim=embed_dim,
+                    dim=self.embed_dim,
                     input_resolution=patches_resolution,
-                    depth=depths[i_layer],
-                    num_heads=num_heads[i_layer],
-                    window_size=window_size,
+                    depth=cfg.model.depths[i_layer],
+                    num_heads=cfg.model.num_heads[i_layer],
+                    window_size=cfg.model.window_size,
                     mlp_ratio=self.mlp_ratio,
                     qkv_bias=qkv_bias,
                     drop=dropout_rate,
                     attn_drop=attn_dropout_rate,
                     drop_path=dpr[
-                        sum(depths[:i_layer]) : sum(depths[: i_layer + 1])
+                        sum(cfg.model.depths[:i_layer]) : sum(
+                            cfg.model.depths[: i_layer + 1]
+                        )
                     ],  # no impact on SR results
                     norm_layer=norm_layer,
                     downsample=None,
-                    img_size=img_size,
+                    img_size=cfg.model.patch_size,
                     patch_size=patch_size,
-                    resi_connection=resi_connection,
-                    use_lepe=use_lepe,
-                    use_cpb_bias=use_cpb_bias,
-                    MoE_config=MoE_config,
-                    use_rpe_bias=use_rpe_bias,
+                    resi_connection=cfg.model.resi_connection,
+                    use_lepe=cfg.model.use_lepe,
+                    use_cpb_bias=cfg.model.use_cpb_bias,
+                    MoE_config=cfg.model.MoE_config,
+                    use_rpe_bias=cfg.model.use_rpe_bias,
                 )
                 self.layers_hf.append(layer)
 
         self.norm = norm_layer(self.num_features)
 
         # Costruiamo l'ultimo layer di convoluzione
-        if resi_connection == "1conv":
-            self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
-        elif resi_connection == "3conv":
+        if cfg.model.resi_connection == "1conv":
+            self.conv_after_body = nn.Conv2d(self.embed_dim, self.embed_dim, 3, 1, 1)
+        elif cfg.model.resi_connection == "3conv":
             self.conv_after_body = nn.Sequential(
-                nn.Conv2d(embed_dim, embed_dim // 4, 3, 1, 1),
+                nn.Conv2d(self.embed_dim, self.embed_dim // 4, 3, 1, 1),
                 nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                nn.Conv2d(embed_dim // 4, embed_dim // 4, 1, 1, 0),
+                nn.Conv2d(self.embed_dim // 4, self.embed_dim // 4, 1, 1, 0),
                 nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                nn.Conv2d(embed_dim // 4, embed_dim, 3, 1, 1),
+                nn.Conv2d(self.embed_dim // 4, self.embed_dim, 3, 1, 1),
             )
 
         ############ 3. Ricostruzione dell'immagine ############
         if self.upsampler == "pixelshuffle":
             # for classical SR
             self.conv_before_upsample = nn.Sequential(
-                nn.Conv2d(embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
+                nn.Conv2d(self.embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
             )
-            self.upsample = Upsample(upscale, num_feat)
+            self.upsample = Upsample(cfg.model.scale, num_feat)
             self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
         elif self.upsampler == "pixelshuffle_aux":
             self.conv_bicubic = nn.Conv2d(num_in_ch, num_feat, 3, 1, 1)
             self.conv_before_upsample = nn.Sequential(
-                nn.Conv2d(embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
+                nn.Conv2d(self.embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
             )
             self.conv_aux = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
             self.conv_after_aux = nn.Sequential(
                 nn.Conv2d(3, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
             )
-            self.upsample = Upsample(upscale, num_feat)
+            self.upsample = Upsample(cfg.model.scale, num_feat)
             self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
 
         elif self.upsampler == "pixelshuffle_hf":
             self.conv_before_upsample = nn.Sequential(
-                nn.Conv2d(embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
+                nn.Conv2d(self.embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
             )
-            self.upsample = Upsample(upscale, num_feat)
-            self.upsample_hf = Upsample_hf(upscale, num_feat)
+            self.upsample = Upsample(cfg.model.scale, num_feat)
+            self.upsample_hf = Upsample_hf(cfg.model.scale, num_feat)
             self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
             self.conv_first_hf = nn.Sequential(
-                nn.Conv2d(num_feat, embed_dim, 3, 1, 1), nn.LeakyReLU(inplace=True)
+                nn.Conv2d(num_feat, self.embed_dim, 3, 1, 1), nn.LeakyReLU(inplace=True)
             )
-            self.conv_after_body_hf = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
+            self.conv_after_body_hf = nn.Conv2d(self.embed_dim, self.embed_dim, 3, 1, 1)
             self.conv_before_upsample_hf = nn.Sequential(
-                nn.Conv2d(embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
+                nn.Conv2d(self.embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
             )
             self.conv_last_hf = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
 
         elif self.upsampler == "pixelshuffledirect":
             # for lightweight SR (to save parameters)
             self.upsample = UpsampleOneStep(
-                upscale,
-                embed_dim,
+                cfg.model.scale,
+                self.embed_dim,
                 num_out_ch,
                 (patches_resolution[0], patches_resolution[1]),
             )
@@ -813,7 +810,7 @@ class Swin2MoSE(nn.Module):
             # for real-world SR (less artifacts)
             assert self.upscale == 4, "only support x4 now."
             self.conv_before_upsample = nn.Sequential(
-                nn.Conv2d(embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
+                nn.Conv2d(self.embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
             )
             self.conv_up1 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
             self.conv_up2 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
@@ -822,7 +819,7 @@ class Swin2MoSE(nn.Module):
             self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
         else:
             # for image denoising and JPEG compression artifact reduction
-            self.conv_last = nn.Conv2d(embed_dim, num_out_ch, 3, 1, 1)
+            self.conv_last = nn.Conv2d(self.embed_dim, num_out_ch, 3, 1, 1)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -1041,7 +1038,7 @@ def main():
     # Puliamo la memoria CUDA
     torch.cuda.empty_cache()
 
-    config = Config()
+    config = ConfigSwin2Mose()
 
     # Dispositivo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
