@@ -221,6 +221,81 @@ def get_super_resolution_stack(
     return (sentinel_pre_stack, agea_stack), (sentinel_post_stack, cgr_stack)
 
 
+def get_landslide_mask(landslides: np.ndarray) -> np.ndarray:
+    """Genera una maschera booleana per le frane a partire dalla mappa delle frane
+
+    Args:
+        landslides: Array numpy (CHW) contenente i dati delle frane
+
+    Returns:
+        Maschera delle frane (CHW) con valori booleani
+    """
+    landslide_mask = landslides[0] > 0  # Soglia arbitraria
+    landslide_mask = landslide_mask.astype(np.bool_)
+    if landslide_mask.ndim == 2:
+        landslide_mask = np.expand_dims(landslide_mask, axis=0)
+
+    return landslide_mask
+
+
+def get_segmentation_stack(
+    comune: ComuneType,
+) -> Tuple[np.ndarray, np.ndarray]:
+
+    directory = os.path.join(MAIN_DIR, comune)
+
+    if not os.path.exists(directory):
+        raise FileNotFoundError(f"Directory '{directory}' does not exist")
+
+    # Creiamo ndarray (C, H, W) stackiamo su i canali
+    input_stack = []
+    output_stack = []
+
+    # Prendiamo la maschera del comune
+    mask = generate_dataset_mask(comune)
+
+    for filename in os.listdir(directory):
+        # Saltiamo i file non rilevanti
+        if any(substr in filename.lower() for substr in ["sentinel2", "slope", "ndvi"]):
+            continue
+
+        path = os.path.join(directory, filename)
+
+        with rasterio.open(path) as src:
+            data = get_data(src, True)
+
+            data[:, ~mask] = 0
+
+            # Otteniamo i canali come liste di array 2D
+            bands = list(data)
+
+            if "Agea" in filename:
+                input_stack.extend(bands)
+            elif "Cgr" in filename:
+                input_stack.extend(bands)
+            elif "Frane" in filename:
+                landslide_mask = get_landslide_mask(bands)
+                output_stack.extend(landslide_mask)
+            else:
+                print(f"File '{filename}' not recognized, skipping.")
+
+    if not input_stack:
+        raise ValueError("No input data found")
+    if not output_stack:
+        raise ValueError("No output data found")
+
+    # Convertiamo le liste in array numpy, stack di default sul primo asse
+    input_stack = np.stack(input_stack)
+    output_stack = np.stack(output_stack)
+
+    if input_stack.shape[1:] != output_stack.shape[1:]:
+        raise ValueError(
+            "Input and output stacks must have the same spatial dimensions"
+        )
+
+    return (input_stack, output_stack)
+
+
 # TODO: considerare la quantitá di valori validi nella maschera
 def check_similarity(
     first_img: np.ndarray,
@@ -294,7 +369,7 @@ def get_random_patch(
         ValueError: Se gli input non rispettano i requisiti di forma o dimensione
     """
 
-    if first_img.shape != second_img.shape:
+    if first_img.shape[1:] != second_img.shape[1:]:
         raise ValueError("Sentinel and drone data must have the same shape")
     if patch_size <= 0:
         raise ValueError("Patch size must be positive")
