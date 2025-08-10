@@ -1,4 +1,5 @@
 import math
+from typing import Literal
 from torch import Tensor, nn
 
 
@@ -71,6 +72,7 @@ class PatchEmbed(nn.Module):
     """
     Converte un tensore di dimensione (B, C, H, W) in un tensore di dimensione (B, N, C)
     dove N = num_patches = (H // patch_size) * (W // patch_size)
+    Tokenizza l'immagine in patch non sovrapposte.
     """
 
     def __init__(self, img_size: int, patch_size: int, in_chans: int, embed_dim: int):
@@ -92,7 +94,7 @@ class PatchEmbed(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        # Appiattimento delle dimensioni spaziali e porta i canali in coda
+        # Appiattimento delle dimensioni spaziali partendo dalla seconda inclusa e porta i canali in coda
         x = self.proj(x).flatten(2).transpose(1, 2)
         # Qui si potrebbe normalizzare
         return x
@@ -102,6 +104,7 @@ class PatchUnEmbed(nn.Module):
     """
     Converte un tensore di dimensione (B, HW, C) in un tensore di dimensione (B, C, X, X)
     dove X = img_size // patch_size
+    Ogni token 1D viene riconvertito in immagine 2D.
     """
 
     def __init__(self, img_size: int, patch_size: int, in_chans: int, embed_dim: int):
@@ -188,3 +191,19 @@ class UpsampleOneStep(nn.Sequential):
         m.append(nn.Conv2d(num_feat, (scale**2) * num_out_ch, 3, 1, 1))
         m.append(nn.PixelShuffle(scale))
         super(UpsampleOneStep, self).__init__(*m)
+
+
+def get_resi_connection(
+    resi_connection: Literal["1conv", "3conv"], dim: int
+) -> nn.Module:
+    if resi_connection == "1conv":
+        return nn.Conv2d(dim, dim, 3, 1, 1)
+    elif resi_connection == "3conv":
+        # Meno parametri riducendo e alla fine espandendo i canali
+        return nn.Sequential(
+            nn.Conv2d(dim, dim // 4, 3, 1, 1),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            nn.Conv2d(dim // 4, dim // 4, 1, 1, 0),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            nn.Conv2d(dim // 4, dim, 3, 1, 1),
+        )

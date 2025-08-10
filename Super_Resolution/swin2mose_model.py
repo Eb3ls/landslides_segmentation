@@ -32,6 +32,7 @@ from Super_Resolution.swin2mose.utils import (
     Upsample,
     Upsample_hf,
     UpsampleOneStep,
+    get_resi_connection,
     window_partition,
     window_reverse,
 )
@@ -181,7 +182,7 @@ class WindowAttention(nn.Module):
                 dim, dim, kernel_size=3, stride=1, padding=1, groups=dim
             )
 
-    def forward(self, x, mask=None):
+    def forward(self, x: Tensor, mask=None) -> Tensor:
         """
         Args:
             x: input features with shape of (num_windows*B, N, C)
@@ -327,6 +328,7 @@ class SwinTransformerBlock(nn.Module):
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
 
+        # Se MoE é None allora usiamo Multi-Layer Perceptron
         if MoE_config is None:
             print("-->>> MLP")
             self.mlp = Mlp(
@@ -352,7 +354,7 @@ class SwinTransformerBlock(nn.Module):
 
         self.register_buffer("attn_mask", attn_mask)
 
-    def calculate_mask(self, x_size):
+    def calculate_mask(self, x_size: list[int]) -> Tensor:
         # calculate attention mask for SW-MSA
         H, W = x_size
         img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
@@ -383,7 +385,7 @@ class SwinTransformerBlock(nn.Module):
 
         return attn_mask
 
-    def forward(self, x, x_size):
+    def forward(self, x: Tensor, x_size: list[int]) -> tuple[Tensor, Tensor | None]:
         H, W = x_size
         B, L, C = x.shape
 
@@ -450,7 +452,8 @@ class SwinTransformerBlock(nn.Module):
 
 class BasicLayer(nn.Module):
     """
-    Basic Layer for Swin Transformer
+    Basic Layer for Swin Transformer.
+    Contiene depth blocchi di SwinTransformerBlock
     """
 
     def __init__(
@@ -466,7 +469,6 @@ class BasicLayer(nn.Module):
         attn_drop: float = 0.0,
         drop_path: float | list[float] = 0.0,
         norm_layer=nn.LayerNorm,
-        downsample=None,
         use_lepe: bool = False,
         pretrained_window_size: int = 0,
         use_cpb_bias: bool = True,
@@ -505,34 +507,21 @@ class BasicLayer(nn.Module):
             ]
         )
 
-        # Patch merging layer
-        if downsample is not None:
-            self.downsample = downsample(
-                dim=dim,
-                input_resolution=input_resolution,
-                norm_layer=norm_layer,
-            )
-        else:
-            self.downsample = None
+        # No downsampling in BasicLayer
 
-    def forward(self, x: Tensor) -> tuple[Tensor, float]:
+    def forward(self, x: Tensor, x_size: list[int]) -> tuple[Tensor, float]:
         loss_moe_all = 0
         for block in self.blocks:
-            result = block(x)
-            if isinstance(result, tuple):
-                x, loss_moe = result
-                loss_moe_all += loss_moe or 0
-            else:
-                x = result
+            x, loss_moe = block(x, x_size)
+            loss_moe_all += loss_moe or 0
 
-        if self.downsample is not None:
-            x = self.downsample(x)
         return x, loss_moe_all
 
 
 class RSTB(nn.Module):
     """
     Residual Swin Transformer Block (RSTB)
+    Applica un BasicLayer e una connessione residua
     """
 
     def __init__(
@@ -548,7 +537,6 @@ class RSTB(nn.Module):
         attn_drop: float = 0.0,
         drop_path: float | list[float] = 0.0,
         norm_layer=nn.LayerNorm,
-        downsample=None,
         img_size: int = 128,
         patch_size: int = 4,
         resi_connection: Literal["1conv", "3conv"] = "1conv",
@@ -574,7 +562,6 @@ class RSTB(nn.Module):
             attn_drop=attn_drop,
             drop_path=drop_path,
             norm_layer=norm_layer,
-            downsample=downsample,
             use_lepe=use_lepe,
             use_cpb_bias=use_cpb_bias,
             MoE_config=MoE_config,
@@ -582,17 +569,7 @@ class RSTB(nn.Module):
         )
 
         # Tipo di connessione residua da adottare
-        if resi_connection == "1conv":
-            self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
-        elif resi_connection == "3conv":
-            # Diminuisce i canali per poi riespanderli alla fine
-            self.conv = nn.Sequential(
-                nn.Conv2d(dim, dim // 4, 3, 1, 1),
-                nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                nn.Conv2d(dim // 4, dim // 4, 1, 1, 0),
-                nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                nn.Conv2d(dim // 4, dim, 3, 1, 1),
-            )
+        self.conv = get_resi_connection(resi_connection, dim)
 
         self.patch_embed = PatchEmbed(
             img_size=img_size,
@@ -609,13 +586,9 @@ class RSTB(nn.Module):
         )
 
     def forward(self, x: Tensor, x_size: list[int]) -> tuple[Tensor, Tensor | None]:
-        loss_moe = None
-        res = self.residual_group(x, x_size)
-
-        if not torch.is_tensor(res):
-            res, loss_moe = res
-
+        res, loss_moe = self.residual_group(x, x_size)
         res = self.patch_embed(self.conv(self.patch_unembed(res, x_size)))
+
         return x + res, loss_moe
 
 
@@ -630,16 +603,15 @@ class Swin2MoSE(nn.Module):
         attn_dropout_rate: float = 0.0,
         drop_path_rate: float = 0.1,
         norm_layer=nn.LayerNorm,
-        ape: bool = False,
-        patch_norm: bool = True,
-        upsampler: str = "pixelshuffle",
     ):
         super(Swin2MoSE, self).__init__()
         num_in_ch = 4
         num_out_ch = 4
         num_feat = 64
+        self.img_range = 1
+        self.mean = torch.zeros(num_in_ch)
         self.upscale = cfg.model.scale
-        self.upsampler = upsampler
+        self.upsampler = cfg.model.upsampler
         self.window_size = cfg.model.window_size
 
         ############ 1. Shallow feature extraction ############
@@ -650,7 +622,7 @@ class Swin2MoSE(nn.Module):
         ############ 2. Deep feature extraction ############
         self.num_layers = len(cfg.model.depths)
         self.embed_dim = cfg.model.embed_dim
-        self.ape = ape
+        self.ape = cfg.model.ape
         self.num_features = cfg.model.embed_dim
         self.mlp_ratio = mlp_ratio
 
@@ -675,9 +647,12 @@ class Swin2MoSE(nn.Module):
 
         # Absolute Positional Embedding
         if self.ape:
+            # Tramite nn.Parameter il tensore dopo che lo abbiamo inizializzato é considerato un parametro del modello e quindi
+            # viene ottimizzato durante il training
             self.absolute_pos_embed = nn.Parameter(
                 torch.zeros(1, num_patches, self.embed_dim)
             )
+            # Inizializziamo il tensore con una distribuzione normale troncata
             nn.init.trunc_normal_(self.absolute_pos_embed, std=0.02)
 
         self.pos_drop = nn.Dropout(p=dropout_rate)
@@ -707,7 +682,6 @@ class Swin2MoSE(nn.Module):
                     )
                 ],
                 norm_layer=norm_layer,
-                downsample=None,  # No downsampling in RSTB
                 img_size=cfg.model.patch_size,
                 patch_size=patch_size,
                 resi_connection=cfg.model.resi_connection,
@@ -737,7 +711,6 @@ class Swin2MoSE(nn.Module):
                         )
                     ],  # no impact on SR results
                     norm_layer=norm_layer,
-                    downsample=None,
                     img_size=cfg.model.patch_size,
                     patch_size=patch_size,
                     resi_connection=cfg.model.resi_connection,
@@ -751,16 +724,9 @@ class Swin2MoSE(nn.Module):
         self.norm = norm_layer(self.num_features)
 
         # Costruiamo l'ultimo layer di convoluzione
-        if cfg.model.resi_connection == "1conv":
-            self.conv_after_body = nn.Conv2d(self.embed_dim, self.embed_dim, 3, 1, 1)
-        elif cfg.model.resi_connection == "3conv":
-            self.conv_after_body = nn.Sequential(
-                nn.Conv2d(self.embed_dim, self.embed_dim // 4, 3, 1, 1),
-                nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                nn.Conv2d(self.embed_dim // 4, self.embed_dim // 4, 1, 1, 0),
-                nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                nn.Conv2d(self.embed_dim // 4, self.embed_dim, 3, 1, 1),
-            )
+        self.conv_after_body = get_resi_connection(
+            cfg.model.resi_connection, self.embed_dim
+        )
 
         ############ 3. Ricostruzione dell'immagine ############
         if self.upsampler == "pixelshuffle":
@@ -781,7 +747,6 @@ class Swin2MoSE(nn.Module):
             )
             self.upsample = Upsample(cfg.model.scale, num_feat)
             self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
-
         elif self.upsampler == "pixelshuffle_hf":
             self.conv_before_upsample = nn.Sequential(
                 nn.Conv2d(self.embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
@@ -797,9 +762,8 @@ class Swin2MoSE(nn.Module):
                 nn.Conv2d(self.embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
             )
             self.conv_last_hf = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
-
         elif self.upsampler == "pixelshuffledirect":
-            # for lightweight SR (to save parameters)
+            # Semplice upsample con convoluzione 2D e pixel shuffle per upsampling
             self.upsample = UpsampleOneStep(
                 cfg.model.scale,
                 self.embed_dim,
@@ -821,6 +785,7 @@ class Swin2MoSE(nn.Module):
             # for image denoising and JPEG compression artifact reduction
             self.conv_last = nn.Conv2d(self.embed_dim, num_out_ch, 3, 1, 1)
 
+    # Da chiamare nel costruttore per inizializzare i pesi
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=0.02)
@@ -830,9 +795,11 @@ class Swin2MoSE(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
+    # Esclusi dal training optimizer dall'applicazione del weight decay
     def no_weight_decay(self):
         return {"absolute_pos_embed"}
 
+    # Esclusi se contengono le keyword specificate
     def no_weight_decay_keywords(self):
         return {"relative_position_bias_table"}
 
@@ -843,11 +810,17 @@ class Swin2MoSE(nn.Module):
         x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), "reflect")
         return x
 
-    def forward_features(self, x):
+    # Forward principale che esegue tutti i layers
+    def forward_features(self, x: Tensor) -> tuple[Tensor, float]:
+        # Shape HxW
         x_size = (x.shape[2], x.shape[3])
+        # Tokenizzazione in patch non sovrapposte
         x = self.patch_embed(x)
+
         if self.ape:
             x = x + self.absolute_pos_embed
+
+        # Dropout posizionale
         x = self.pos_drop(x)
 
         loss_moe_all = 0
@@ -856,8 +829,9 @@ class Swin2MoSE(nn.Module):
 
             if not torch.is_tensor(x):
                 x, loss_moe = x
-                loss_moe_all += loss_moe or 0
+                loss_moe_all += loss_moe if loss_moe is not None else 0
 
+        # Normalizzazione finale
         x = self.norm(x)  # B L C
         x = self.patch_unembed(x, x_size)
 
@@ -883,32 +857,36 @@ class Swin2MoSE(nn.Module):
 
         return x, loss_moe_all
 
-    def forward_backbone(self, x):
-        H, W = x.shape[2:]
+    # Prima chiamata che estrae le feature shallow CREDO
+    def forward_backbone(self, x) -> torch.Tensor:
         x = self.check_image_size(x)
 
+        # Normalizzazione
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
 
         if self.upsampler == "pixelshuffledirect":
-            # for lightweight SR
+            # shallow
             x = self.conv_first(x)
 
-            res = self.forward_features(x)
-            if not torch.is_tensor(res):
-                res, loss_moe = res
+            # deep
+            res, _ = self.forward_features(x)
 
+            # residual connection
             x = self.conv_after_body(res) + x
         else:
             raise Exception("not implemented yet")
 
+        # Denormalizzazione
         x = x / self.img_range + self.mean
         return x
 
+    # Metodo principale per il forward del modello
     def forward(self, x):
         H, W = x.shape[2:]
         x = self.check_image_size(x)
 
+        # Normalizzazione
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
 
@@ -972,15 +950,14 @@ class Swin2MoSE(nn.Module):
             x_hf = self.conv_last_hf(self.upsample_hf(x_hf))
             x = x_out + x_hf
             x_hf = x_hf / self.img_range + self.mean
-
         elif self.upsampler == "pixelshuffledirect":
-            # for lightweight SR
+            # Shallow features
             x = self.conv_first(x)
 
-            res = self.forward_features(x)
-            if not torch.is_tensor(res):
-                res, loss_moe = res
+            # Deep features con layer RSTB
+            res, loss_moe = self.forward_features(x)
 
+            # Residual connection
             x = self.conv_after_body(res) + x
             x = self.upsample(x)
         elif self.upsampler == "nearest+conv":
@@ -1018,7 +995,6 @@ class Swin2MoSE(nn.Module):
         x = x / self.img_range + self.mean
         if self.upsampler == "pixelshuffle_aux":
             return x[:, :, : H * self.upscale, : W * self.upscale], aux, loss_moe
-
         elif self.upsampler == "pixelshuffle_hf":
             x_out = x_out / self.img_range + self.mean
             return (
@@ -1029,6 +1005,7 @@ class Swin2MoSE(nn.Module):
             )
 
         else:
+            # Crop del tensore alle dimensioni obiettivo nel caso in cui sia stato fatto padding
             return x[:, :, : H * self.upscale, : W * self.upscale], loss_moe
 
 
