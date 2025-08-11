@@ -118,6 +118,9 @@ def train_model(
         optimizer, T_max=config.train.epochs, eta_min=1e-6
     )
 
+    use_amp = device.type == "cuda"
+    scaler = torch.GradScaler(enabled=use_amp)
+
     model.train()
     losses = []
 
@@ -134,16 +137,21 @@ def train_model(
                 low_res = low_res.to(device, non_blocking=True)
                 high_res = high_res.to(device, non_blocking=True)
 
-                outputs = model(low_res)
-
-                # Allenamento
-                loss = criterion(outputs, high_res)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                with torch.autocast(device.type, dtype=torch.float16, enabled=use_amp):
+                    outputs = model(low_res)
+                    # Allenamento
+                    loss = criterion(outputs, high_res)
+                    optimizer.zero_grad()
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
 
                 epoch_loss += loss.item()
-                pbar.set_postfix({"Loss": f"{loss.item():.6f}"})
+                pbar.set_postfix(
+                    {
+                        "Loss": f"{loss.item():.6f}, Scaling factor: {scaler.get_scale():.2f}"
+                    }
+                )
 
         scheduler.step()
 

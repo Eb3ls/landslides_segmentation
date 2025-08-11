@@ -276,7 +276,9 @@ class MoE(nn.Module):
         prob = torch.where(is_in, prob_if_in, prob_if_out)
         return prob
 
-    def noisy_top_k_gating(self, x, train, noise_epsilon=1e-2):
+    def noisy_top_k_gating(
+        self, x: torch.Tensor, train: bool, noise_epsilon: float = 1e-2
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Noisy top-k gating.
         See paper: https://arxiv.org/abs/1701.06538.
         Args:

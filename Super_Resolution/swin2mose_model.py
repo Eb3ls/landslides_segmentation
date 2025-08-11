@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
 
-from typing import Literal
+from typing import Literal, cast
 
 from timm.layers.drop import DropPath
 from timm.layers.weight_init import trunc_normal_
@@ -182,6 +182,28 @@ class WindowAttention(nn.Module):
                 dim, dim, kernel_size=3, stride=1, padding=1, groups=dim
             )
 
+    def lepe_pos(self, v: torch.Tensor) -> torch.Tensor:
+        """Compute Local Enhancement Positional Encoding (LEPE).
+        v shape: (B_, num_heads, N, head_dim), where N=window_size*window_size.
+        Returns a tensor with same shape as v to be added after attention.
+        """
+        B_, nH, N, Hd = v.shape
+        w = self.window_size[0]
+        assert (
+            N == w * w
+        ), "WindowAttention expects N == window_size*window_size when using LEPE"
+        C = nH * Hd
+        # Merge heads -> (B_, N, C)
+        x = v.permute(0, 2, 1, 3).contiguous().view(B_, N, C)
+        # To (B_, C, w, w)
+        x = x.transpose(1, 2).contiguous().view(B_, C, w, w)
+        # Depth-wise conv
+        x = self.get_v(x)
+        # Back to (B_, nH, N, Hd)
+        x = x.view(B_, C, N).transpose(1, 2).contiguous().view(B_, N, nH, Hd)
+        x = x.permute(0, 2, 1, 3).contiguous()
+        return x
+
     def forward(self, x: Tensor, mask=None) -> Tensor:
         """
         Args:
@@ -204,6 +226,8 @@ class WindowAttention(nn.Module):
             qkv[2],
         )  # make torchscript happy (cannot use tensor as tuple)
 
+        # ensure lepe is defined for type checkers
+        lepe: torch.Tensor | None = None
         if self.use_lepe:
             lepe = self.lepe_pos(v)
 
@@ -219,9 +243,9 @@ class WindowAttention(nn.Module):
             relative_position_bias_table = self.cpb_mlp(
                 self.relative_coords_table
             ).view(-1, self.num_heads)
-            relative_position_bias = relative_position_bias_table[
-                self.relative_position_index.view(-1)
-            ].view(
+            rel_idx: torch.Tensor = cast(torch.Tensor, self.relative_position_index)
+            idx_flat = rel_idx.reshape(-1)
+            relative_position_bias = relative_position_bias_table[idx_flat].view(
                 self.window_size[0] * self.window_size[1],
                 self.window_size[0] * self.window_size[1],
                 -1,
@@ -233,8 +257,10 @@ class WindowAttention(nn.Module):
             attn = attn + relative_position_bias.unsqueeze(0)
 
         if self.use_rpe_bias:
+            rpe_idx: torch.Tensor = cast(torch.Tensor, self.rpe_relative_position_index)
+            idx_flat_rpe = rpe_idx.reshape(-1)
             relative_position_bias = self.relative_position_bias_table[
-                self.rpe_relative_position_index.view(-1)
+                idx_flat_rpe
             ].view(
                 self.window_size[0] * self.window_size[1],
                 self.window_size[0] * self.window_size[1],
@@ -259,7 +285,7 @@ class WindowAttention(nn.Module):
 
         x = attn @ v
 
-        if self.use_lepe:
+        if lepe is not None:
             x = x + lepe
 
         x = x.transpose(1, 2).reshape(B_, N, C)
@@ -304,7 +330,7 @@ class SwinTransformerBlock(nn.Module):
             self.window_size = min(self.input_resolution)
         assert (
             0 <= self.shift_size < self.window_size
-        ), "shift_size must in 0-window_size"
+        ), "shift_size must in 0-window-size"
 
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
@@ -510,10 +536,13 @@ class BasicLayer(nn.Module):
         # No downsampling in BasicLayer
 
     def forward(self, x: Tensor, x_size: list[int]) -> tuple[Tensor, float]:
-        loss_moe_all = 0
+        loss_moe_all: float = 0.0
         for block in self.blocks:
             x, loss_moe = block(x, x_size)
-            loss_moe_all += loss_moe or 0
+            if loss_moe is not None:
+                loss_moe_all += (
+                    loss_moe.item() if torch.is_tensor(loss_moe) else loss_moe
+                )
 
         return x, loss_moe_all
 
@@ -609,7 +638,9 @@ class Swin2MoSE(nn.Module):
         num_out_ch = 4
         num_feat = 64
         self.img_range = 1
-        self.mean = torch.zeros(num_in_ch)
+        # Registriamo la mean con shape [1, C, 1, 1]
+        # Il buffer serve per memorizzare un tensore che non è un parametro del modello ma una costante
+        self.register_buffer("mean", torch.zeros(1, num_in_ch, 1, 1))
         self.upscale = cfg.model.scale
         self.upsampler = cfg.model.upsampler
         self.window_size = cfg.model.window_size
@@ -743,7 +774,7 @@ class Swin2MoSE(nn.Module):
             )
             self.conv_aux = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
             self.conv_after_aux = nn.Sequential(
-                nn.Conv2d(3, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
+                nn.Conv2d(num_out_ch, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
             )
             self.upsample = Upsample(cfg.model.scale, num_feat)
             self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
@@ -785,6 +816,9 @@ class Swin2MoSE(nn.Module):
             # for image denoising and JPEG compression artifact reduction
             self.conv_last = nn.Conv2d(self.embed_dim, num_out_ch, 3, 1, 1)
 
+        # Per applicare l'inizializzazione dei pesi su LayerNorm e Linear
+        # self.apply(self._init_weights)
+
     # Da chiamare nel costruttore per inizializzare i pesi
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -823,13 +857,16 @@ class Swin2MoSE(nn.Module):
         # Dropout posizionale
         x = self.pos_drop(x)
 
-        loss_moe_all = 0
+        loss_moe_all = 0.0
         for layer in self.layers:
             x = layer(x, x_size)
 
             if not torch.is_tensor(x):
                 x, loss_moe = x
-                loss_moe_all += loss_moe if loss_moe is not None else 0
+                if loss_moe is not None:
+                    loss_moe_all += (
+                        loss_moe.item() if torch.is_tensor(loss_moe) else loss_moe
+                    )
 
         # Normalizzazione finale
         x = self.norm(x)  # B L C
@@ -844,13 +881,16 @@ class Swin2MoSE(nn.Module):
             x = x + self.absolute_pos_embed
         x = self.pos_drop(x)
 
-        loss_moe_all = 0
+        loss_moe_all = 0.0
         for layer in self.layers_hf:
             x = layer(x, x_size)
 
             if not torch.is_tensor(x):
                 x, loss_moe = x
-                loss_moe_all += loss_moe or 0
+                if loss_moe is not None:
+                    loss_moe_all += (
+                        loss_moe.item() if torch.is_tensor(loss_moe) else loss_moe
+                    )
 
         x = self.norm(x)  # B L C
         x = self.patch_unembed(x, x_size)
@@ -862,8 +902,9 @@ class Swin2MoSE(nn.Module):
         x = self.check_image_size(x)
 
         # Normalizzazione
-        self.mean = self.mean.type_as(x)
-        x = (x - self.mean) * self.img_range
+        mean_buf: torch.Tensor = cast(torch.Tensor, self.mean)
+        mean_buf = mean_buf.type_as(x)
+        x = (x - mean_buf) * self.img_range
 
         if self.upsampler == "pixelshuffledirect":
             # shallow
@@ -877,8 +918,7 @@ class Swin2MoSE(nn.Module):
         else:
             raise Exception("not implemented yet")
 
-        # Denormalizzazione
-        x = x / self.img_range + self.mean
+        # Return feature-space tensor (no denorm here)
         return x
 
     # Metodo principale per il forward del modello
@@ -887,8 +927,9 @@ class Swin2MoSE(nn.Module):
         x = self.check_image_size(x)
 
         # Normalizzazione
-        self.mean = self.mean.type_as(x)
-        x = (x - self.mean) * self.img_range
+        mean_buf: torch.Tensor = cast(torch.Tensor, self.mean)
+        mean_buf = mean_buf.type_as(x)
+        x = (x - mean_buf) * self.img_range
 
         loss_moe = 0
         if self.upsampler == "pixelshuffle":
@@ -897,7 +938,7 @@ class Swin2MoSE(nn.Module):
 
             res = self.forward_features(x)
             if not torch.is_tensor(res):
-                res, loss_moe = res
+                res, _ = res
 
             x = self.conv_after_body(res) + x
             x = self.conv_before_upsample(x)
@@ -914,25 +955,25 @@ class Swin2MoSE(nn.Module):
 
             res = self.forward_features(x)
             if not torch.is_tensor(res):
-                res, loss_moe = res
+                res, _ = res
 
             x = self.conv_after_body(res) + x
             x = self.conv_before_upsample(x)
-            aux = self.conv_aux(x)  # b, 3, LR_H, LR_W
+            aux = self.conv_aux(x)  # b, num_out_ch, LR_H, LR_W
             x = self.conv_after_aux(aux)
             x = (
                 self.upsample(x)[:, :, : H * self.upscale, : W * self.upscale]
                 + bicubic[:, :, : H * self.upscale, : W * self.upscale]
             )
             x = self.conv_last(x)
-            aux = aux / self.img_range + self.mean
+            # aux is not returned; keep only main SR output
         elif self.upsampler == "pixelshuffle_hf":
             # for classical SR with HF
             x = self.conv_first(x)
 
             res = self.forward_features(x)
             if not torch.is_tensor(res):
-                res, loss_moe = res
+                res, _ = res
 
             x = self.conv_after_body(res) + x
             x_before = self.conv_before_upsample(x)
@@ -942,20 +983,18 @@ class Swin2MoSE(nn.Module):
 
             res_hf = self.forward_features_hf(x_hf)
             if not torch.is_tensor(res_hf):
-                res_hf, loss_moe_hf = res_hf
-                loss_moe += loss_moe_hf
+                res_hf, _ = res_hf
 
             x_hf = self.conv_after_body_hf(res_hf) + x_hf
             x_hf = self.conv_before_upsample_hf(x_hf)
             x_hf = self.conv_last_hf(self.upsample_hf(x_hf))
             x = x_out + x_hf
-            x_hf = x_hf / self.img_range + self.mean
         elif self.upsampler == "pixelshuffledirect":
             # Shallow features
             x = self.conv_first(x)
 
             # Deep features con layer RSTB
-            res, loss_moe = self.forward_features(x)
+            res, _ = self.forward_features(x)
 
             # Residual connection
             x = self.conv_after_body(res) + x
@@ -966,7 +1005,7 @@ class Swin2MoSE(nn.Module):
 
             res = self.forward_features(x)
             if not torch.is_tensor(res):
-                res, loss_moe = res
+                res, _ = res
 
             x = self.conv_after_body(res) + x
             x = self.conv_before_upsample(x)
@@ -987,26 +1026,15 @@ class Swin2MoSE(nn.Module):
 
             res = self.forward_features(x_first)
             if not torch.is_tensor(res):
-                res, loss_moe = res
+                res, _ = res
 
             res = self.conv_after_body(res) + x_first
             x = x + self.conv_last(res)
 
-        x = x / self.img_range + self.mean
-        if self.upsampler == "pixelshuffle_aux":
-            return x[:, :, : H * self.upscale, : W * self.upscale], aux, loss_moe
-        elif self.upsampler == "pixelshuffle_hf":
-            x_out = x_out / self.img_range + self.mean
-            return (
-                x_out[:, :, : H * self.upscale, : W * self.upscale],
-                x[:, :, : H * self.upscale, : W * self.upscale],
-                x_hf[:, :, : H * self.upscale, : W * self.upscale],
-                loss_moe,
-            )
-
-        else:
-            # Crop del tensore alle dimensioni obiettivo nel caso in cui sia stato fatto padding
-            return x[:, :, : H * self.upscale, : W * self.upscale], loss_moe
+        # Denormalizzazione finale
+        x = x / self.img_range + mean_buf
+        # Crop del tensore alle dimensioni obiettivo nel caso in cui sia stato fatto padding
+        return x[:, :, : H * self.upscale, : W * self.upscale]
 
 
 def main():
@@ -1033,8 +1061,8 @@ def main():
         test_dataset = SuperResolutionDataset(
             config.test.comune,
             config.model.scale,
-            config.test.dataset_size,
             config.model.patch_size,
+            config.test.dataset_size,
         )
 
         # Creazione del modello

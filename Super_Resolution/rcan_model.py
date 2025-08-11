@@ -157,8 +157,8 @@ def main():
         test_dataset = SuperResolutionDataset(
             config.test.comune,
             config.model.scale,
-            config.test.dataset_size,
             config.model.patch_size,
+            config.test.dataset_size,
         )
 
         # Creazione del modello
