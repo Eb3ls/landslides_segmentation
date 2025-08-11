@@ -26,7 +26,6 @@ from Super_Resolution.model_utils import (
 )
 from Super_Resolution.swin2mose.moe import MoE
 from Super_Resolution.swin2mose.utils import (
-    Mlp,
     PatchEmbed,
     PatchUnEmbed,
     Upsample,
@@ -54,133 +53,68 @@ class WindowAttention(nn.Module):
 
     def __init__(
         self,
-        dim,
-        window_size,
-        num_heads,
-        qkv_bias=True,
-        attn_drop=0.0,
-        proj_drop=0.0,
-        pretrained_window_size=[0, 0],
-        use_lepe=False,
-        use_cpb_bias=True,
-        use_rpe_bias=False,
+        dim: int,
+        window_size: tuple[int, int],
+        num_heads: int,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        pretrained_window_size: tuple[int, int] = (0, 0),
     ):
-
         super().__init__()
         self.dim = dim
         self.window_size = window_size  # Wh, Ww
         self.pretrained_window_size = pretrained_window_size
         self.num_heads = num_heads
 
+        # Da capire
         self.logit_scale = nn.Parameter(
             torch.log(10 * torch.ones((num_heads, 1, 1))), requires_grad=True
         )
 
-        self.use_cpb_bias = use_cpb_bias
+        ######## Relative Position Bias impostato a True seguendo l'articolo ########
 
-        if self.use_cpb_bias:
-            print("positional encoder: CPB")
-            # mlp to generate continuous relative position bias
-            self.cpb_mlp = nn.Sequential(
-                nn.Linear(2, 512, bias=True),
-                nn.ReLU(inplace=True),
-                nn.Linear(512, num_heads, bias=False),
-            )
+        # Si crea una tabella 2*Wh-1 * 2*Ww-1, num_heads,
+        # copre tutte le possibili differenze di posizioni relative tra due patch
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads)
+        )
 
-            # get relative_coords_table
-            relative_coords_h = torch.arange(
-                -(self.window_size[0] - 1), self.window_size[0], dtype=torch.float32
-            )
-            relative_coords_w = torch.arange(
-                -(self.window_size[1] - 1), self.window_size[1], dtype=torch.float32
-            )
-            relative_coords_table = (
-                torch.stack(torch.meshgrid([relative_coords_h, relative_coords_w]))
-                .permute(1, 2, 0)
-                .contiguous()
-                .unsqueeze(0)
-            )  # 1, 2*Wh-1, 2*Ww-1, 2
-            if pretrained_window_size[0] > 0:
-                relative_coords_table[:, :, :, 0] /= pretrained_window_size[0] - 1
-                relative_coords_table[:, :, :, 1] /= pretrained_window_size[1] - 1
-            else:
-                relative_coords_table[:, :, :, 0] /= self.window_size[0] - 1
-                relative_coords_table[:, :, :, 1] /= self.window_size[1] - 1
-            relative_coords_table *= 8  # normalize to -8, 8
-            relative_coords_table = (
-                torch.sign(relative_coords_table)
-                * torch.log2(torch.abs(relative_coords_table) + 1.0)
-                / np.log2(8)
-            )
-
-            self.register_buffer("relative_coords_table", relative_coords_table)
-
-            # get pair-wise relative position index for each token inside the window
-            coords_h = torch.arange(self.window_size[0])
-            coords_w = torch.arange(self.window_size[1])
-            coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
-            coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
-            relative_coords = (
-                coords_flatten[:, :, None] - coords_flatten[:, None, :]
-            )  # 2, Wh*Ww, Wh*Ww
-            relative_coords = relative_coords.permute(
-                1, 2, 0
-            ).contiguous()  # Wh*Ww, Wh*Ww, 2
-            relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
-            relative_coords[:, :, 1] += self.window_size[1] - 1
-            relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
-            relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
-            self.register_buffer("relative_position_index", relative_position_index)
-
-        self.use_rpe_bias = use_rpe_bias
-        if self.use_rpe_bias:
-            print("positional encoder: RPE")
-            # define a parameter table of relative position bias
-            self.relative_position_bias_table = nn.Parameter(
-                torch.zeros(
-                    (2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads
-                )
-            )  # 2*Wh-1 * 2*Ww-1, nH
-
-            # get pair-wise relative position index for each token inside the window
-            coords_h = torch.arange(self.window_size[0])
-            coords_w = torch.arange(self.window_size[1])
-            coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
-            coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
-            relative_coords = (
-                coords_flatten[:, :, None] - coords_flatten[:, None, :]
-            )  # 2, Wh*Ww, Wh*Ww
-            relative_coords = relative_coords.permute(
-                1, 2, 0
-            ).contiguous()  # Wh*Ww, Wh*Ww, 2
-            relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
-            relative_coords[:, :, 1] += self.window_size[1] - 1
-            relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
-            rpe_relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
-            self.register_buffer(
-                "rpe_relative_position_index", rpe_relative_position_index
-            )
-
-            trunc_normal_(self.relative_position_bias_table, std=0.02)
+        # get pair-wise relative position index for each token inside the window
+        coords_h = torch.arange(self.window_size[0])
+        coords_w = torch.arange(self.window_size[1])
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+        relative_coords = (
+            coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        )  # 2, Wh*Ww, Wh*Ww
+        relative_coords = relative_coords.permute(
+            1, 2, 0
+        ).contiguous()  # Wh*Ww, Wh*Ww, 2
+        relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        rpe_relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+        self.register_buffer("rpe_relative_position_index", rpe_relative_position_index)
+        trunc_normal_(self.relative_position_bias_table, std=0.02)
 
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        # Se vero aggiunge un bias che il modello può imparare
         if qkv_bias:
             self.q_bias = nn.Parameter(torch.zeros(dim))
             self.v_bias = nn.Parameter(torch.zeros(dim))
         else:
             self.q_bias = None
             self.v_bias = None
+
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        # Applicata ai vettori dell'ultima dimensione
         self.softmax = nn.Softmax(dim=-1)
 
-        self.use_lepe = use_lepe
-        if self.use_lepe:
-            print("positional encoder: LEPE")
-            self.get_v = nn.Conv2d(
-                dim, dim, kernel_size=3, stride=1, padding=1, groups=dim
-            )
+        ######## Relative Position Bias impostato a True seguendo l'articolo ########
+        self.get_v = nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1, groups=dim)
 
     def lepe_pos(self, v: torch.Tensor) -> torch.Tensor:
         """Compute Local Enhancement Positional Encoding (LEPE).
@@ -210,26 +144,25 @@ class WindowAttention(nn.Module):
             x: input features with shape of (num_windows*B, N, C)
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
+        # num_windows sono state estratte dalle immagini e quindi batch diventa num_windows*B
         B_, N, C = x.shape
         qkv_bias = None
-        if self.q_bias is not None:
-            assert self.v_bias is not None, "v_bias must be set when q_bias is set"
+        if self.q_bias is not None and self.v_bias is not None:
             v_bias: torch.Tensor = self.v_bias
             qkv_bias = torch.cat(
                 (self.q_bias, torch.zeros_like(v_bias, requires_grad=False), v_bias)
             )
+
         qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
         qkv = qkv.reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         q, k, v = (
             qkv[0],
             qkv[1],
             qkv[2],
-        )  # make torchscript happy (cannot use tensor as tuple)
+        )
 
-        # ensure lepe is defined for type checkers
-        lepe: torch.Tensor | None = None
-        if self.use_lepe:
-            lepe = self.lepe_pos(v)
+        # LePE
+        lepe = self.lepe_pos(v)
 
         # cosine attention
         attn = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1)
@@ -239,37 +172,18 @@ class WindowAttention(nn.Module):
         ).exp()
         attn = attn * logit_scale
 
-        if self.use_cpb_bias:
-            relative_position_bias_table = self.cpb_mlp(
-                self.relative_coords_table
-            ).view(-1, self.num_heads)
-            rel_idx: torch.Tensor = cast(torch.Tensor, self.relative_position_index)
-            idx_flat = rel_idx.reshape(-1)
-            relative_position_bias = relative_position_bias_table[idx_flat].view(
-                self.window_size[0] * self.window_size[1],
-                self.window_size[0] * self.window_size[1],
-                -1,
-            )  # Wh*Ww,Wh*Ww,nH
-            relative_position_bias = relative_position_bias.permute(
-                2, 0, 1
-            ).contiguous()  # nH, Wh*Ww, Wh*Ww
-            relative_position_bias = 16 * torch.sigmoid(relative_position_bias)
-            attn = attn + relative_position_bias.unsqueeze(0)
-
-        if self.use_rpe_bias:
-            rpe_idx: torch.Tensor = cast(torch.Tensor, self.rpe_relative_position_index)
-            idx_flat_rpe = rpe_idx.reshape(-1)
-            relative_position_bias = self.relative_position_bias_table[
-                idx_flat_rpe
-            ].view(
-                self.window_size[0] * self.window_size[1],
-                self.window_size[0] * self.window_size[1],
-                -1,
-            )  # Wh*Ww,Wh*Ww,nH
-            relative_position_bias = relative_position_bias.permute(
-                2, 0, 1
-            ).contiguous()  # nH, Wh*Ww, Wh*Ww
-            attn = attn + relative_position_bias.unsqueeze(0)
+        # relative position bias
+        rpe_idx: torch.Tensor = cast(torch.Tensor, self.rpe_relative_position_index)
+        idx_flat_rpe = rpe_idx.reshape(-1)
+        relative_position_bias = self.relative_position_bias_table[idx_flat_rpe].view(
+            self.window_size[0] * self.window_size[1],
+            self.window_size[0] * self.window_size[1],
+            -1,
+        )  # Wh*Ww,Wh*Ww,nH
+        relative_position_bias = relative_position_bias.permute(
+            2, 0, 1
+        ).contiguous()  # nH, Wh*Ww, Wh*Ww
+        attn = attn + relative_position_bias.unsqueeze(0)
 
         if mask is not None:
             nW = mask.shape[0]
@@ -284,9 +198,7 @@ class WindowAttention(nn.Module):
         attn = self.attn_drop(attn)
 
         x = attn @ v
-
-        if lepe is not None:
-            x = x + lepe
+        x = x + lepe
 
         x = x.transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
@@ -302,6 +214,7 @@ class SwinTransformerBlock(nn.Module):
         dim: int,
         input_resolution: list[int],
         num_heads: int,
+        MoE_config: dict,
         window_size: int = 7,
         shift_size: int = 0,
         mlp_ratio: float = 4.0,
@@ -309,13 +222,8 @@ class SwinTransformerBlock(nn.Module):
         drop: float = 0.0,
         attn_drop: float = 0.0,
         drop_path: float | list[float] = 0.0,
-        act_layer=nn.GELU,
         norm_layer=nn.LayerNorm,
         pretrained_window_size: int = 0,
-        use_lepe: bool = False,
-        use_cpb_bias: bool = True,
-        MoE_config: dict | None = None,
-        use_rpe_bias: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -341,9 +249,6 @@ class SwinTransformerBlock(nn.Module):
             attn_drop=attn_drop,
             proj_drop=drop,
             pretrained_window_size=(pretrained_window_size, pretrained_window_size),
-            use_lepe=use_lepe,
-            use_cpb_bias=use_cpb_bias,
-            use_rpe_bias=use_rpe_bias,
         )
 
         if isinstance(drop_path, list) or drop_path is None:
@@ -355,23 +260,12 @@ class SwinTransformerBlock(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
 
         # Se MoE é None allora usiamo Multi-Layer Perceptron
-        if MoE_config is None:
-            print("-->>> MLP")
-            self.mlp = Mlp(
-                in_features=dim,
-                hidden_features=mlp_hidden_dim,
-                act_layer=act_layer,
-                drop=drop,
-            )
-        else:
-            print("-->>> MOE")
-            print(MoE_config)
-            self.mlp = MoE(
-                input_size=dim,
-                output_size=dim,
-                hidden_size=mlp_hidden_dim,
-                **MoE_config,
-            )
+        self.mlp = MoE(
+            input_size=dim,
+            output_size=dim,
+            hidden_size=mlp_hidden_dim,
+            **MoE_config,
+        )
 
         if self.shift_size > 0:
             attn_mask = self.calculate_mask(self.input_resolution)
@@ -489,17 +383,14 @@ class BasicLayer(nn.Module):
         depth: int,
         num_heads: int,
         window_size: int,
+        MoE_config: dict,
         mlp_ratio: float = 4.0,
         qkv_bias: bool = True,
         drop: float = 0.0,
         attn_drop: float = 0.0,
         drop_path: float | list[float] = 0.0,
         norm_layer=nn.LayerNorm,
-        use_lepe: bool = False,
         pretrained_window_size: int = 0,
-        use_cpb_bias: bool = True,
-        MoE_config: dict | None = None,
-        use_rpe_bias: bool = False,
     ):
         super(BasicLayer, self).__init__()
         self.dim = dim
@@ -524,10 +415,7 @@ class BasicLayer(nn.Module):
                     ),
                     norm_layer=norm_layer,
                     pretrained_window_size=pretrained_window_size,
-                    use_lepe=use_lepe,
-                    use_cpb_bias=use_cpb_bias,
                     MoE_config=MoE_config,
-                    use_rpe_bias=use_rpe_bias,
                 )
                 for i in range(depth)
             ]
@@ -560,6 +448,7 @@ class RSTB(nn.Module):
         depth: int,
         num_heads: int,
         window_size: int,
+        MoE_config: dict,
         mlp_ratio: float = 4.0,
         qkv_bias: bool = True,
         drop: float = 0.0,
@@ -569,10 +458,6 @@ class RSTB(nn.Module):
         img_size: int = 128,
         patch_size: int = 4,
         resi_connection: Literal["1conv", "3conv"] = "1conv",
-        use_lepe: bool = False,
-        use_cpb_bias: bool = True,
-        MoE_config: dict | None = None,
-        use_rpe_bias: bool = False,
     ):
         super(RSTB, self).__init__()
 
@@ -591,10 +476,7 @@ class RSTB(nn.Module):
             attn_drop=attn_drop,
             drop_path=drop_path,
             norm_layer=norm_layer,
-            use_lepe=use_lepe,
-            use_cpb_bias=use_cpb_bias,
             MoE_config=MoE_config,
-            use_rpe_bias=use_rpe_bias,
         )
 
         # Tipo di connessione residua da adottare
@@ -626,12 +508,13 @@ class Swin2MoSE(nn.Module):
         self,
         cfg: ConfigSwin2Mose,
         patch_size: int = 1,
+        norm_layer=nn.LayerNorm,
+        dropout_rate: float = 0.0,
+        # Parametri erediati da SwinTransformer, lascio default
         mlp_ratio: float = 4.0,
         qkv_bias: bool = True,
-        dropout_rate: float = 0.0,
         attn_dropout_rate: float = 0.0,
         drop_path_rate: float = 0.1,
-        norm_layer=nn.LayerNorm,
     ):
         super(Swin2MoSE, self).__init__()
         num_in_ch = 4
@@ -653,7 +536,6 @@ class Swin2MoSE(nn.Module):
         ############ 2. Deep feature extraction ############
         self.num_layers = len(cfg.model.depths)
         self.embed_dim = cfg.model.embed_dim
-        self.ape = cfg.model.ape
         self.num_features = cfg.model.embed_dim
         self.mlp_ratio = mlp_ratio
 
@@ -676,16 +558,8 @@ class Swin2MoSE(nn.Module):
             embed_dim=self.embed_dim,
         )
 
-        # Absolute Positional Embedding
-        if self.ape:
-            # Tramite nn.Parameter il tensore dopo che lo abbiamo inizializzato é considerato un parametro del modello e quindi
-            # viene ottimizzato durante il training
-            self.absolute_pos_embed = nn.Parameter(
-                torch.zeros(1, num_patches, self.embed_dim)
-            )
-            # Inizializziamo il tensore con una distribuzione normale troncata
-            nn.init.trunc_normal_(self.absolute_pos_embed, std=0.02)
-
+        # Dropout genera una maschera con prob di dropout_rate di azzerare gli elementi, gli altri vengono
+        # moltiplicati per 1/(1 - dropout_rate) per mantenere la media del tensore
         self.pos_drop = nn.Dropout(p=dropout_rate)
 
         # Stochastic Depth (Drop Path)
@@ -716,10 +590,7 @@ class Swin2MoSE(nn.Module):
                 img_size=cfg.model.patch_size,
                 patch_size=patch_size,
                 resi_connection=cfg.model.resi_connection,
-                use_lepe=cfg.model.use_lepe,
-                use_cpb_bias=cfg.model.use_cpb_bias,
                 MoE_config=cfg.model.MoE_config,
-                use_rpe_bias=cfg.model.use_rpe_bias,
             )
             self.layers.append(layer)
 
@@ -745,10 +616,7 @@ class Swin2MoSE(nn.Module):
                     img_size=cfg.model.patch_size,
                     patch_size=patch_size,
                     resi_connection=cfg.model.resi_connection,
-                    use_lepe=cfg.model.use_lepe,
-                    use_cpb_bias=cfg.model.use_cpb_bias,
                     MoE_config=cfg.model.MoE_config,
-                    use_rpe_bias=cfg.model.use_rpe_bias,
                 )
                 self.layers_hf.append(layer)
 
@@ -844,15 +712,33 @@ class Swin2MoSE(nn.Module):
         x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), "reflect")
         return x
 
+    def forward_features_hf(self, x):
+        x_size = (x.shape[2], x.shape[3])
+        x = self.patch_embed(x)
+        x = self.pos_drop(x)
+
+        loss_moe_all = 0.0
+        for layer in self.layers_hf:
+            x = layer(x, x_size)
+
+            if not torch.is_tensor(x):
+                x, loss_moe = x
+                if loss_moe is not None:
+                    loss_moe_all += (
+                        loss_moe.item() if torch.is_tensor(loss_moe) else loss_moe
+                    )
+
+        x = self.norm(x)  # B L C
+        x = self.patch_unembed(x, x_size)
+
+        return x, loss_moe_all
+
     # Forward principale che esegue tutti i layers
     def forward_features(self, x: Tensor) -> tuple[Tensor, float]:
         # Shape HxW
         x_size = (x.shape[2], x.shape[3])
         # Tokenizzazione in patch non sovrapposte
         x = self.patch_embed(x)
-
-        if self.ape:
-            x = x + self.absolute_pos_embed
 
         # Dropout posizionale
         x = self.pos_drop(x)
@@ -874,53 +760,6 @@ class Swin2MoSE(nn.Module):
 
         return x, loss_moe_all
 
-    def forward_features_hf(self, x):
-        x_size = (x.shape[2], x.shape[3])
-        x = self.patch_embed(x)
-        if self.ape:
-            x = x + self.absolute_pos_embed
-        x = self.pos_drop(x)
-
-        loss_moe_all = 0.0
-        for layer in self.layers_hf:
-            x = layer(x, x_size)
-
-            if not torch.is_tensor(x):
-                x, loss_moe = x
-                if loss_moe is not None:
-                    loss_moe_all += (
-                        loss_moe.item() if torch.is_tensor(loss_moe) else loss_moe
-                    )
-
-        x = self.norm(x)  # B L C
-        x = self.patch_unembed(x, x_size)
-
-        return x, loss_moe_all
-
-    # Prima chiamata che estrae le feature shallow CREDO
-    def forward_backbone(self, x) -> torch.Tensor:
-        x = self.check_image_size(x)
-
-        # Normalizzazione
-        mean_buf: torch.Tensor = cast(torch.Tensor, self.mean)
-        mean_buf = mean_buf.type_as(x)
-        x = (x - mean_buf) * self.img_range
-
-        if self.upsampler == "pixelshuffledirect":
-            # shallow
-            x = self.conv_first(x)
-
-            # deep
-            res, _ = self.forward_features(x)
-
-            # residual connection
-            x = self.conv_after_body(res) + x
-        else:
-            raise Exception("not implemented yet")
-
-        # Return feature-space tensor (no denorm here)
-        return x
-
     # Metodo principale per il forward del modello
     def forward(self, x):
         H, W = x.shape[2:]
@@ -931,7 +770,6 @@ class Swin2MoSE(nn.Module):
         mean_buf = mean_buf.type_as(x)
         x = (x - mean_buf) * self.img_range
 
-        loss_moe = 0
         if self.upsampler == "pixelshuffle":
             # for classical SR
             x = self.conv_first(x)

@@ -37,12 +37,8 @@ class Swin2MoseModelConfig(ModelConfig):
     window_size: int
     mlp_ratio: float
     upsampler: UpsamplerType
-    ape: bool
     resi_connection: Literal["1conv", "3conv"]
-    MoE_config: Optional[dict]
-    use_lepe: bool
-    use_cpb_bias: bool
-    use_rpe_bias: bool
+    MoE_config: dict
 
 
 @dataclass
