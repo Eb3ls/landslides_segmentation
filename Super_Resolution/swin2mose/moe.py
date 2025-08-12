@@ -134,7 +134,9 @@ class SparseDispatcher(object):
         return torch.split(self._nonzero_gates, self._part_sizes, dim=0)
 
 
-def build_experts(experts_cfg, default_cfg, num_experts):
+def build_experts(
+    experts_cfg: dict | None, default_cfg: tuple[int, int, int], num_experts: int
+):
     experts_cfg = deepcopy(experts_cfg)
     if experts_cfg is None:
         # old build way
@@ -167,7 +169,7 @@ class MoE(nn.Module):
         output_size: int,
         num_experts: int,
         hidden_size: int,
-        experts=None,
+        experts: dict | None = None,
         noisy_gating: bool = True,
         k: int = 4,
         x_gating=None,
@@ -181,11 +183,13 @@ class MoE(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.k = k
+        # Nell'articolo il noise non viene usato
         self.with_noise = with_noise
         # instantiate experts
         self.experts = build_experts(
             experts, (self.input_size, self.hidden_size, self.output_size), num_experts
         )
+        # Parametri di gating da ottimizzare
         self.w_gate = nn.Parameter(
             torch.zeros(input_size, num_experts), requires_grad=True
         )
@@ -204,11 +208,13 @@ class MoE(nn.Module):
         assert self.k <= self.num_experts
 
         self.cnn_combine = None
+
+        # Nell'articolo usano smart merger
         if with_smart_merger == "v1":
-            print("with SMART MERGER")
+            # Convoluzione per combinare le uscite dei k esperti in un'unica uscita
             self.cnn_combine = nn.Conv2d(self.k, 1, kernel_size=3, padding=1)
 
-    def cv_squared(self, x):
+    def cv_squared(self, x: torch.Tensor) -> torch.Tensor:
         """The squared coefficient of variation of a sample.
         Useful as a loss to encourage a positive distribution to be more uniform.
         Epsilons added for numerical stability.
@@ -225,19 +231,24 @@ class MoE(nn.Module):
             return torch.tensor([0], device=x.device, dtype=x.dtype)
         return x.float().var() / (x.float().mean() ** 2 + eps)
 
-    def _gates_to_load(self, gates):
-        """Compute the true load per expert, given the gates.
-        The load is the number of examples for which the corresponding gate is >0.
+    def _gates_to_load(self, gates: torch.Tensor) -> torch.Tensor:
+        """Calcola il carico reale per esperto, dati i gates.
+        Il carico è il numero di esempi per cui il gate corrispondente è > 0.
         Args:
         gates: a `Tensor` of shape [batch_size, n]
         Returns:
         a float32 `Tensor` of shape [n]
         """
+        # Crea una maschera e poi somma i valori sulla prima dimensione
         return (gates > 0).sum(0)
 
     def _prob_in_top_k(
-        self, clean_values, noisy_values, noise_stddev, noisy_top_values
-    ):
+        self,
+        clean_values: torch.Tensor,
+        noisy_values: torch.Tensor,
+        noise_stddev: torch.Tensor,
+        noisy_top_values: torch.Tensor,
+    ) -> torch.Tensor:
         """Helper function to NoisyTopKGating.
         Computes the probability that value is in top k, given different random noise.
         This gives us a way of backpropagating from a loss that balances the number
@@ -270,7 +281,7 @@ class MoE(nn.Module):
             torch.gather(top_values_flat, 0, threshold_positions_if_out), 1
         )
         # is each value currently in the top k.
-        normal = Normal(self.mean, self.std)
+        normal = Normal(self.mean, self.std)  # type: ignore
         prob_if_in = normal.cdf((clean_values - threshold_if_in) / noise_stddev)
         prob_if_out = normal.cdf((clean_values - threshold_if_out) / noise_stddev)
         prob = torch.where(is_in, prob_if_in, prob_if_out)
@@ -289,10 +300,13 @@ class MoE(nn.Module):
           gates: a Tensor with shape [batch_size, num_experts]
           load: a Tensor with shape [num_experts]
         """
+        # Calcola i logits per ogni esperto
         clean_logits = x @ self.w_gate
         if self.noisy_gating and train:
             raw_noise_stddev = x @ self.w_noise
+            # Usa softplus per evitare valori negativi e un piccolo bias per evitare valori nulli
             noise_stddev = self.softplus(raw_noise_stddev) + noise_epsilon
+            # Aggiunge rumore gaussiano ai logits basato su noise_stddev
             noisy_logits = clean_logits + (
                 torch.randn_like(clean_logits) * noise_stddev
             )
@@ -300,26 +314,35 @@ class MoE(nn.Module):
         else:
             logits = clean_logits
 
-        # calculate topk + 1 that will be needed for the noisy gates
+        # Seleziona i top k+1 esperti sulla seconda dimensione (batch_size, num_experts) -> (batch_size, k+1)
+        # Ordine decrescente
         top_logits, top_indices = logits.topk(min(self.k + 1, self.num_experts), dim=1)
+        # Seleziona i top k logits e i loro indici
         top_k_logits = top_logits[:, : self.k]
         top_k_indices = top_indices[:, : self.k]
+        # Calcola il peso per i top k logits
         top_k_gates = self.softmax(top_k_logits)
+        top_k_gates = top_k_gates.to(dtype=logits.dtype)
 
+        # Crea un tensore di zeri con la stessa forma dei logits
         zeros = torch.zeros_like(logits, requires_grad=True)
+        # Sparge i valori di top_k_gates nei posti indicati da top_k_indices, gli altri sono 0
         gates = zeros.scatter(1, top_k_indices, top_k_gates)
 
         if self.noisy_gating and self.k < self.num_experts and train:
             load = (
                 self._prob_in_top_k(
-                    clean_logits, noisy_logits, noise_stddev, top_logits  # type: ignore
+                    clean_logits, noisy_logits, noise_stddev, top_logits  # type: ignore in questo ramo esiste sempre
                 )
             ).sum(0)
         else:
+            # Calcola per ogni esperto il carico, cioè il numero di esempi per cui il gate è > 0
             load = self._gates_to_load(gates)
         return gates, load
 
-    def forward(self, x, loss_coef=1e-2):
+    def forward(
+        self, x: torch.Tensor, loss_coef: float = 1e-2
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Args:
         x: tensor shape [batch_size, input_size]
         train: a boolean scalar.
@@ -336,7 +359,8 @@ class MoE(nn.Module):
         else:
             xg = x.mean(1)
 
-        gates, load = self.noisy_top_k_gating(xg, self.training and self.with_noise)
+        add_noise = self.training and self.with_noise
+        gates, load = self.noisy_top_k_gating(xg, add_noise)
         # calculate importance loss
         importance = gates.sum(0)
         #

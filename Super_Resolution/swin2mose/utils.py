@@ -3,21 +3,31 @@ from typing import Literal
 from torch import Tensor, nn
 
 
-def window_reverse(windows, window_size, H, W):
+def window_reverse(windows: Tensor, window_size: int, H: int, W: int) -> Tensor:
     """
+    Ricompone le finestre in un tensore di dimensione (B, H, W, C).
+
     Args:
         windows: (num_windows*B, window_size, window_size, C)
-        window_size (int): Window size
-        H (int): Height of image
-        W (int): Width of image
+        window_size
+        H: Height of image
+        W: Width of image
 
     Returns:
         x: (B, H, W, C)
     """
+    # Ricalcola il batch size
     B = int(windows.shape[0] / (H * W / window_size / window_size))
     x = windows.view(
-        B, H // window_size, W // window_size, window_size, window_size, -1
+        # Ricostruisce la view intermedia B, num_windows_H, window_size, num_windows_W, window_size, C
+        B,
+        H // window_size,
+        W // window_size,
+        window_size,
+        window_size,
+        -1,
     )
+    # Ricompone nella posizione spaziale originale
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return x
 
@@ -48,19 +58,24 @@ class Mlp(nn.Module):
         return x
 
 
-def window_partition(x, window_size):
+def window_partition(x: Tensor, window_size: int) -> Tensor:
     """
+    Scompone un tensore in finestre di dimensione window_size x window_size.
+
     Args:
         x: (B, H, W, C)
-        window_size (int): window size
+        window_size
 
     Returns:
         windows: (num_windows*B, window_size, window_size, C)
     """
     B, H, W, C = x.shape
+    # B, num_windows_H, window_size, num_windows_W, window_size, C
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
     windows = (
-        x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+        x.permute(0, 1, 3, 2, 4, 5).contiguous()
+        # Collassa le dimensioni Bx num_windows_H num_windows_W sul primo asse
+        .view(-1, window_size, window_size, C)
     )
     return windows
 
@@ -199,7 +214,7 @@ def get_resi_connection(
     if resi_connection == "1conv":
         return nn.Conv2d(dim, dim, 3, 1, 1)
     elif resi_connection == "3conv":
-        # Meno parametri riducendo e alla fine espandendo i canali
+        # Meno parametri riducendo e alla fine espandendo i canali (~ 1/2)
         return nn.Sequential(
             nn.Conv2d(dim, dim // 4, 3, 1, 1),
             nn.LeakyReLU(negative_slope=0.2, inplace=True),

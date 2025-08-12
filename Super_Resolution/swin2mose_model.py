@@ -39,8 +39,9 @@ from data_utils import SuperResolutionDataset
 
 
 class WindowAttention(nn.Module):
-    r"""Window based multi-head self attention (W-MSA) module with relative position bias.
-    It supports both of shifted and non-shifted window.
+    r"""Window based multi-head self attention (W-MSA) con rpe e LePE,
+    Supporta anche Shifted Window Attention (SW-MSA).
+
     Args:
         dim (int): Number of input channels.
         window_size (tuple[int]): The height and width of the window.
@@ -67,7 +68,8 @@ class WindowAttention(nn.Module):
         self.pretrained_window_size = pretrained_window_size
         self.num_heads = num_heads
 
-        # Da capire
+        # Parametro moltiplicato prima della softmax con l'attn QxK
+        # Requires grad fa si che qualsiasi operazione da questa venga tracciata per il backpropagation
         self.logit_scale = nn.Parameter(
             torch.log(10 * torch.ones((num_heads, 1, 1))), requires_grad=True
         )
@@ -98,6 +100,7 @@ class WindowAttention(nn.Module):
         self.register_buffer("rpe_relative_position_index", rpe_relative_position_index)
         trunc_normal_(self.relative_position_bias_table, std=0.02)
 
+        # Query, Key, Value
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         # Se vero aggiunge un bias che il modello può imparare
         if qkv_bias:
@@ -145,6 +148,7 @@ class WindowAttention(nn.Module):
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
         # num_windows sono state estratte dalle immagini e quindi batch diventa num_windows*B
+        # N é Wh * Ww, dimensione spaziale collassata in un vettore
         B_, N, C = x.shape
         qkv_bias = None
         if self.q_bias is not None and self.v_bias is not None:
@@ -153,7 +157,11 @@ class WindowAttention(nn.Module):
                 (self.q_bias, torch.zeros_like(v_bias, requires_grad=False), v_bias)
             )
 
+        # Calcola qvk con shape (B_, N, 3 * C), espande quindi le dimensioni di 3 per ognuna
         qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
+        # -1 dice di calcolare la dimensione automaticamente per lasciare il numero di elementi invariato
+        # Reshape per ottenere (B_, N, 3, num_heads, head_dim)
+        # Permuta per ottenere (3, B_, num_heads, N, head_dim), il numero indica la dimensione da mettere in quel posto
         qkv = qkv.reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         q, k, v = (
             qkv[0],
@@ -164,12 +172,15 @@ class WindowAttention(nn.Module):
         # LePE
         lepe = self.lepe_pos(v)
 
-        # cosine attention
+        # Prima normalizza Q e K, poi calcola l'attenzione (@ é il prodotto scalare)
+        # É la similaritá coseno tra ogni coppia query-key, valori [-1, 1]
         attn = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1)
         logit_scale = torch.clamp(
             self.logit_scale,
             max=torch.log(torch.tensor(1.0 / 0.01)).to(self.logit_scale.device),
         ).exp()
+        # Moltiplica per il logit scale prima della softmax, amplifica/riduce la temperatura dell'attenzione
+        # Aiuta a stabilizzare l'addestramento
         attn = attn * logit_scale
 
         # relative position bias
@@ -186,10 +197,15 @@ class WindowAttention(nn.Module):
         attn = attn + relative_position_bias.unsqueeze(0)
 
         if mask is not None:
+            # Numero di finestre per immagine
             nW = mask.shape[0]
+            # Raggruppato in (batch_size, nW, nH, N, N)
+            # Espansa mask per avere la forma (1, nW, 1, N, N), con il broadcasting é applicato a tutti i batch e alle finestre
+            # Se due token sono in finestre diverse nel layer prima sono da annullare
             attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(
                 1
             ).unsqueeze(0)
+            # Tornato alla forma originale per la softmax
             attn = attn.view(-1, self.num_heads, N, N)
             attn = self.softmax(attn)
         else:
@@ -197,9 +213,12 @@ class WindowAttention(nn.Module):
 
         attn = self.attn_drop(attn)
 
+        # Prodotto scalare tra l'attenzione e V
         x = attn @ v
+        # Sommata Local Enhancement Positional Encoding finale
         x = x + lepe
 
+        # Ritorna alla forma originale (B_, N, C)
         x = x.transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -221,7 +240,7 @@ class SwinTransformerBlock(nn.Module):
         qkv_bias: bool = True,
         drop: float = 0.0,
         attn_drop: float = 0.0,
-        drop_path: float | list[float] = 0.0,
+        drop_path: float = 0.0,
         norm_layer=nn.LayerNorm,
         pretrained_window_size: int = 0,
     ):
@@ -251,16 +270,13 @@ class SwinTransformerBlock(nn.Module):
             pretrained_window_size=(pretrained_window_size, pretrained_window_size),
         )
 
-        if isinstance(drop_path, list) or drop_path is None:
-            print("Using list of drop_path values")
-            raise TypeError("drop_path must be a single value, not a list")
-
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim)
+        # Definiti quanti neuroni ci sono nella MLP rispetto a dim di input
         mlp_hidden_dim = int(dim * mlp_ratio)
 
-        # Se MoE é None allora usiamo Multi-Layer Perceptron
-        self.mlp = MoE(
+        # Nell'articolo si usa MoE
+        self.moe = MoE(
             input_size=dim,
             output_size=dim,
             hidden_size=mlp_hidden_dim,
@@ -277,37 +293,41 @@ class SwinTransformerBlock(nn.Module):
     def calculate_mask(self, x_size: list[int]) -> Tensor:
         # calculate attention mask for SW-MSA
         H, W = x_size
-        img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
+        img_mask = torch.zeros((1, H, W, 1))
+        # Intervallo di righe e colonne
         h_slices = (
-            slice(0, -self.window_size),
-            slice(-self.window_size, -self.shift_size),
-            slice(-self.shift_size, None),
+            slice(0, -self.window_size),  # Parte alta
+            slice(-self.window_size, -self.shift_size),  # Parte centrale
+            slice(-self.shift_size, None),  # Parte bassa
         )
         w_slices = (
-            slice(0, -self.window_size),
-            slice(-self.window_size, -self.shift_size),
-            slice(-self.shift_size, None),
+            slice(0, -self.window_size),  # Parte sinistra
+            slice(-self.window_size, -self.shift_size),  # Parte centrale
+            slice(-self.shift_size, None),  # Parte destra
         )
+
+        # Per ogni combinazione di h_slices e w_slices, assegna un indice unico
         cnt = 0
         for h in h_slices:
             for w in w_slices:
                 img_mask[:, h, w, :] = cnt
                 cnt += 1
 
-        mask_windows = window_partition(
-            img_mask, self.window_size
-        )  # nW, window_size, window_size, 1
+        # Ha un solo canale perché fará broadcasting
+        mask_windows = window_partition(img_mask, self.window_size)
         mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+        # (nW, 1, N) - (nW, N, 1) -> (nW, N, N) matrice di differenza, 0 se i due token sono nella stessa regione
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        # Trasforma le differenze in -100 che dopo la softmax diventeranno 0
         attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(
             attn_mask == 0, float(0.0)
         )
 
         return attn_mask
 
-    def forward(self, x: Tensor, x_size: list[int]) -> tuple[Tensor, Tensor | None]:
+    def forward(self, x: Tensor, x_size: list[int]) -> tuple[Tensor, Tensor]:
         H, W = x_size
-        B, L, C = x.shape
+        B, _, C = x.shape
 
         shortcut = x
         x = x.view(B, H, W, C)
@@ -320,45 +340,40 @@ class SwinTransformerBlock(nn.Module):
         else:
             shifted_x = x
 
-        # partition windows
-        x_windows = window_partition(
-            shifted_x, self.window_size
-        )  # nW*B, window_size, window_size, C
-        x_windows = x_windows.view(
-            -1, self.window_size * self.window_size, C
-        )  # nW*B, window_size*window_size, C
+        # Partition windows
+        x_windows = window_partition(shifted_x, self.window_size)
+        # Collassa la dimensione spaziale delle finestre in un vettore
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
 
         # W-MSA/SW-MSA (to be compatible for testing on images whose shapes are the multiple of window size
         if self.input_resolution == x_size:
-            attn_windows = self.attn(
-                x_windows, mask=self.attn_mask
-            )  # nW*B, window_size*window_size, C
+            attn_windows = self.attn(x_windows, mask=self.attn_mask)
         else:
+            # Se la risoluzione di input non corrisponde a quella attesa, genera una nuova maschera
             attn_windows = self.attn(
                 x_windows, mask=self.calculate_mask(x_size).to(x.device)
             )
 
-        # merge windows
+        # Reshape in windows 2D
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
+        # Ricompone le finestre in un tensore di dimensione originale (B, H, W, C)
+        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
 
-        # reverse cyclic shift
+        # Shift back
         if self.shift_size > 0:
             x = torch.roll(
                 shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2)
             )
         else:
             x = shifted_x
+
+        # Ritorna alla forma in sequenza di token
         x = x.view(B, H * W, C)
+        # Attention + shortcut
         x = shortcut + self.drop_path(self.norm1(x))
 
-        # FFN
-
-        loss_moe = None
-        res = self.mlp(x)
-        if not torch.is_tensor(res):
-            res, loss_moe = res
-
+        res, loss_moe = self.moe(x)
+        # MoE + shortcut
         x = x + self.drop_path(self.norm2(res))
 
         return x, loss_moe

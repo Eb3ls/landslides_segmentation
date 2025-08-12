@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import napari
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from dataclasses import asdict
 
 # LPIPS genera warning sul modo in cui carica i pesi
 from piq import ssim, psnr, LPIPS, SSIMLoss
@@ -16,23 +17,49 @@ from Super_Resolution.config import Config
 from data_utils import SuperResolutionDataset
 
 
-def save_metrics(metrics_dict: dict, config: Config) -> None:
-    """Salva le metriche di valutazione in un file JSON.
+def _config_to_dict(config: Config) -> dict:
+    """Converte la Config in un dizionario annidato pronto per JSON."""
+    return {
+        "model": asdict(config.model),
+        "train": asdict(config.train),
+        "test": asdict(config.test),
+    }
 
-    Args:
-        metrics_dict: Dizionario contenente le metriche
-        config: Configurazione del modello
-    """
+
+def _json_default(o):
+    """Gestione di tipi non serializzabili (es. numpy) in JSON."""
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        return float(o)
+    if isinstance(o, (np.ndarray,)):
+        return o.tolist()
+    return str(o)
+
+
+def save_metrics(metrics_dict: dict, config: Config) -> None:
+    """Salva le metriche di valutazione in un file JSON formattato e leggibile."""
 
     metrics_data = {
         "timestamp": datetime.now().isoformat(),
         "model_name": config.model.name,
         "metrics": metrics_dict,
-        "model_config": str(config.model),
+        "model_config": _config_to_dict(config),
     }
 
-    with open(f"{config.model.dir_path}{config.model.name}/metrics.json", "w") as f:
-        json.dump(metrics_data, f, indent=4)
+    with open(
+        f"{config.model.dir_path}{config.model.name}/metrics.json",
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(
+            metrics_data,
+            f,
+            indent=4,
+            sort_keys=True,
+            ensure_ascii=False,
+            default=_json_default,
+        )
 
     print(f"Metrics saved to {config.model.dir_path}{config.model.name}/metrics.json")
 
@@ -111,6 +138,7 @@ def train_model(
     """Addestra il modello di super risoluzione."""
 
     # Loss and optimizer
+    # TODO restituire anche singoli valori per il plot separato
     criterion = ncc_ssim_loss
     # TODO guardare possibili optimizers
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
@@ -118,7 +146,11 @@ def train_model(
         optimizer, T_max=config.train.epochs, eta_min=1e-6
     )
 
-    use_amp = device.type == "cuda"
+    use_amp = device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 7
+    if use_amp:
+        print("Using Automatic Mixed Precision (AMP) for training.")
+    else:
+        print("AMP is not supported on this device, using full precision.")
     scaler = torch.GradScaler(enabled=use_amp)
 
     model.train()
