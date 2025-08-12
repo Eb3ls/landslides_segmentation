@@ -51,6 +51,8 @@ class TrainConfig:
     batch_size: int
     epochs: int
     show_progress: bool
+    use_moe_loss: bool
+    loss_weights: dict[Literal["ncc", "ssim", "moe"], float]
 
 
 @dataclass

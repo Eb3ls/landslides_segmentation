@@ -10,5 +10,7 @@ Super_Resolution/swin2mose/*
 venv
 
 # Files to keep
+!Super_Resolution/rcan/rcan_model.py
 !Super_Resolution/swin2mose/moe.py
 !Super_Resolution/swin2mose/utils.py
+!Super_Resolution/swin2mose/swin2mose_model.py

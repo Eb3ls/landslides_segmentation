@@ -3,12 +3,9 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from matplotlib import pyplot as plt
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
-from torch.utils.data import DataLoader
 
 from typing import Literal, cast
 
@@ -16,14 +13,6 @@ from timm.layers.drop import DropPath
 from timm.layers.weight_init import trunc_normal_
 
 from Super_Resolution.config import ConfigSwin2Mose
-from Super_Resolution.model_utils import (
-    evaluate_model,
-    load_model,
-    save_model,
-    train_model,
-    visualize_predictions,
-    save_metrics,
-)
 from Super_Resolution.swin2mose.moe import MoE
 from Super_Resolution.swin2mose.utils import (
     PatchEmbed,
@@ -85,7 +74,9 @@ class WindowAttention(nn.Module):
         # get pair-wise relative position index for each token inside the window
         coords_h = torch.arange(self.window_size[0])
         coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+        coords = torch.stack(
+            torch.meshgrid([coords_h, coords_w], indexing="ij")
+        )  # 2, Wh, Ww
         coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
         relative_coords = (
             coords_flatten[:, :, None] - coords_flatten[:, None, :]
@@ -785,6 +776,7 @@ class Swin2MoSE(nn.Module):
         mean_buf = mean_buf.type_as(x)
         x = (x - mean_buf) * self.img_range
 
+        total_moe_loss = 0.0
         if self.upsampler == "pixelshuffle":
             # for classical SR
             x = self.conv_first(x)
@@ -847,7 +839,8 @@ class Swin2MoSE(nn.Module):
             x = self.conv_first(x)
 
             # Deep features con layer RSTB
-            res, _ = self.forward_features(x)
+            res, moe_loss = self.forward_features(x)
+            total_moe_loss += moe_loss
 
             # Residual connection
             x = self.conv_after_body(res) + x
@@ -887,96 +880,5 @@ class Swin2MoSE(nn.Module):
         # Denormalizzazione finale
         x = x / self.img_range + mean_buf
         # Crop del tensore alle dimensioni obiettivo nel caso in cui sia stato fatto padding
-        return x[:, :, : H * self.upscale, : W * self.upscale]
-
-
-def main():
-    """Funzione principale per addestrare e valutare il modello di super risoluzione."""
-
-    # Puliamo la memoria CUDA
-    torch.cuda.empty_cache()
-
-    config = ConfigSwin2Mose()
-
-    # Dispositivo
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # Seed per riproducibilità
-    torch.manual_seed(config.train.seed)
-    np.random.seed(config.train.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(config.train.seed)
-
-    try:
-
-        # Dataset di valutazione
-        test_dataset = SuperResolutionDataset(
-            config.test.comune,
-            config.model.scale,
-            config.model.patch_size,
-            config.test.dataset_size,
-        )
-
-        # Creazione del modello
-        model = Swin2MoSE(config).to(device)
-
-        print(f"Parametri: {sum(p.numel() for p in model.parameters())}")
-
-        if config.test.load_model:
-            # Caricamento del modello esistente
-            model = load_model(config, model, device)
-            visualize_predictions(model, test_dataset, device, config)
-            return
-
-        # Altrimenti alleniamo il modello
-
-        # Dataset di addestramento
-        train_dataset = SuperResolutionDataset(
-            config.train.comune,
-            config.model.scale,
-            config.model.patch_size,
-            config.train.dataset_size,
-            config.train.augment_data,
-        )
-
-        train_loader = DataLoader(
-            train_dataset,
-            config.train.batch_size,
-            num_workers=config.train.workers,
-            persistent_workers=True,
-        )
-
-        # Allenamento
-        print("Starting training...")
-        losses = train_model(model, train_loader, device, config)
-
-        # Plottiamo la loss del training logaritmica
-        plt.figure(figsize=(12, 8))
-        plt.plot(losses)
-        plt.title("Training Loss")
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.yscale("log")
-        plt.grid(True)
-        plt.savefig(f"{config.model.dir_path}{config.model.name}/loss.png")
-        plt.show()
-
-        print("Evaluating model...")
-        metrics = evaluate_model(model, train_loader, device)
-        save_metrics(metrics, config)
-
-        visualize_predictions(model, test_dataset, device, config)
-
-        # Salvataggio del modello
-        save_model(model, config)
-
-    except Exception as e:
-        print(f"Error occurred during training: {e}")
-        import traceback
-
-        traceback.print_exc()
-
-
-if __name__ == "__main__":
-    main()
+        out = x[:, :, : H * self.upscale, : W * self.upscale]
+        return out, total_moe_loss

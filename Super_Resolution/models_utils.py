@@ -1,5 +1,6 @@
 import json
 import random
+from typing import Literal
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,7 +14,9 @@ from dataclasses import asdict
 # LPIPS genera warning sul modo in cui carica i pesi
 from piq import ssim, psnr, LPIPS, SSIMLoss
 from datetime import datetime
-from Super_Resolution.config import Config
+from Super_Resolution.config import Config, ConfigRCAN, ConfigSwin2Mose
+from Super_Resolution.rcan.rcan_model import RCAN
+from Super_Resolution.swin2mose.swin2mose_model import Swin2MoSE
 from data_utils import SuperResolutionDataset
 
 
@@ -118,15 +121,40 @@ def ncc_loss(sr: torch.Tensor, hr: torch.Tensor) -> torch.Tensor:
     return 1 - ((cc_value + 1) * 0.5)
 
 
-def ncc_ssim_loss(sr: torch.Tensor, hr: torch.Tensor) -> torch.Tensor:
+def ncc_ssim_loss(
+    sr: torch.Tensor,
+    hr: torch.Tensor,
+    config: Config,
+    moe_loss: float | torch.Tensor = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Calcola le componenti di loss (NCC, SSIM, MoE) e la loss totale.
+
+    Ritorna:
+        total_loss, ncc_component, ssim_component, moe_component
+    """
+    # NCC come loss (0 buono, 1 cattivo)
     ncc_value = ncc_loss(sr, hr)
 
-    # Clampiamo sr per evitare valori fuori range
+    # Clampiamo sr per evitare valori fuori range per SSIM
     sr = torch.clamp(sr, 0, 1)
 
-    ssim = SSIMLoss()
-    ssim_value = ssim(sr, hr)
-    return ncc_value + ssim_value
+    # SSIMLoss restituisce (1 - SSIM), quindi è già una loss
+    ssim_loss_val = SSIMLoss()(sr, hr)
+
+    # MoE può essere float o tensor: convertiamo a tensor su device corretto
+    if not torch.is_tensor(moe_loss):
+        moe_loss_tensor = torch.tensor(moe_loss, device=sr.device, dtype=sr.dtype)
+    else:
+        moe_loss_tensor = moe_loss.to(device=sr.device, dtype=sr.dtype)
+
+    # Applichiamo i pesi
+    ncc_component = config.train.loss_weights["ncc"] * ncc_value
+    ssim_component = config.train.loss_weights["ssim"] * ssim_loss_val
+    moe_component = config.train.loss_weights["moe"] * moe_loss_tensor
+
+    total_loss = ncc_component + ssim_component + moe_component
+
+    return total_loss, ncc_component, ssim_component, moe_component
 
 
 def train_model(
@@ -134,11 +162,13 @@ def train_model(
     dataloader: DataLoader,
     device: torch.device,
     config: Config,
-) -> list[float]:
-    """Addestra il modello di super risoluzione."""
+) -> dict[str, list[float]]:
+    """Addestra il modello di super risoluzione.
+
+    Ritorna un dizionario con le curve per-epoca: total, ncc, ssim, moe
+    """
 
     # Loss and optimizer
-    # TODO restituire anche singoli valori per il plot separato
     criterion = ncc_ssim_loss
     # TODO guardare possibili optimizers
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
@@ -154,10 +184,13 @@ def train_model(
     scaler = torch.GradScaler(enabled=use_amp)
 
     model.train()
-    losses = []
+    losses_epoch = {"total": [], "ncc": [], "ssim": [], "moe": []}
 
     for epoch in range(config.train.epochs):
-        epoch_loss = 0.0
+        epoch_total = 0.0
+        epoch_ncc = 0.0
+        epoch_ssim = 0.0
+        epoch_moe = 0.0
 
         with tqdm(
             dataloader,
@@ -165,33 +198,57 @@ def train_model(
             disable=not config.train.show_progress,
         ) as pbar:
             for _, (low_res, high_res) in enumerate(pbar):
-                # Spopstiamo i tensori sul dispositivo per velocizzare il training
+                # Spostiamo i tensori sul dispositivo per velocizzare il training
                 low_res = low_res.to(device, non_blocking=True)
                 high_res = high_res.to(device, non_blocking=True)
 
                 with torch.autocast(device.type, dtype=torch.float16, enabled=use_amp):
                     outputs = model(low_res)
-                    # Allenamento
-                    loss = criterion(outputs, high_res)
-                    optimizer.zero_grad()
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
+                    if isinstance(outputs, tuple):
+                        # Se il modello restituisce anche la loss di MoE
+                        outputs, moe_loss_val = outputs
+                    else:
+                        moe_loss_val = 0.0
 
-                epoch_loss += loss.item()
+                    total_loss, ncc_c, ssim_c, moe_c = criterion(
+                        outputs,
+                        high_res,
+                        config,
+                        moe_loss_val,
+                    )
+
+                optimizer.zero_grad()
+                scaler.scale(total_loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                # Aggiorna metriche batch
+                epoch_total += float(total_loss.detach().item())
+                epoch_ncc += float(ncc_c.detach().item())
+                epoch_ssim += float(ssim_c.detach().item())
+                epoch_moe += float(moe_c.detach().item())
+
                 pbar.set_postfix(
                     {
-                        "Loss": f"{loss.item():.6f}, Scaling factor: {scaler.get_scale():.2f}"
+                        "tot": f"{total_loss.item():.6f}",
+                        "scale": f"{scaler.get_scale():.2f}",
                     }
                 )
 
         scheduler.step()
 
-        avg_loss = epoch_loss / len(dataloader)
-        losses.append(avg_loss)
-        print(f"Epoch [{epoch+1}/{config.train.epochs}], Average Loss: {avg_loss:.6f}")
+        denom = max(1, len(dataloader))
+        losses_epoch["total"].append(epoch_total / denom)
+        losses_epoch["ncc"].append(epoch_ncc / denom)
+        losses_epoch["ssim"].append(epoch_ssim / denom)
+        losses_epoch["moe"].append(epoch_moe / denom)
 
-    return losses
+        print(
+            f"Epoch [{epoch+1}/{config.train.epochs}] | "
+            f"avg tot: {losses_epoch['total'][-1]:.6f} | "
+        )
+
+    return losses_epoch
 
 
 def evaluate_model(
@@ -212,6 +269,9 @@ def evaluate_model(
             high_res = high_res.to(device)
 
             outputs = model(low_res)
+            if isinstance(outputs, tuple):
+                # Se il modello restituisce anche la loss di Moe
+                outputs, _ = outputs
 
             # Clamp dei valori per SSIM (deve essere in [0,1])
             print(
@@ -262,7 +322,13 @@ def visualize_predictions(
             low_res_batch = low_res.unsqueeze(0).to(device)
 
             # Genera predizione
-            pred = model(low_res_batch).squeeze(0).cpu()
+            outputs = model(low_res_batch)
+            if isinstance(outputs, tuple):
+                # Se il modello restituisce anche la loss di Moe
+                pred, _ = outputs
+            else:
+                pred = outputs
+            pred = pred.squeeze(0).cpu()
 
             # Reupscaliamo l'immagine a bassa risoluzione per avere un confronto diretto
             low_res = torch.nn.functional.interpolate(
@@ -375,3 +441,101 @@ def load_model(
     model.load_state_dict(torch.load(path, map_location=device))
 
     return model
+
+
+def launch_all(model_type: Literal["rcan", "swin2mose"]) -> None:
+    """Funzione principale per addestrare e valutare il modello di super risoluzione."""
+
+    # Puliamo la memoria CUDA
+    torch.cuda.empty_cache()
+
+    if model_type == "rcan":
+        config = ConfigRCAN()
+    elif model_type == "swin2mose":
+        config = ConfigSwin2Mose()
+
+    # Dispositivo
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Seed per riproducibilità
+    torch.manual_seed(config.train.seed)
+    np.random.seed(config.train.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(config.train.seed)
+
+    try:
+
+        # Dataset di valutazione
+        test_dataset = SuperResolutionDataset(
+            config.test.comune,
+            config.model.scale,
+            config.model.patch_size,
+            config.test.dataset_size,
+        )
+
+        # Creazione del modello
+        if model_type == "rcan":
+            model = RCAN(config).to(device)  # type: ignore
+        elif model_type == "swin2mose":
+            model = Swin2MoSE(config).to(device)  # type: ignore
+
+        print(f"Parametri: {sum(p.numel() for p in model.parameters())}")
+
+        if config.test.load_model:
+            # Caricamento del modello esistente
+            model = load_model(config, model, device)
+            visualize_predictions(model, test_dataset, device, config)
+            return
+
+        # Altrimenti alleniamo il modello
+
+        # Dataset di addestramento
+        train_dataset = SuperResolutionDataset(
+            config.train.comune,
+            config.model.scale,
+            config.model.patch_size,
+            config.train.dataset_size,
+            config.train.augment_data,
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            config.train.batch_size,
+            num_workers=config.train.workers,
+            persistent_workers=True,
+        )
+
+        # Allenamento
+        print("Starting training...")
+        losses = train_model(model, train_loader, device, config)
+
+        # Plottiamo le loss del training (totale, ncc, ssim, moe)
+        fig, axs = plt.subplots(2, 2, figsize=(14, 10), sharex=True)
+        keys = ["total", "ncc", "ssim", "moe"]
+        titles = ["Total Loss", "NCC Loss", "SSIM Loss", "MoE Loss"]
+        for ax, k, title in zip(axs.ravel(), keys, titles):
+            ax.plot(losses[k])
+            ax.set_title(title)
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("Loss")
+            ax.set_yscale("log")
+            ax.grid(True)
+        plt.tight_layout()
+        plt.savefig(f"{config.model.dir_path}{config.model.name}/loss.png")
+        plt.show()
+
+        print("Evaluating model...")
+        metrics = evaluate_model(model, train_loader, device)
+        save_metrics(metrics, config)
+
+        visualize_predictions(model, test_dataset, device, config)
+
+        # Salvataggio del modello
+        save_model(model, config)
+
+    except Exception as e:
+        print(f"Error occurred during training: {e}")
+        import traceback
+
+        traceback.print_exc()
