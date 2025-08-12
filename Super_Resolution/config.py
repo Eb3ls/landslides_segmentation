@@ -1,7 +1,7 @@
 import os
 import yaml
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal
 from data_utils import ComuneType
 
 
@@ -102,6 +102,17 @@ class ConfigSwin2Mose(Config):
         self.model = Swin2MoseModelConfig(**config_dict["model"])
         self.train = TrainConfig(**config_dict["train"])
         self.test = TestConfig(**config_dict["test"])
+
+        # Controlliamo che embedded dim sia divisibile per ogni testa nella lista num_heads
+        if not all(self.model.embed_dim % n == 0 for n in self.model.num_heads):
+            raise ValueError(
+                f"embed_dim {self.model.embed_dim} must be divisible by every num_heads in {self.model.num_heads}"
+            )
+
+        if self.model.patch_size % self.model.window_size != 0:
+            raise ValueError(
+                f"patch_size {self.model.patch_size} must be divisible by window_size {self.model.window_size}"
+            )
 
         if not os.path.exists(os.path.join(self.model.dir_path, self.model.name)):
             os.makedirs(os.path.join(self.model.dir_path, self.model.name))

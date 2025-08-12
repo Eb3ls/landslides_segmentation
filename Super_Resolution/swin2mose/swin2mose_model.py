@@ -24,7 +24,6 @@ from Super_Resolution.swin2mose.utils import (
     window_partition,
     window_reverse,
 )
-from data_utils import SuperResolutionDataset
 
 
 class WindowAttention(nn.Module):

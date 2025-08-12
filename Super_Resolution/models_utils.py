@@ -300,7 +300,7 @@ def evaluate_model(
         "psnr": psnr_total / num_batches,
         "ssim": ssim_total / num_batches,
         "lpips": lpips_total / num_batches,
-        "ncc_loss": ncc_total / num_batches,
+        "ncc": ncc_total / num_batches,
     }
 
 
