@@ -360,11 +360,13 @@ class SwinTransformerBlock(nn.Module):
         # Ritorna alla forma in sequenza di token
         x = x.view(B, H * W, C)
         # Attention + shortcut
-        x = shortcut + self.drop_path(self.norm1(x))
+        x = shortcut + self.drop_path(x)
+        x = self.norm1(x)
 
-        res, loss_moe = self.moe(x)
+        moe_out, loss_moe = self.moe(x)
         # MoE + shortcut
-        x = x + self.drop_path(self.norm2(res))
+        x = x + self.drop_path(moe_out)
+        x = self.norm2(x)
 
         return x, loss_moe
 
@@ -428,14 +430,16 @@ class BasicLayer(nn.Module):
 
         # No downsampling in BasicLayer
 
-    def forward(self, x: Tensor, x_size: list[int]) -> tuple[Tensor, float]:
-        loss_moe_all: float = 0.0
+    def forward(self, x: Tensor, x_size: list[int]) -> tuple[Tensor, Tensor]:
+        """
+        Ritorna: (features, loss_moe_all) dove loss_moe_all è uno scalare Tensor.
+        """
+        # Accumulatore Tensor su device corretto, grad-enabled quando i contributi lo sono
+        loss_moe_all: Tensor = torch.zeros((), device=x.device, dtype=x.dtype)
         for block in self.blocks:
             x, loss_moe = block(x, x_size)
-            if loss_moe is not None:
-                loss_moe_all += (
-                    loss_moe.item() if torch.is_tensor(loss_moe) else loss_moe
-                )
+            loss_moe = loss_moe.to(device=x.device, dtype=x.dtype)
+            loss_moe_all = loss_moe_all + loss_moe
 
         return x, loss_moe_all
 
@@ -599,7 +603,7 @@ class Swin2MoSE(nn.Module):
             )
             self.layers.append(layer)
 
-        if self.upsampler == "pixelshuffle":
+        if self.upsampler in ("pixelshuffle", "pixelshuffle_hf"):
             self.layers_hf = nn.ModuleList()
             for i_layer in range(self.num_layers):
                 layer = RSTB(
@@ -722,16 +726,12 @@ class Swin2MoSE(nn.Module):
         x = self.patch_embed(x)
         x = self.pos_drop(x)
 
-        loss_moe_all = 0.0
+        # Accumula loss MoE come Tensor
+        loss_moe_all: Tensor = torch.zeros((), device=x.device, dtype=x.dtype)
         for layer in self.layers_hf:
-            x = layer(x, x_size)
-
-            if not torch.is_tensor(x):
-                x, loss_moe = x
-                if loss_moe is not None:
-                    loss_moe_all += (
-                        loss_moe.item() if torch.is_tensor(loss_moe) else loss_moe
-                    )
+            x, loss_moe = layer(x, x_size)
+            loss_moe = loss_moe.to(device=x.device, dtype=x.dtype)
+            loss_moe_all = loss_moe_all + loss_moe
 
         x = self.norm(x)  # B L C
         x = self.patch_unembed(x, x_size)
@@ -739,7 +739,7 @@ class Swin2MoSE(nn.Module):
         return x, loss_moe_all
 
     # Forward principale che esegue tutti i layers
-    def forward_features(self, x: Tensor) -> tuple[Tensor, float]:
+    def forward_features(self, x: Tensor) -> tuple[Tensor, Tensor]:
         # Shape HxW
         x_size = (x.shape[2], x.shape[3])
         # Tokenizzazione in patch non sovrapposte
@@ -748,16 +748,15 @@ class Swin2MoSE(nn.Module):
         # Dropout posizionale
         x = self.pos_drop(x)
 
-        loss_moe_all = 0.0
+        # Accumula loss MoE come Tensor
+        loss_moe_all: Tensor = torch.zeros((), device=x.device, dtype=x.dtype)
         for layer in self.layers:
-            x = layer(x, x_size)
-
-            if not torch.is_tensor(x):
-                x, loss_moe = x
-                if loss_moe is not None:
-                    loss_moe_all += (
-                        loss_moe.item() if torch.is_tensor(loss_moe) else loss_moe
-                    )
+            x, loss_moe = layer(x, x_size)
+            if not torch.is_tensor(loss_moe):
+                loss_moe = torch.tensor(loss_moe, device=x.device, dtype=x.dtype)
+            else:
+                loss_moe = loss_moe.to(device=x.device, dtype=x.dtype)
+            loss_moe_all = loss_moe_all + loss_moe
 
         # Normalizzazione finale
         x = self.norm(x)  # B L C
@@ -775,14 +774,14 @@ class Swin2MoSE(nn.Module):
         mean_buf = mean_buf.type_as(x)
         x = (x - mean_buf) * self.img_range
 
-        total_moe_loss = 0.0
+        # MoE loss totale come Tensor
+        total_moe_loss: Tensor = torch.zeros((), device=x.device, dtype=x.dtype)
         if self.upsampler == "pixelshuffle":
             # for classical SR
             x = self.conv_first(x)
 
-            res = self.forward_features(x)
-            if not torch.is_tensor(res):
-                res, _ = res
+            res, moe_loss = self.forward_features(x)
+            total_moe_loss = total_moe_loss + moe_loss
 
             x = self.conv_after_body(res) + x
             x = self.conv_before_upsample(x)
@@ -797,9 +796,8 @@ class Swin2MoSE(nn.Module):
             bicubic = self.conv_bicubic(bicubic)
             x = self.conv_first(x)
 
-            res = self.forward_features(x)
-            if not torch.is_tensor(res):
-                res, _ = res
+            res, moe_loss = self.forward_features(x)
+            total_moe_loss = total_moe_loss + moe_loss
 
             x = self.conv_after_body(res) + x
             x = self.conv_before_upsample(x)
@@ -815,9 +813,8 @@ class Swin2MoSE(nn.Module):
             # for classical SR with HF
             x = self.conv_first(x)
 
-            res = self.forward_features(x)
-            if not torch.is_tensor(res):
-                res, _ = res
+            res, moe_loss = self.forward_features(x)
+            total_moe_loss = total_moe_loss + moe_loss
 
             x = self.conv_after_body(res) + x
             x_before = self.conv_before_upsample(x)
@@ -825,9 +822,8 @@ class Swin2MoSE(nn.Module):
 
             x_hf = self.conv_first_hf(x_before)
 
-            res_hf = self.forward_features_hf(x_hf)
-            if not torch.is_tensor(res_hf):
-                res_hf, _ = res_hf
+            res_hf, moe_loss_hf = self.forward_features_hf(x_hf)
+            total_moe_loss = total_moe_loss + moe_loss_hf
 
             x_hf = self.conv_after_body_hf(res_hf) + x_hf
             x_hf = self.conv_before_upsample_hf(x_hf)
@@ -839,7 +835,7 @@ class Swin2MoSE(nn.Module):
 
             # Deep features con layer RSTB
             res, moe_loss = self.forward_features(x)
-            total_moe_loss += moe_loss
+            total_moe_loss = total_moe_loss + moe_loss
 
             # Residual connection
             x = self.conv_after_body(res) + x
@@ -848,9 +844,8 @@ class Swin2MoSE(nn.Module):
             # for real-world SR
             x = self.conv_first(x)
 
-            res = self.forward_features(x)
-            if not torch.is_tensor(res):
-                res, _ = res
+            res, moe_loss = self.forward_features(x)
+            total_moe_loss = total_moe_loss + moe_loss
 
             x = self.conv_after_body(res) + x
             x = self.conv_before_upsample(x)
@@ -869,9 +864,8 @@ class Swin2MoSE(nn.Module):
             # for image denoising and JPEG compression artifact reduction
             x_first = self.conv_first(x)
 
-            res = self.forward_features(x_first)
-            if not torch.is_tensor(res):
-                res, _ = res
+            res, moe_loss = self.forward_features(x_first)
+            total_moe_loss = total_moe_loss + moe_loss
 
             res = self.conv_after_body(res) + x_first
             x = x + self.conv_last(res)
