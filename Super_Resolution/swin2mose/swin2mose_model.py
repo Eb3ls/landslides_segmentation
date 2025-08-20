@@ -519,7 +519,6 @@ class Swin2MoSE(nn.Module):
     def __init__(
         self,
         cfg: ConfigSwin2Mose,
-        patch_size: int = 1,
         norm_layer=nn.LayerNorm,
         dropout_rate: float = 0.0,
         # Parametri erediati da SwinTransformer, lascio default
@@ -530,7 +529,6 @@ class Swin2MoSE(nn.Module):
     ):
         super(Swin2MoSE, self).__init__()
         num_in_ch = 4
-        num_out_ch = 4
         num_feat = 64
         self.img_range = 1
         # Registriamo la mean con shape [1, C, 1, 1]
@@ -554,7 +552,7 @@ class Swin2MoSE(nn.Module):
         # Layer di embedding in non overlapping patch
         self.patch_embed = PatchEmbed(
             img_size=cfg.model.img_size,
-            patch_size=patch_size,
+            patch_size=cfg.model.patch_size,
             in_chans=self.embed_dim,
             embed_dim=self.embed_dim,
         )
@@ -564,7 +562,7 @@ class Swin2MoSE(nn.Module):
         # Layer di unembedding
         self.patch_unembed = PatchUnEmbed(
             img_size=cfg.model.img_size,
-            patch_size=patch_size,
+            patch_size=cfg.model.patch_size,
             in_chans=self.embed_dim,
             embed_dim=self.embed_dim,
         )
@@ -599,7 +597,7 @@ class Swin2MoSE(nn.Module):
                 ],
                 norm_layer=norm_layer,
                 img_size=cfg.model.img_size,
-                patch_size=patch_size,
+                patch_size=cfg.model.patch_size,
                 resi_connection=cfg.model.resi_connection,
                 MoE_config=cfg.model.MoE_config,
             )
@@ -625,7 +623,7 @@ class Swin2MoSE(nn.Module):
                     ],  # no impact on SR results
                     norm_layer=norm_layer,
                     img_size=cfg.model.img_size,
-                    patch_size=patch_size,
+                    patch_size=cfg.model.patch_size,
                     resi_connection=cfg.model.resi_connection,
                     MoE_config=cfg.model.MoE_config,
                 )
@@ -645,25 +643,25 @@ class Swin2MoSE(nn.Module):
                 nn.Conv2d(self.embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
             )
             self.upsample = Upsample(cfg.model.scale, num_feat)
-            self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+            self.conv_last = nn.Conv2d(num_feat, num_in_ch, 3, 1, 1)
         elif self.upsampler == "pixelshuffle_aux":
             self.conv_bicubic = nn.Conv2d(num_in_ch, num_feat, 3, 1, 1)
             self.conv_before_upsample = nn.Sequential(
                 nn.Conv2d(self.embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
             )
-            self.conv_aux = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+            self.conv_aux = nn.Conv2d(num_feat, num_in_ch, 3, 1, 1)
             self.conv_after_aux = nn.Sequential(
-                nn.Conv2d(num_out_ch, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
+                nn.Conv2d(num_in_ch, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
             )
             self.upsample = Upsample(cfg.model.scale, num_feat)
-            self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+            self.conv_last = nn.Conv2d(num_feat, num_in_ch, 3, 1, 1)
         elif self.upsampler == "pixelshuffle_hf":
             self.conv_before_upsample = nn.Sequential(
                 nn.Conv2d(self.embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
             )
             self.upsample = Upsample(cfg.model.scale, num_feat)
             self.upsample_hf = Upsample_hf(cfg.model.scale, num_feat)
-            self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+            self.conv_last = nn.Conv2d(num_feat, num_in_ch, 3, 1, 1)
             self.conv_first_hf = nn.Sequential(
                 nn.Conv2d(num_feat, self.embed_dim, 3, 1, 1), nn.LeakyReLU(inplace=True)
             )
@@ -671,13 +669,13 @@ class Swin2MoSE(nn.Module):
             self.conv_before_upsample_hf = nn.Sequential(
                 nn.Conv2d(self.embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
             )
-            self.conv_last_hf = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+            self.conv_last_hf = nn.Conv2d(num_feat, num_in_ch, 3, 1, 1)
         elif self.upsampler == "pixelshuffledirect":
             # Semplice upsample con convoluzione 2D e pixel shuffle per upsampling
             self.upsample = UpsampleOneStep(
                 cfg.model.scale,
                 self.embed_dim,
-                num_out_ch,
+                num_in_ch,
                 (patches_resolution[0], patches_resolution[1]),
             )
         elif self.upsampler == "nearest+conv":
@@ -689,11 +687,11 @@ class Swin2MoSE(nn.Module):
             self.conv_up1 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
             self.conv_up2 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
             self.conv_hr = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
-            self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+            self.conv_last = nn.Conv2d(num_feat, num_in_ch, 3, 1, 1)
             self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
         else:
             # for image denoising and JPEG compression artifact reduction
-            self.conv_last = nn.Conv2d(self.embed_dim, num_out_ch, 3, 1, 1)
+            self.conv_last = nn.Conv2d(self.embed_dim, num_in_ch, 3, 1, 1)
 
         # Per applicare l'inizializzazione dei pesi su LayerNorm e Linear
         # self.apply(self._init_weights)
@@ -716,7 +714,11 @@ class Swin2MoSE(nn.Module):
     def no_weight_decay_keywords(self):
         return {"relative_position_bias_table"}
 
-    def check_image_size(self, x):
+    def check_image_size(self, x: Tensor) -> Tensor:
+        """
+        Controlla se l'immagine ha dimensioni multiple della finestra.
+        Se no, applica un padding riflessivo per renderle tali.
+        """
         _, _, h, w = x.size()
         mod_pad_h = (self.window_size - h % self.window_size) % self.window_size
         mod_pad_w = (self.window_size - w % self.window_size) % self.window_size

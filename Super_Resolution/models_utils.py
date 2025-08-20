@@ -172,8 +172,13 @@ def train_model(
     criterion = ncc_ssim_loss
     # TODO guardare possibili optimizers
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.train.epochs, eta_min=1e-6
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=4,
+        threshold=1e-4,
+        min_lr=1e-6,
     )
 
     use_amp = device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 7
@@ -235,17 +240,18 @@ def train_model(
                     }
                 )
 
-        scheduler.step()
-
         denom = max(1, len(dataloader))
         losses_epoch["total"].append(epoch_total / denom)
         losses_epoch["ncc"].append(epoch_ncc / denom)
         losses_epoch["ssim"].append(epoch_ssim / denom)
         losses_epoch["moe"].append(epoch_moe / denom)
 
+        scheduler.step(losses_epoch["total"][-1])
+
         print(
             f"Epoch [{epoch+1}/{config.train.epochs}] | "
             f"avg tot: {losses_epoch['total'][-1]:.6f} | "
+            f"lr: {optimizer.param_groups[0]['lr']:.6e} | "
         )
 
     return losses_epoch
@@ -465,10 +471,17 @@ def launch_all(
 
         # Dataset di valutazione
         test_dataset = SuperResolutionDataset(
-            config.test.comune,
-            config.model.scale,
-            config.model.img_size,
-            config.test.dataset_size,
+            comune=config.test.comune,
+            scale=config.model.scale,
+            patch_size=config.model.img_size,
+            num_patches=config.test.dataset_size,
+        )
+
+        test_loader = DataLoader(
+            test_dataset,
+            config.test.batch_size,
+            num_workers=config.train.workers,
+            persistent_workers=True,
         )
 
         # Creazione del modello
@@ -491,11 +504,11 @@ def launch_all(
 
         # Dataset di addestramento
         train_dataset = SuperResolutionDataset(
-            config.train.comune,
-            config.model.scale,
-            config.model.img_size,
-            config.train.dataset_size,
-            config.train.augment_data,
+            comune=config.train.comune,
+            scale=config.model.scale,
+            patch_size=config.model.img_size,
+            num_patches=config.train.dataset_size,
+            to_augment=config.train.augment_data,
         )
 
         train_loader = DataLoader(
@@ -522,10 +535,11 @@ def launch_all(
             ax.grid(True)
         plt.tight_layout()
         plt.savefig(f"{config.model.dir_path}{config.model.name}/loss.png")
-        plt.show()
+        if config.test.run_napari:
+            plt.show()
 
         print("Evaluating model...")
-        metrics = evaluate_model(model, train_loader, device)
+        metrics = evaluate_model(model, test_loader, device)
         save_metrics(metrics, config)
 
         visualize_predictions(model, test_dataset, device, config)

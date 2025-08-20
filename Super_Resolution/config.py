@@ -31,6 +31,7 @@ UpsamplerType = Literal[
 
 @dataclass
 class Swin2MoseModelConfig(ModelConfig):
+    patch_size: int
     embed_dim: int
     depths: list[int]
     num_heads: list[int]
@@ -43,12 +44,11 @@ class Swin2MoseModelConfig(ModelConfig):
 
 @dataclass
 class MyModelConfig(ModelConfig):
-    shallow_features: int
     emb_patch_size: int
     embed_dim: int
     depths: list[int]
     num_heads: list[int]
-    window_size: list[int]
+    window_size: int
     resi_connection: Literal["1conv", "3conv"]
 
 
@@ -71,6 +71,7 @@ class TestConfig:
     load_model: bool
     comune: ComuneType
     dataset_size: int
+    batch_size: int
     image_samples: int
     run_napari: bool
 

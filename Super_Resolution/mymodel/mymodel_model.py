@@ -245,7 +245,6 @@ class SwinTransformerBlock(nn.Module):
         qkv_bias: bool = True,
         drop: float = 0.0,
         attn_drop: float = 0.0,
-        drop_path: float = 0.0,
         norm_layer=nn.LayerNorm,
         pretrained_window_size: int = 0,
     ):
@@ -272,7 +271,6 @@ class SwinTransformerBlock(nn.Module):
             pretrained_window_size=(pretrained_window_size, pretrained_window_size),
         )
 
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim)
         # Definiti quanti neuroni ci sono nella MLP rispetto a dim di input
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -370,10 +368,10 @@ class SwinTransformerBlock(nn.Module):
         # Ritorna alla forma in sequenza di token
         x = x.view(B, H * W, C)
         # Attention + shortcut
-        x = shortcut + self.drop_path(self.norm1(x))
+        x = shortcut + self.norm1(x)
 
         # FFN
-        x = x + self.drop_path(self.norm2(self.mlp(x)))
+        x = x + self.norm2(self.mlp(x))
 
         return x
 
@@ -440,33 +438,19 @@ class MyModel(nn.Module):
 
         self.scale = cfg.model.scale
         self.img_size = cfg.model.img_size
-        self.features = cfg.model.shallow_features
         self.num_in_channels = 4
         self.emb_patch_size = cfg.model.emb_patch_size
         self.emb_dim = cfg.model.embed_dim
+        self.window_size = cfg.model.window_size
 
         # Shallow feature extraction
-        self.conv1 = nn.Conv2d(
-            self.num_in_channels, self.features, kernel_size=3, stride=1, padding=1
-        )
+        self.conv_first = nn.Conv2d(self.num_in_channels, self.emb_dim, 3, 1, 1)
 
-        # Base upsample branch (directly from input) to which residual refinements are added
-        self.base_upsample = nn.Sequential(
-            nn.Conv2d(
-                self.num_in_channels,
-                self.num_in_channels * self.scale * self.scale,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-            ),
-            nn.PixelShuffle(self.scale),
-        )
-
-        # Embedding (tokenization) at shallow feature level
+        # Tokenizzazione
         self.patch_embed = PatchEmbed(
             img_size=self.img_size,
             patch_size=self.emb_patch_size,
-            in_chans=self.features,
+            in_chans=self.emb_dim,
             embed_dim=self.emb_dim,
         )
         self.patch_unembed = PatchUnEmbed(
@@ -476,106 +460,96 @@ class MyModel(nn.Module):
             embed_dim=self.emb_dim,
         )
 
-        # Swin-based residual transformer layers (operate in token space)
+        # Calcoliamo il numero di token per layer
         token_grid = (
             self.img_size // self.emb_patch_size,
             self.img_size // self.emb_patch_size,
         )
 
+        # Main body
         self.num_layers = len(cfg.model.depths)
         self.layers = nn.ModuleList()
         for i in range(self.num_layers):
             layer = RSTB(
-                dim=self.emb_dim,
                 input_resolution=token_grid,
+                dim=self.emb_dim,
                 depth=cfg.model.depths[i],
                 num_heads=cfg.model.num_heads[i],
-                window_size=cfg.model.window_size[i],
+                window_size=cfg.model.window_size,
                 img_size=self.img_size,
                 patch_size=self.emb_patch_size,
                 resi_connection=cfg.model.resi_connection,
             )
             self.layers.append(layer)
 
-        # Convolution after body (on spatial features) before producing residuals
-        self.conv_after_body = nn.Conv2d(
-            self.emb_dim, self.emb_dim, kernel_size=3, stride=1, padding=1
+        self.norm = nn.LayerNorm(self.emb_dim)
+
+        # Dopo il main body
+        self.conv_after_body = get_resi_connection(
+            cfg.model.resi_connection, self.emb_dim
         )
 
-        # Per-layer residual refinement heads:
-        # 1) upsample features to HR via PixelShuffle
-        # 2) project to output channels (num_in_channels) as residual detail map
-        self.residual_up_convs = nn.ModuleList(
-            [
-                nn.Conv2d(
-                    self.emb_dim,
-                    self.emb_dim * self.scale * self.scale,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                )
-                for _ in range(self.num_layers)
-            ]
+        # Upsampler
+        self.conv_before_upsample = nn.Sequential(
+            nn.Conv2d(
+                self.emb_dim,
+                self.emb_dim,
+                3,
+                1,
+                1,
+            ),
+            nn.LeakyReLU(inplace=True),
         )
-        self.residual_shuffle = nn.PixelShuffle(self.scale)
-        self.residual_out_convs = nn.ModuleList(
-            [
-                nn.Conv2d(
-                    self.emb_dim,
-                    self.num_in_channels,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                )
-                for _ in range(self.num_layers)
-            ]
+        self.upsample = nn.Sequential(
+            nn.Conv2d(
+                self.emb_dim,
+                self.emb_dim * self.scale**2,
+                3,
+                1,
+                1,
+            ),
+            nn.PixelShuffle(5),
         )
 
-        # Optional global refinement at HR (can be identity or small conv stack)
-        self.hr_refine = nn.Sequential(
-            nn.Conv2d(self.num_in_channels, self.num_in_channels, 3, 1, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(self.num_in_channels, self.num_in_channels, 3, 1, 1),
+        self.conv_last = nn.Conv2d(
+            self.emb_dim,
+            self.num_in_channels,
+            3,
+            1,
+            1,
         )
+
+    def check_image_size(self, x: Tensor) -> Tensor:
+        """
+        Controlla se l'immagine ha dimensioni multiple della finestra.
+        Se no, applica un padding riflessivo per renderle tali.
+        """
+        _, _, h, w = x.size()
+        mod_pad_h = (self.window_size - h % self.window_size) % self.window_size
+        mod_pad_w = (self.window_size - w % self.window_size) % self.window_size
+        if mod_pad_h != 0 or mod_pad_w != 0:
+            print(f"Padding applied: (0, {mod_pad_w}, 0, {mod_pad_h})")
+            x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), "reflect")
+        return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
+        x = self.check_image_size(x)
 
-        Strategy:
-        1. Base upsample of input (coarse SR baseline).
-        2. Extract shallow features, tokenize and pass through transformer layers.
-        3. After each layer: obtain spatial features, refine (conv), upsample to HR, project to residual output and accumulate.
-        4. Final HR refinement.
-        """
-        B, C, H, W = x.shape
-        assert H == self.img_size and W == self.img_size, "Input size mismatch"
+        x = self.conv_first(x)
+        res = x
 
-        # Base HR prediction
-        hr = self.base_upsample(x)  # (B, C, H*scale, W*scale)
+        # Main body
+        x_size = (x.shape[2], x.shape[3])
+        x = self.patch_embed(x)
+        for layer in self.layers:
+            x = layer(x, x_size)
 
-        # Shallow features
-        feat = self.conv1(x)  # (B, features, H, W)
+        x = self.norm(x)
+        x = self.patch_unembed(x, x_size)
 
-        # Tokens
-        tokens = self.patch_embed(feat)  # (B, N, emb_dim)
-        token_grid = [
-            self.img_size // self.emb_patch_size,
-            self.img_size // self.emb_patch_size,
-        ]
+        # Dopo il main body
+        x = self.conv_after_body(x) + res
+        x = self.conv_before_upsample(x)
+        x = self.conv_last(self.upsample(x))
 
-        for i, layer in enumerate(self.layers):
-            # Transformer residual block
-            tokens = layer(tokens, token_grid)
-            # Back to spatial features
-            spatial = self.patch_unembed(tokens, token_grid)  # (B, emb_dim, H, W)
-            # Local conv refinement in LR space
-            spatial = self.conv_after_body(spatial)
-            # Upsample to HR and project to residual map
-            up = self.residual_up_convs[i](spatial)
-            up = self.residual_shuffle(up)  # (B, emb_dim, H*scale, W*scale)
-            res = self.residual_out_convs[i](up)  # (B, C, H*scale, W*scale)
-            hr = hr + res  # accumulate progressively finer details
-
-        # Final refinement
-        hr = self.hr_refine(hr) + hr
-        return hr
+        return x
