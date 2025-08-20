@@ -7,6 +7,7 @@ __pycache__
 Trash
 Super_Resolution/rcan/*
 Super_Resolution/swin2mose/*
+Super_Resolution/mymodel/*
 venv
 
 # Files to keep
@@ -14,3 +15,4 @@ venv
 !Super_Resolution/swin2mose/moe.py
 !Super_Resolution/swin2mose/utils.py
 !Super_Resolution/swin2mose/swin2mose_model.py
+!Super_Resolution/mymodel/mymodel_model.py

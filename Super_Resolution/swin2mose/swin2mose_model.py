@@ -142,9 +142,12 @@ class WindowAttention(nn.Module):
         B_, N, C = x.shape
         qkv_bias = None
         if self.q_bias is not None and self.v_bias is not None:
-            v_bias: torch.Tensor = self.v_bias
             qkv_bias = torch.cat(
-                (self.q_bias, torch.zeros_like(v_bias, requires_grad=False), v_bias)
+                (
+                    self.q_bias,
+                    torch.zeros_like(self.v_bias, requires_grad=False),
+                    self.v_bias,
+                )
             )
 
         # Calcola qvk con shape (B_, N, 3 * C), espande quindi le dimensioni di 3 per ognuna
@@ -550,18 +553,17 @@ class Swin2MoSE(nn.Module):
 
         # Layer di embedding in non overlapping patch
         self.patch_embed = PatchEmbed(
-            img_size=cfg.model.patch_size,
+            img_size=cfg.model.img_size,
             patch_size=patch_size,
             in_chans=self.embed_dim,
             embed_dim=self.embed_dim,
         )
-        num_patches = self.patch_embed.num_patches
         patches_resolution = self.patch_embed.patch_resolution
         self.patches_resolution = patches_resolution
 
         # Layer di unembedding
         self.patch_unembed = PatchUnEmbed(
-            img_size=cfg.model.patch_size,
+            img_size=cfg.model.img_size,
             patch_size=patch_size,
             in_chans=self.embed_dim,
             embed_dim=self.embed_dim,
@@ -596,7 +598,7 @@ class Swin2MoSE(nn.Module):
                     )
                 ],
                 norm_layer=norm_layer,
-                img_size=cfg.model.patch_size,
+                img_size=cfg.model.img_size,
                 patch_size=patch_size,
                 resi_connection=cfg.model.resi_connection,
                 MoE_config=cfg.model.MoE_config,
@@ -622,7 +624,7 @@ class Swin2MoSE(nn.Module):
                         )
                     ],  # no impact on SR results
                     norm_layer=norm_layer,
-                    img_size=cfg.model.patch_size,
+                    img_size=cfg.model.img_size,
                     patch_size=patch_size,
                     resi_connection=cfg.model.resi_connection,
                     MoE_config=cfg.model.MoE_config,

@@ -1,6 +1,5 @@
 import json
 import random
-from typing import Literal
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,9 +13,10 @@ from dataclasses import asdict
 # LPIPS genera warning sul modo in cui carica i pesi
 from piq import ssim, psnr, LPIPS, SSIMLoss
 from datetime import datetime
-from Super_Resolution.config import Config, ConfigRCAN, ConfigSwin2Mose
+from Super_Resolution.config import Config, ConfigMyModel, ConfigRCAN, ConfigSwin2Mose
 from Super_Resolution.rcan.rcan_model import RCAN
 from Super_Resolution.swin2mose.swin2mose_model import Swin2MoSE
+from Super_Resolution.mymodel.mymodel_model import MyModel
 from data_utils import SuperResolutionDataset
 
 
@@ -443,16 +443,13 @@ def load_model(
     return model
 
 
-def launch_all(model_type: Literal["rcan", "swin2mose"]) -> None:
+def launch_all(
+    config: ConfigRCAN | ConfigSwin2Mose | ConfigMyModel,
+) -> None:
     """Funzione principale per addestrare e valutare il modello di super risoluzione."""
 
     # Puliamo la memoria CUDA
     torch.cuda.empty_cache()
-
-    if model_type == "rcan":
-        config = ConfigRCAN()
-    elif model_type == "swin2mose":
-        config = ConfigSwin2Mose()
 
     # Dispositivo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -470,15 +467,17 @@ def launch_all(model_type: Literal["rcan", "swin2mose"]) -> None:
         test_dataset = SuperResolutionDataset(
             config.test.comune,
             config.model.scale,
-            config.model.patch_size,
+            config.model.img_size,
             config.test.dataset_size,
         )
 
         # Creazione del modello
-        if model_type == "rcan":
+        if isinstance(config, ConfigRCAN):
             model = RCAN(config).to(device)  # type: ignore
-        elif model_type == "swin2mose":
+        elif isinstance(config, ConfigSwin2Mose):
             model = Swin2MoSE(config).to(device)  # type: ignore
+        elif isinstance(config, ConfigMyModel):
+            model = MyModel(config).to(device)  # type: ignore
 
         print(f"Parametri: {sum(p.numel() for p in model.parameters())}")
 
@@ -494,7 +493,7 @@ def launch_all(model_type: Literal["rcan", "swin2mose"]) -> None:
         train_dataset = SuperResolutionDataset(
             config.train.comune,
             config.model.scale,
-            config.model.patch_size,
+            config.model.img_size,
             config.train.dataset_size,
             config.train.augment_data,
         )
