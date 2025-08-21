@@ -1,45 +1,23 @@
-from typing import Literal
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
-from torch import Tensor, nn
 import torch
 import torch.nn.functional as F
 
-from timm.layers.drop import DropPath
-
-from Super_Resolution.config import ConfigMyModel, MyModelConfig, Swin2MoseModelConfig
-from Super_Resolution.swin2mose.utils import (
+from torch import Tensor, nn
+from typing import Literal
+from Super_Resolution.config import ConfigMyModel
+from Super_Resolution.models_functions import (
     PatchEmbed,
     PatchUnEmbed,
     get_resi_connection,
     window_partition,
     window_reverse,
+    Mlp,
 )
-
-
-class Mlp(nn.Module):
-    def __init__(
-        self,
-        in_features,
-        hidden_features=None,
-        out_features=None,
-        act_layer=nn.GELU,
-        drop=0.0,
-    ):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
 
 
 class WindowAttention(nn.Module):
@@ -421,7 +399,7 @@ class RSTB(nn.Module):
             embed_dim=dim,
         )
 
-    def forward(self, x: Tensor, x_size: tuple[int]) -> Tensor:
+    def forward(self, x: Tensor, x_size: tuple[int, int]) -> Tensor:
         # TODO: non so se ha senso mettere il residuo qua, dopo faccio
         # unembed e lo passeró come residuo al finale
 
@@ -532,24 +510,31 @@ class MyModel(nn.Module):
             x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), "reflect")
         return x
 
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        x_size = (x.shape[2], x.shape[3])
+        x = self.patch_embed(x)
+
+        for layer in self.layers:
+            x = layer(x, x_size)
+
+        x = self.norm(x)  # B L C
+        x = self.patch_unembed(x, x_size)
+
+        return x
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        H, W = x.shape[2:]
         x = self.check_image_size(x)
 
         x = self.conv_first(x)
         res = x
 
-        # Main body
-        x_size = (x.shape[2], x.shape[3])
-        x = self.patch_embed(x)
-        for layer in self.layers:
-            x = layer(x, x_size)
+        # Feature extraction
+        x = self.forward_features(x)
 
-        x = self.norm(x)
-        x = self.patch_unembed(x, x_size)
-
-        # Dopo il main body
+        # Corpo principale + residuo shallow features
         x = self.conv_after_body(x) + res
         x = self.conv_before_upsample(x)
         x = self.conv_last(self.upsample(x))
 
-        return x
+        return x[:, :, : H * self.scale, : W * self.scale]

@@ -14,7 +14,7 @@ from timm.layers.weight_init import trunc_normal_
 
 from Super_Resolution.config import ConfigSwin2Mose
 from Super_Resolution.swin2mose.moe import MoE
-from Super_Resolution.swin2mose.utils import (
+from Super_Resolution.models_functions import (
     PatchEmbed,
     PatchUnEmbed,
     Upsample,
@@ -531,9 +531,6 @@ class Swin2MoSE(nn.Module):
         num_in_ch = 4
         num_feat = 64
         self.img_range = 1
-        # Registriamo la mean con shape [1, C, 1, 1]
-        # Il buffer serve per memorizzare un tensore che non è un parametro del modello ma una costante
-        self.register_buffer("mean", torch.zeros(1, num_in_ch, 1, 1))
         self.upscale = cfg.model.scale
         self.upsampler = cfg.model.upsampler
         self.window_size = cfg.model.window_size
@@ -864,15 +861,6 @@ class Swin2MoSE(nn.Module):
                 )
             )
             x = self.conv_last(self.lrelu(self.conv_hr(x)))
-        else:
-            # for image denoising and JPEG compression artifact reduction
-            x_first = self.conv_first(x)
-
-            res, moe_loss = self.forward_features(x_first)
-            total_moe_loss = total_moe_loss + moe_loss
-
-            res = self.conv_after_body(res) + x_first
-            x = x + self.conv_last(res)
 
         # Denormalizzazione finale
         x = x / self.img_range + mean_buf

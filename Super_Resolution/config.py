@@ -63,7 +63,7 @@ class TrainConfig:
     epochs: int
     show_progress: bool
     use_moe_loss: bool
-    loss_weights: dict[Literal["ncc", "ssim", "moe"], float]
+    loss_weights: dict[str, float]
 
 
 @dataclass
@@ -85,7 +85,6 @@ class Config:
         self.train = TrainConfig(**config_dict["train"])
         self.test = TestConfig(**config_dict["test"])
 
-        # Controlliamo che la directory dove salvare i dati esista
         if not os.path.exists(os.path.join(self.model.dir_path, self.model.name)):
             os.makedirs(os.path.join(self.model.dir_path, self.model.name))
 

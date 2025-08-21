@@ -17,7 +17,7 @@ import torch.nn as nn
 from torch.distributions.normal import Normal
 from copy import deepcopy
 
-from Super_Resolution.swin2mose.utils import Mlp as MLP
+from Super_Resolution.models_functions import Mlp
 
 
 class SparseDispatcher(object):
@@ -140,13 +140,13 @@ def build_experts(
     experts_cfg = deepcopy(experts_cfg)
     if experts_cfg is None:
         # old build way
-        return nn.ModuleList([MLP(*default_cfg) for i in range(num_experts)])
+        return nn.ModuleList([Mlp(*default_cfg) for i in range(num_experts)])
     # new build way: mix mlp with leff
     experts = []
     for e_cfg in experts_cfg:
         type_ = e_cfg.pop("type")
         if type_ == "mlp":
-            experts.append(MLP(*default_cfg))
+            experts.append(Mlp(*default_cfg))
     return nn.ModuleList(experts)
 
 

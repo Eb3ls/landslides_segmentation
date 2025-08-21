@@ -121,40 +121,120 @@ def ncc_loss(sr: torch.Tensor, hr: torch.Tensor) -> torch.Tensor:
     return 1 - ((cc_value + 1) * 0.5)
 
 
-def ncc_ssim_loss(
+def charbonnier_loss(
+    x: torch.Tensor, y: torch.Tensor, eps: float = 1e-3
+) -> torch.Tensor:
+    """Charbonnier (pseudo L1) loss: sqrt((x-y)^2 + eps^2)."""
+    diff = x - y
+    # Per stabilitá numerica in AMP cast a float32
+    if diff.dtype == torch.float16:
+        diff32 = diff.float()
+        loss = torch.sqrt(diff32 * diff32 + eps * eps).mean()
+        return loss.to(diff.dtype)
+    return torch.sqrt(diff * diff + eps * eps).mean()
+
+
+# Cache dei kernel Sobel per evitare ricreazioni continue
+_SOBEL_KERNELS: dict[str, torch.Tensor] | None = None
+
+
+def _get_sobel_kernels(
+    device: torch.device, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    global _SOBEL_KERNELS
+    if (
+        _SOBEL_KERNELS is None
+        or _SOBEL_KERNELS["dx"].device != device
+        or _SOBEL_KERNELS["dx"].dtype != dtype
+    ):
+        kx = (
+            torch.tensor(
+                [[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=dtype, device=device
+            )
+            / 8.0
+        )
+        ky = (
+            torch.tensor(
+                [[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=dtype, device=device
+            )
+            / 8.0
+        )
+        _SOBEL_KERNELS = {"dx": kx.view(1, 1, 3, 3), "dy": ky.view(1, 1, 3, 3)}
+    return _SOBEL_KERNELS["dx"], _SOBEL_KERNELS["dy"]
+
+
+def sobel_gradient(t: torch.Tensor) -> torch.Tensor:
+    """Calcola il modulo del gradiente Sobel per ciascun canale e li concatena.
+    Ritorna tensore con stessa shape dell'input (approssimando: modulo normalizzato)."""
+    dx_k, dy_k = _get_sobel_kernels(t.device, t.dtype)
+    c = t.shape[1]
+    # group conv per applicare stesso kernel a ogni canale
+    dx = torch.nn.functional.conv2d(t, dx_k.repeat(c, 1, 1, 1), padding=1, groups=c)
+    dy = torch.nn.functional.conv2d(t, dy_k.repeat(c, 1, 1, 1), padding=1, groups=c)
+    grad = torch.sqrt(torch.clamp(dx * dx + dy * dy, min=0.0) + 1e-12)
+    return grad
+
+
+def gradient_loss(sr: torch.Tensor, hr: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.l1_loss(sobel_gradient(sr), sobel_gradient(hr))
+
+
+def composite_loss(
     sr: torch.Tensor,
     hr: torch.Tensor,
     config: Config,
     moe_loss: float | torch.Tensor = 0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Calcola le componenti di loss (NCC, SSIM, MoE) e la loss totale.
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Calcola dinamicamente le componenti di loss in base ai pesi > 0.
+    Ritorna total_loss e dizionario componenti (già pesate)."""
+    weights = config.train.loss_weights
 
-    Ritorna:
-        total_loss, ncc_component, ssim_component, moe_component
-    """
-    # NCC come loss (0 buono, 1 cattivo)
-    ncc_value = ncc_loss(sr, hr)
+    comps: dict[str, torch.Tensor] = {}
 
-    # Clampiamo sr per evitare valori fuori range per SSIM
-    sr = torch.clamp(sr, 0, 1)
+    # Controlli range sr/hr (prevenzione valori fuori scala che degradano SSIM/NCC)
+    if torch.isnan(sr).any() or torch.isinf(sr).any():
+        raise ValueError("NaN/Inf rilevati in sr")
+    if torch.isnan(hr).any() or torch.isinf(hr).any():
+        raise ValueError("NaN/Inf rilevati in hr")
 
-    # SSIMLoss restituisce (1 - SSIM), quindi è già una loss
-    ssim_loss_val = SSIMLoss()(sr, hr)
+    # NCC
+    if weights.get("ncc", 0.0) > 0:
+        ncc_v = ncc_loss(sr, hr)
+        comps["ncc"] = weights["ncc"] * ncc_v
 
-    # MoE può essere float o tensor: convertiamo a tensor su device corretto
-    if not torch.is_tensor(moe_loss):
-        moe_loss_tensor = torch.tensor(moe_loss, device=sr.device, dtype=sr.dtype)
-    else:
-        moe_loss_tensor = moe_loss.to(device=sr.device, dtype=sr.dtype)
+    # Clamp per SSIM / Charbonnier (input deve essere [0,1])
+    sr_clamped = torch.clamp(sr, 0, 1)
 
-    # Applichiamo i pesi
-    ncc_component = config.train.loss_weights["ncc"] * ncc_value
-    ssim_component = config.train.loss_weights["ssim"] * ssim_loss_val
-    moe_component = config.train.loss_weights["moe"] * moe_loss_tensor
+    # SSIM
+    if weights.get("ssim", 0.0) > 0:
+        ssim_v = SSIMLoss()(sr_clamped, hr)
+        comps["ssim"] = weights["ssim"] * ssim_v
 
-    total_loss = ncc_component + ssim_component + moe_component
+    # Charbonnier
+    if weights.get("charb", 0.0) > 0:
+        charb_v = charbonnier_loss(sr_clamped, hr)
+        comps["charb"] = weights["charb"] * charb_v
 
-    return total_loss, ncc_component, ssim_component, moe_component
+    # Gradient HF
+    if weights.get("grad", 0.0) > 0:
+        grad_v = gradient_loss(sr_clamped, hr)
+        comps["grad"] = weights["grad"] * grad_v
+
+    # MoE
+    if weights.get("moe", 0.0) > 0:
+        if not torch.is_tensor(moe_loss):
+            moe_loss_tensor = torch.tensor(moe_loss, device=sr.device, dtype=sr.dtype)
+        else:
+            moe_loss_tensor = moe_loss.to(device=sr.device, dtype=sr.dtype)
+        comps["moe"] = weights["moe"] * moe_loss_tensor
+
+    total = (
+        torch.stack([v for v in comps.values()]).sum()
+        if comps
+        else torch.tensor(0.0, device=sr.device, dtype=sr.dtype)
+    )
+
+    return total, comps
 
 
 def train_model(
@@ -169,8 +249,7 @@ def train_model(
     """
 
     # Loss and optimizer
-    criterion = ncc_ssim_loss
-    # TODO guardare possibili optimizers
+    criterion = composite_loss
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -181,21 +260,23 @@ def train_model(
         min_lr=1e-6,
     )
 
-    use_amp = device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 7
+    use_amp = False  # Disabilitiamo AMP per semplicità/stabilità con nuove loss
     if use_amp:
         print("Using Automatic Mixed Precision (AMP) for training.")
     else:
-        print("AMP is not supported on this device, using full precision.")
+        print("Training in full precision (AMP disabilitato).")
     scaler = torch.GradScaler(enabled=use_amp)
 
+    # Prepara dizionario dinamico delle curve
+    active_components = [k for k, w in config.train.loss_weights.items() if w > 0]
+    losses_epoch: dict[str, list[float]] = {"total": []}
+    for k in active_components:
+        losses_epoch[k] = []
+
     model.train()
-    losses_epoch = {"total": [], "ncc": [], "ssim": [], "moe": []}
 
     for epoch in range(config.train.epochs):
-        epoch_total = 0.0
-        epoch_ncc = 0.0
-        epoch_ssim = 0.0
-        epoch_moe = 0.0
+        accumulators = {k: 0.0 for k in ["total", *active_components]}
 
         with tqdm(
             dataloader,
@@ -203,23 +284,19 @@ def train_model(
             disable=not config.train.show_progress,
         ) as pbar:
             for _, (low_res, high_res) in enumerate(pbar):
-                # Spostiamo i tensori sul dispositivo per velocizzare il training
                 low_res = low_res.to(device, non_blocking=True)
                 high_res = high_res.to(device, non_blocking=True)
 
-                with torch.autocast(device.type, dtype=torch.float16, enabled=use_amp):
+                with torch.autocast(
+                    device_type=device.type, dtype=torch.float16, enabled=use_amp
+                ):
                     outputs = model(low_res)
                     if isinstance(outputs, tuple):
-                        # Se il modello restituisce anche la loss di MoE
                         outputs, moe_loss_val = outputs
                     else:
                         moe_loss_val = 0.0
-
-                    total_loss, ncc_c, ssim_c, moe_c = criterion(
-                        outputs,
-                        high_res,
-                        config,
-                        moe_loss_val,
+                    total_loss, comps = criterion(
+                        outputs, high_res, config, moe_loss_val
                     )
 
                 optimizer.zero_grad()
@@ -227,31 +304,27 @@ def train_model(
                 scaler.step(optimizer)
                 scaler.update()
 
-                # Aggiorna metriche batch
-                epoch_total += float(total_loss.detach().item())
-                epoch_ncc += float(ncc_c.detach().item())
-                epoch_ssim += float(ssim_c.detach().item())
-                epoch_moe += float(moe_c.detach().item())
+                accumulators["total"] += float(total_loss.detach().item())
+                for k in active_components:
+                    if k in comps:
+                        accumulators[k] += float(comps[k].detach().item())
 
-                pbar.set_postfix(
-                    {
-                        "tot": f"{total_loss.item():.6f}",
-                        "scale": f"{scaler.get_scale():.2f}",
-                    }
-                )
+                pbar.set_postfix({"tot": f"{total_loss.item():.6f}"})
 
         denom = max(1, len(dataloader))
-        losses_epoch["total"].append(epoch_total / denom)
-        losses_epoch["ncc"].append(epoch_ncc / denom)
-        losses_epoch["ssim"].append(epoch_ssim / denom)
-        losses_epoch["moe"].append(epoch_moe / denom)
+        losses_epoch["total"].append(accumulators["total"] / denom)
+        for k in active_components:
+            losses_epoch[k].append(
+                accumulators[k] / denom if accumulators[k] != 0 else 0.0
+            )
 
         scheduler.step(losses_epoch["total"][-1])
 
+        comps_log = " | ".join(
+            f"{k}:{losses_epoch[k][-1]:.5f}" for k in active_components
+        )
         print(
-            f"Epoch [{epoch+1}/{config.train.epochs}] | "
-            f"avg tot: {losses_epoch['total'][-1]:.6f} | "
-            f"lr: {optimizer.param_groups[0]['lr']:.6e} | "
+            f"Epoch [{epoch+1}/{config.train.epochs}] | avg tot: {losses_epoch['total'][-1]:.6f} | lr: {optimizer.param_groups[0]['lr']:.6e} | {comps_log}"
         )
 
     return losses_epoch
@@ -522,17 +595,34 @@ def launch_all(
         print("Starting training...")
         losses = train_model(model, train_loader, device, config)
 
-        # Plottiamo le loss del training (totale, ncc, ssim, moe)
-        fig, axs = plt.subplots(2, 2, figsize=(14, 10), sharex=True)
-        keys = ["total", "ncc", "ssim", "moe"]
-        titles = ["Total Loss", "NCC Loss", "SSIM Loss", "MoE Loss"]
-        for ax, k, title in zip(axs.ravel(), keys, titles):
-            ax.plot(losses[k])
-            ax.set_title(title)
-            ax.set_xlabel("Epoch")
-            ax.set_ylabel("Loss")
-            ax.set_yscale("log")
-            ax.grid(True)
+        # Plot dinamico solo delle componenti attive
+        active_components = [k for k, w in config.train.loss_weights.items() if w > 0]
+        n_plots = 1 + len(active_components)
+        cols = 3
+        rows = (n_plots + cols - 1) // cols
+        fig, axs = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), sharex=True)
+        axs = np.atleast_1d(axs).ravel()
+
+        axs[0].plot(losses["total"])
+        axs[0].set_title("Total Loss")
+        axs[0].set_xlabel("Epoch")
+        axs[0].set_ylabel("Loss")
+        axs[0].set_yscale("log")
+        axs[0].grid(True)
+
+        last_filled = 0
+        for idx, k in enumerate(active_components, start=1):
+            axs[idx].plot(losses[k])
+            axs[idx].set_title(f"{k.upper()} Loss")
+            axs[idx].set_xlabel("Epoch")
+            axs[idx].set_ylabel("Loss")
+            axs[idx].set_yscale("log")
+            axs[idx].grid(True)
+            last_filled = idx
+
+        for j in range(last_filled + 1, len(axs)):
+            axs[j].axis("off")
+
         plt.tight_layout()
         plt.savefig(f"{config.model.dir_path}{config.model.name}/loss.png")
         if config.test.run_napari:
@@ -540,11 +630,12 @@ def launch_all(
 
         print("Evaluating model...")
         metrics = evaluate_model(model, test_loader, device)
+        # Salviamo anche le curve di loss attive nel JSON metrics
+        metrics["training_curves"] = losses
         save_metrics(metrics, config)
 
         visualize_predictions(model, test_dataset, device, config)
 
-        # Salvataggio del modello
         save_model(model, config)
 
     except Exception as e:
