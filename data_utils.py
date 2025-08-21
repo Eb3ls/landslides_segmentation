@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import numpy as np
 from typing import Literal, Tuple
 import rasterio
@@ -221,7 +222,7 @@ def get_super_resolution_stack(
     return (sentinel_pre_stack, agea_stack), (sentinel_post_stack, cgr_stack)
 
 
-def get_landslide_mask(landslides: np.ndarray) -> np.ndarray:
+def get_landslide_mask(landslides: list) -> np.ndarray:
     """Genera una maschera booleana per le frane a partire dalla mappa delle frane
 
     Args:
@@ -256,7 +257,7 @@ def get_segmentation_stack(
 
     for filename in os.listdir(directory):
         # Saltiamo i file non rilevanti
-        if any(substr in filename.lower() for substr in ["sentinel2", "slope", "ndvi"]):
+        if any(substr in filename.lower() for substr in ["sentinel2", "ndvi", "slope"]):
             continue
 
         path = os.path.join(directory, filename)
@@ -276,6 +277,7 @@ def get_segmentation_stack(
             elif "Frane" in filename:
                 landslide_mask = get_landslide_mask(bands)
                 output_stack.extend(landslide_mask)
+            
             else:
                 print(f"File '{filename}' not recognized, skipping.")
 
