@@ -770,11 +770,6 @@ class Swin2MoSE(nn.Module):
         H, W = x.shape[2:]
         x = self.check_image_size(x)
 
-        # Normalizzazione
-        mean_buf: torch.Tensor = cast(torch.Tensor, self.mean)
-        mean_buf = mean_buf.type_as(x)
-        x = (x - mean_buf) * self.img_range
-
         # MoE loss totale come Tensor
         total_moe_loss: Tensor = torch.zeros((), device=x.device, dtype=x.dtype)
         if self.upsampler == "pixelshuffle":
@@ -862,8 +857,6 @@ class Swin2MoSE(nn.Module):
             )
             x = self.conv_last(self.lrelu(self.conv_hr(x)))
 
-        # Denormalizzazione finale
-        x = x / self.img_range + mean_buf
         # Crop del tensore alle dimensioni obiettivo nel caso in cui sia stato fatto padding
         out = x[:, :, : H * self.upscale, : W * self.upscale]
         return out, total_moe_loss

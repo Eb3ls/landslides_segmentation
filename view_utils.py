@@ -5,8 +5,6 @@ from matplotlib.figure import Figure
 import napari
 import numpy as np
 
-from data_utils import augment_data
-
 
 def save_to_napari(fig: Figure, viewer: napari.Viewer, name="") -> None:
     """Salva l'immagine corrente su napari."""
@@ -97,4 +95,3 @@ def view_data(
     else:
         # Aggiungiamo l'immagine a napari
         add_image_and_histogram(viewer, data, filename)
-        pass

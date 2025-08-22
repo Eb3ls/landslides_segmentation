@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 import numpy as np
-from typing import Literal, Tuple
+from typing import Literal, Tuple, cast
 import rasterio
 from torch import Tensor
 import torch
@@ -277,7 +277,7 @@ def get_segmentation_stack(
             elif "Frane" in filename:
                 landslide_mask = get_landslide_mask(bands)
                 output_stack.extend(landslide_mask)
-            
+
             else:
                 print(f"File '{filename}' not recognized, skipping.")
 
@@ -473,7 +473,7 @@ def augment_data(
         out_data = torch.rot90(out_data, k=k, dims=[1, 2])
 
     # Scegliamo se applicare luminosità o contrasto
-    do_brightness = False
+    do_brightness = np.random.rand() < 0.5
 
     # Maschera necessaria per non considerare i pixel che erano NaN nella media
 
@@ -515,7 +515,7 @@ class SuperResolutionDataset(Dataset):
     """Dataset per il training della super risoluzione.
 
     Args:
-        comune: Nome del comune da cui caricare i dati
+        comune: Nome del comune da usare se for_training è False altrimenti i comuni rimanenti
         scale: Fattore di scala per la super risoluzione
         patch_size: Dimensione delle patch quadrate da estrarre
         num_patches: Numero di patch da generare per epoch
@@ -528,31 +528,61 @@ class SuperResolutionDataset(Dataset):
         scale: int,
         patch_size: int = 256,
         num_patches: int = 1000,
-        to_augment: bool = False,
+        for_training: bool = False,
+        syntetic_data: bool = False,
+        to_augment: bool = True,
     ) -> None:
         self.comune = comune
         self.scale = scale
         self.patch_size = patch_size
         self.num_patches = num_patches
         self.to_augment = to_augment
+        self.syntetic_data = syntetic_data
+        if for_training:
+            self.set_comuni = [
+                c
+                for c in ["Brisighella", "Casola-Valsenio", "Modigliana", "Predappio"]
+                if c != comune
+            ]
+        else:
+            self.set_comuni = [comune]
 
-        print(f"Loading data for {comune}...")
+        self.mask = {}
+        self.stack_post = {}
+        for single_comune in self.set_comuni:
+            print(f"Loading data for {single_comune}...")
+            self.mask[single_comune] = generate_dataset_mask(
+                cast(ComuneType, single_comune)
+            )
+            # Carichiamo gli stack di dati
+            _, self.stack_post[single_comune] = get_super_resolution_stack(
+                cast(ComuneType, single_comune)
+            )
 
-        # Generiamo la maschera del dataset
-        self.mask = generate_dataset_mask(comune)
+            if single_comune == "Brisighella":
+                print("Fixing NaN values in NIR band for Brisighella...")
+                # Il NIR (banda 3) contiene pochi NaN non coperti dalla maschera; imposta a 0 SOLO i NaN dentro la maschera
+                sentinel_post, _cgr = self.stack_post[single_comune]
+                nir = sentinel_post[3]
+                mask2d = self.mask[single_comune]
 
-        # Carichiamo gli stack di dati
-        _, self.stack_post = get_super_resolution_stack(comune)
+                bad = np.isnan(nir) & mask2d
+                if bad.any():
+                    nir[bad] = 0.0
+                    sentinel_post[3] = nir.astype(np.float32)
+                    self.stack_post[single_comune] = (sentinel_post, _cgr)
 
     def __len__(self) -> int:
         return self.num_patches
 
     def __getitem__(self, _) -> Tuple[torch.Tensor, torch.Tensor]:
+        random_comune = np.random.choice(self.set_comuni)
+
         low_res_patch, high_res_patch, patch_mask = get_random_patch(
-            self.stack_post[0],
-            self.stack_post[1],
+            self.stack_post[random_comune][1 if self.syntetic_data else 0],
+            self.stack_post[random_comune][1],
             self.patch_size * self.scale,
-            self.mask,
+            self.mask[random_comune],
         )
 
         # Convertiamo a tensori e assicuriamo il formato corretto
@@ -562,7 +592,7 @@ class SuperResolutionDataset(Dataset):
 
         # Augmentiamo i dati
         if self.to_augment:
-            low_res_patch, high_res_patch = augment_data(
+            low_res_tensor, high_res_tensor = augment_data(
                 low_res_tensor, high_res_tensor, patch_mask
             )
 

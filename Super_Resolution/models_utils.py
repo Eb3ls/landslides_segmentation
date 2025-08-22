@@ -548,6 +548,9 @@ def launch_all(
             scale=config.model.scale,
             patch_size=config.model.img_size,
             num_patches=config.test.dataset_size,
+            for_training=False,
+            to_augment=False,
+            syntetic_data=config.train.syntetic_data,
         )
 
         test_loader = DataLoader(
@@ -577,11 +580,13 @@ def launch_all(
 
         # Dataset di addestramento
         train_dataset = SuperResolutionDataset(
-            comune=config.train.comune,
+            comune=config.test.comune,
             scale=config.model.scale,
             patch_size=config.model.img_size,
             num_patches=config.train.dataset_size,
+            for_training=True,
             to_augment=config.train.augment_data,
+            syntetic_data=config.train.syntetic_data,
         )
 
         train_loader = DataLoader(

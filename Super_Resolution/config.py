@@ -54,11 +54,11 @@ class MyModelConfig(ModelConfig):
 
 @dataclass
 class TrainConfig:
-    comune: ComuneType
     seed: int
     workers: int
     dataset_size: int
     augment_data: bool
+    syntetic_data: bool
     batch_size: int
     epochs: int
     show_progress: bool
