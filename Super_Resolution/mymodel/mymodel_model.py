@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from torch import Tensor, nn
 from typing import Literal
+from timm.layers.weight_init import trunc_normal_
 from Super_Resolution.config import ConfigMyModel
 from Super_Resolution.models_functions import (
     PatchEmbed,
@@ -17,6 +18,7 @@ from Super_Resolution.models_functions import (
     window_partition,
     window_reverse,
     Mlp,
+    Upsample,
 )
 
 
@@ -418,11 +420,15 @@ class MyModel(nn.Module):
         self.img_size = cfg.model.img_size
         self.num_in_channels = 4
         self.emb_patch_size = cfg.model.emb_patch_size
+        num_feat = cfg.model.num_feat
         self.emb_dim = cfg.model.embed_dim
         self.window_size = cfg.model.window_size
+        self.upsampler = cfg.model.upsampler
 
-        # Shallow feature extraction
-        self.conv_first = nn.Conv2d(self.num_in_channels, self.emb_dim, 3, 1, 1)
+        # Shallow feature extraction, uso reflect padding per evitare il darkening ai bordi
+        self.conv_first = nn.Conv2d(
+            self.num_in_channels, self.emb_dim, 3, 1, 1, padding_mode="reflect"
+        )
 
         # Tokenizzazione
         self.patch_embed = PatchEmbed(
@@ -431,6 +437,7 @@ class MyModel(nn.Module):
             in_chans=self.emb_dim,
             embed_dim=self.emb_dim,
         )
+
         self.patch_unembed = PatchUnEmbed(
             img_size=self.img_size,
             patch_size=self.emb_patch_size,
@@ -467,35 +474,68 @@ class MyModel(nn.Module):
             cfg.model.resi_connection, self.emb_dim
         )
 
-        # Upsampler
-        self.conv_before_upsample = nn.Sequential(
-            nn.Conv2d(
-                self.emb_dim,
-                self.emb_dim,
-                3,
-                1,
-                1,
-            ),
-            nn.LeakyReLU(inplace=True),
-        )
-        self.upsample = nn.Sequential(
-            nn.Conv2d(
-                self.emb_dim,
-                self.emb_dim * self.scale**2,
-                3,
-                1,
-                1,
-            ),
-            nn.PixelShuffle(5),
-        )
+        # Shared activation for upsampler tails
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
-        self.conv_last = nn.Conv2d(
-            self.emb_dim,
-            self.num_in_channels,
-            3,
-            1,
-            1,
-        )
+        # Upsampler
+        if self.upsampler == "pixelshuffle":
+            self.conv_before_upsample = nn.Sequential(
+                nn.Conv2d(self.emb_dim, num_feat, 3, 1, 1, padding_mode="reflect"),
+                nn.LeakyReLU(inplace=True),
+            )
+            # Direct 5x PixelShuffle
+            self.upsample = nn.Sequential(
+                nn.Conv2d(
+                    num_feat,
+                    num_feat * (self.scale**2),
+                    3,
+                    1,
+                    1,
+                    padding_mode="reflect",
+                ),
+                nn.PixelShuffle(self.scale),
+            )
+            # Add refinement conv after shuffle to reduce checkerboard
+            self.conv_hr = nn.Conv2d(
+                num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
+            )
+            self.conv_last = nn.Conv2d(
+                num_feat, self.num_in_channels, 3, 1, 1, padding_mode="reflect"
+            )
+        elif self.upsampler == "x5_hybrid":
+            # 4x PixelShuffle + 1.25x bicubic + conv refine
+            self.conv_before_upsample = nn.Sequential(
+                nn.Conv2d(self.emb_dim, num_feat, 3, 1, 1, padding_mode="reflect"),
+                nn.LeakyReLU(inplace=True),
+            )
+            self.upsample4 = Upsample(4, num_feat)
+            self.conv_hr = nn.Conv2d(
+                num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
+            )
+            self.conv_last = nn.Conv2d(
+                num_feat, self.num_in_channels, 3, 1, 1, padding_mode="reflect"
+            )
+        elif self.upsampler == "nearest+conv":
+            print("Using nearest+conv upsampler")
+            # Two 2x nearest stages + final 1.25x bicubic with refinement
+            self.conv_before_upsample = nn.Sequential(
+                nn.Conv2d(self.emb_dim, num_feat, 3, 1, 1, padding_mode="reflect"),
+                nn.LeakyReLU(inplace=True),
+            )
+            self.conv_up1 = nn.Conv2d(
+                num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
+            )
+            self.conv_up2 = nn.Conv2d(
+                num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
+            )
+            self.conv_hr = nn.Conv2d(
+                num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
+            )
+            self.conv_last = nn.Conv2d(
+                num_feat, self.num_in_channels, 3, 1, 1, padding_mode="reflect"
+            )
+        else:
+            raise ValueError(f"Unsupported upsampler: {self.upsampler}")
 
     def check_image_size(self, x: Tensor) -> Tensor:
         """
@@ -526,15 +566,44 @@ class MyModel(nn.Module):
         H, W = x.shape[2:]
         x = self.check_image_size(x)
 
-        x = self.conv_first(x)
-        res = x
-
-        # Feature extraction
-        x = self.forward_features(x)
-
-        # Corpo principale + residuo shallow features
-        x = self.conv_after_body(x) + res
-        x = self.conv_before_upsample(x)
-        x = self.conv_last(self.upsample(x))
+        if self.upsampler == "pixelshuffle":
+            x = self.conv_first(x)
+            res = x
+            x = self.forward_features(x)
+            x = self.conv_after_body(x) + res
+            x = self.conv_before_upsample(x)
+            x = self.upsample(x)
+            x = self.lrelu(self.conv_hr(x))
+            x = self.conv_last(x)
+        elif self.upsampler == "x5_hybrid":
+            x = self.conv_first(x)
+            res = x
+            x = self.forward_features(x)
+            x = self.conv_after_body(x) + res
+            x = self.conv_before_upsample(x)
+            x = self.upsample4(x)
+            # 1.25x to reach 5x
+            x = F.interpolate(
+                x, scale_factor=5 / 4, mode="bicubic", align_corners=False
+            )
+            x = self.lrelu(self.conv_hr(x))
+            x = self.conv_last(x)
+        elif self.upsampler == "nearest+conv":
+            # for real-world SR
+            x = self.conv_first(x)
+            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.conv_before_upsample(x)
+            x = self.lrelu(
+                self.conv_up1(F.interpolate(x, scale_factor=2, mode="nearest"))
+            )
+            x = self.lrelu(
+                self.conv_up2(F.interpolate(x, scale_factor=2, mode="nearest"))
+            )
+            # Final 1.25x to reach 5x
+            x = F.interpolate(
+                x, scale_factor=5 / 4, mode="bicubic", align_corners=False
+            )
+            x = self.lrelu(self.conv_hr(x))
+            x = self.conv_last(x)
 
         return x[:, :, : H * self.scale, : W * self.scale]

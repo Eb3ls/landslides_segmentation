@@ -191,33 +191,24 @@ def composite_loss(
 
     comps: dict[str, torch.Tensor] = {}
 
-    # Controlli range sr/hr (prevenzione valori fuori scala che degradano SSIM/NCC)
-    if torch.isnan(sr).any() or torch.isinf(sr).any():
-        raise ValueError("NaN/Inf rilevati in sr")
-    if torch.isnan(hr).any() or torch.isinf(hr).any():
-        raise ValueError("NaN/Inf rilevati in hr")
-
     # NCC
     if weights.get("ncc", 0.0) > 0:
         ncc_v = ncc_loss(sr, hr)
         comps["ncc"] = weights["ncc"] * ncc_v
 
-    # Clamp per SSIM / Charbonnier (input deve essere [0,1])
-    sr_clamped = torch.clamp(sr, 0, 1)
-
     # SSIM
     if weights.get("ssim", 0.0) > 0:
-        ssim_v = SSIMLoss()(sr_clamped, hr)
+        ssim_v = SSIMLoss()(sr, hr)
         comps["ssim"] = weights["ssim"] * ssim_v
 
     # Charbonnier
     if weights.get("charb", 0.0) > 0:
-        charb_v = charbonnier_loss(sr_clamped, hr)
+        charb_v = charbonnier_loss(sr, hr)
         comps["charb"] = weights["charb"] * charb_v
 
     # Gradient HF
     if weights.get("grad", 0.0) > 0:
-        grad_v = gradient_loss(sr_clamped, hr)
+        grad_v = gradient_loss(sr, hr)
         comps["grad"] = weights["grad"] * grad_v
 
     # MoE
@@ -227,6 +218,14 @@ def composite_loss(
         else:
             moe_loss_tensor = moe_loss.to(device=sr.device, dtype=sr.dtype)
         comps["moe"] = weights["moe"] * moe_loss_tensor
+
+    if weights.get("l1", 0.0) > 0:
+        l1_v = torch.nn.functional.l1_loss(sr, hr)
+        comps["l1"] = weights["l1"] * l1_v
+
+    if weights.get("mse", 0.0) > 0:
+        mse_v = torch.nn.functional.mse_loss(sr, hr)
+        comps["mse"] = weights["mse"] * mse_v
 
     total = (
         torch.stack([v for v in comps.values()]).sum()
@@ -605,7 +604,7 @@ def launch_all(
         n_plots = 1 + len(active_components)
         cols = 3
         rows = (n_plots + cols - 1) // cols
-        fig, axs = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), sharex=True)
+        _, axs = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), sharex=True)
         axs = np.atleast_1d(axs).ravel()
 
         axs[0].plot(losses["total"])

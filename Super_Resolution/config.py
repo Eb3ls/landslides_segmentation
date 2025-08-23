@@ -20,36 +20,30 @@ class RCANModelConfig(ModelConfig):
     reduction_channels: int
 
 
-UpsamplerType = Literal[
-    "pixelshuffle",
-    "pixelshuffledirect",
-    "pixelshuffle_aux",
-    "pixelshuffle_hf",
-    "nearest+conv",
-]
-
-
 @dataclass
 class Swin2MoseModelConfig(ModelConfig):
     patch_size: int
+    num_feat: int
     embed_dim: int
     depths: list[int]
     num_heads: list[int]
     window_size: int
     mlp_ratio: float
-    upsampler: UpsamplerType
+    upsampler: str
     resi_connection: Literal["1conv", "3conv"]
     MoE_config: dict
 
 
 @dataclass
 class MyModelConfig(ModelConfig):
+    num_feat: int
     emb_patch_size: int
     embed_dim: int
     depths: list[int]
     num_heads: list[int]
     window_size: int
     resi_connection: Literal["1conv", "3conv"]
+    upsampler: str
 
 
 @dataclass

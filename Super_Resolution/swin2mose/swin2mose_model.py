@@ -233,7 +233,6 @@ class SwinTransformerBlock(nn.Module):
         qkv_bias: bool = True,
         drop: float = 0.0,
         attn_drop: float = 0.0,
-        drop_path: float = 0.0,
         norm_layer=nn.LayerNorm,
         pretrained_window_size: int = 0,
     ):
@@ -263,7 +262,6 @@ class SwinTransformerBlock(nn.Module):
             pretrained_window_size=(pretrained_window_size, pretrained_window_size),
         )
 
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim)
         # Definiti quanti neuroni ci sono nella MLP rispetto a dim di input
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -363,12 +361,12 @@ class SwinTransformerBlock(nn.Module):
         # Ritorna alla forma in sequenza di token
         x = x.view(B, H * W, C)
         # Attention + shortcut
-        x = shortcut + self.drop_path(x)
+        x = shortcut + x
         x = self.norm1(x)
 
         moe_out, loss_moe = self.moe(x)
         # MoE + shortcut
-        x = x + self.drop_path(moe_out)
+        x = x + moe_out
         x = self.norm2(x)
 
         return x, loss_moe
@@ -420,9 +418,6 @@ class BasicLayer(nn.Module):
                     qkv_bias=qkv_bias,
                     drop=drop,
                     attn_drop=attn_drop,
-                    drop_path=(
-                        drop_path[i] if isinstance(drop_path, list) else drop_path
-                    ),
                     norm_layer=norm_layer,
                     pretrained_window_size=pretrained_window_size,
                     MoE_config=MoE_config,
@@ -465,7 +460,6 @@ class RSTB(nn.Module):
         qkv_bias: bool = True,
         drop: float = 0.0,
         attn_drop: float = 0.0,
-        drop_path: float | list[float] = 0.0,
         norm_layer=nn.LayerNorm,
         img_size: int = 128,
         patch_size: int = 4,
@@ -486,7 +480,6 @@ class RSTB(nn.Module):
             qkv_bias=qkv_bias,
             drop=drop,
             attn_drop=attn_drop,
-            drop_path=drop_path,
             norm_layer=norm_layer,
             MoE_config=MoE_config,
         )
@@ -525,11 +518,10 @@ class Swin2MoSE(nn.Module):
         mlp_ratio: float = 4.0,
         qkv_bias: bool = True,
         attn_dropout_rate: float = 0.0,
-        drop_path_rate: float = 0.1,
     ):
         super(Swin2MoSE, self).__init__()
         num_in_ch = 4
-        num_feat = 64
+        num_feat = cfg.model.num_feat
         self.img_range = 1
         self.upscale = cfg.model.scale
         self.upsampler = cfg.model.upsampler
@@ -568,12 +560,6 @@ class Swin2MoSE(nn.Module):
         # moltiplicati per 1/(1 - dropout_rate) per mantenere la media del tensore
         self.pos_drop = nn.Dropout(p=dropout_rate)
 
-        # Stochastic Depth (Drop Path)
-        dpr: list[float] = [
-            x.item()
-            for x in torch.linspace(0, drop_path_rate, steps=sum(cfg.model.depths) + 1)
-        ]
-
         # Costruiamo i Residual Swin Transformer Blocks (RSTB)
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
@@ -587,11 +573,6 @@ class Swin2MoSE(nn.Module):
                 qkv_bias=qkv_bias,
                 drop=dropout_rate,
                 attn_drop=attn_dropout_rate,
-                drop_path=dpr[
-                    sum(cfg.model.depths[:i_layer]) : sum(
-                        cfg.model.depths[: i_layer + 1]
-                    )
-                ],
                 norm_layer=norm_layer,
                 img_size=cfg.model.img_size,
                 patch_size=cfg.model.patch_size,
@@ -613,11 +594,6 @@ class Swin2MoSE(nn.Module):
                     qkv_bias=qkv_bias,
                     drop=dropout_rate,
                     attn_drop=attn_dropout_rate,
-                    drop_path=dpr[
-                        sum(cfg.model.depths[:i_layer]) : sum(
-                            cfg.model.depths[: i_layer + 1]
-                        )
-                    ],  # no impact on SR results
                     norm_layer=norm_layer,
                     img_size=cfg.model.img_size,
                     patch_size=cfg.model.patch_size,
@@ -685,6 +661,21 @@ class Swin2MoSE(nn.Module):
             self.conv_up2 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
             self.conv_hr = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
             self.conv_last = nn.Conv2d(num_feat, num_in_ch, 3, 1, 1)
+            self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        elif self.upsampler == "x5_hybrid":
+            # PixelShuffle progressivo x4 + upsample bicubico 1.25x (5/4) + conv di rifinitura
+            assert self.upscale == 5, "x5_hybrid richiede scale=5"
+            self.conv_before_upsample = nn.Sequential(
+                nn.Conv2d(self.embed_dim, num_feat, 3, 1, 1, padding_mode="reflect"),
+                nn.LeakyReLU(inplace=True),
+            )
+            self.upsample4 = Upsample(4, num_feat)
+            self.conv_hr = nn.Conv2d(
+                num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
+            )
+            self.conv_last = nn.Conv2d(
+                num_feat, num_in_ch, 3, 1, 1, padding_mode="reflect"
+            )
             self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
         else:
             # for image denoising and JPEG compression artifact reduction
@@ -856,6 +847,26 @@ class Swin2MoSE(nn.Module):
                 )
             )
             x = self.conv_last(self.lrelu(self.conv_hr(x)))
+        elif self.upsampler == "x5_hybrid":
+            # Shallow features
+            x = self.conv_first(x)
+            # Deep features
+            res, moe_loss = self.forward_features(x)
+            total_moe_loss = total_moe_loss + moe_loss
+            # Residual connection
+            x = self.conv_after_body(res) + x
+            x = self.conv_before_upsample(x)
+            # x4 con PixelShuffle progressivo
+            x = self.upsample4(x)
+            # 1.25x (5/4) bicubico per arrivare a x5 esatto
+            x = F.interpolate(
+                x,
+                size=(H * self.upscale, W * self.upscale),
+                mode="bicubic",
+                align_corners=False,
+            )
+            x = self.lrelu(self.conv_hr(x))
+            x = self.conv_last(x)
 
         # Crop del tensore alle dimensioni obiettivo nel caso in cui sia stato fatto padding
         out = x[:, :, : H * self.upscale, : W * self.upscale]
