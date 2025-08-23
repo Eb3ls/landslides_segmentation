@@ -412,6 +412,53 @@ class RSTB(nn.Module):
         return self.patch_embed(self.conv(self.patch_unembed(x, x_size))) + res
 
 
+# ==============
+# Helper blocks for experimental upsamplers
+# ==============
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation channel attention."""
+
+    def __init__(self, channels: int, reduction: int = 8):
+        super().__init__()
+        hidden = max(1, channels // reduction)
+        self.avg = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(channels, hidden, kernel_size=1)
+        self.act = nn.ReLU(inplace=True)
+        self.fc2 = nn.Conv2d(hidden, channels, kernel_size=1)
+        self.gate = nn.Sigmoid()
+
+    def forward(self, x: Tensor) -> Tensor:
+        w = self.avg(x)
+        w = self.fc2(self.act(self.fc1(w)))
+        w = self.gate(w)
+        return x * w
+
+
+class DepthwiseSeparableConv(nn.Module):
+    """Depthwise 3x3 + Pointwise 1x1 as light anti-alias/refine stage."""
+
+    def __init__(
+        self, channels: int, kernel_size: int = 3, stride: int = 1, padding: int = 1
+    ):
+        super().__init__()
+        self.dw = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=channels,
+            padding_mode="reflect",
+            bias=True,
+        )
+        self.pw = nn.Conv2d(
+            channels, channels, kernel_size=1, stride=1, padding=0, bias=True
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.pw(self.dw(x))
+
+
 class MyModel(nn.Module):
     def __init__(self, cfg: ConfigMyModel):
         super(MyModel, self).__init__()
@@ -534,6 +581,87 @@ class MyModel(nn.Module):
             self.conv_last = nn.Conv2d(
                 num_feat, self.num_in_channels, 3, 1, 1, padding_mode="reflect"
             )
+        elif self.upsampler in ("testing", "test1", "test2"):
+            print(f"Using experimental upsampler: {self.upsampler}")
+            # Residual-to-bicubic scaling for stable color
+            self.res_scale = 0.1  # conservative residual scaling
+
+            # Variant flags
+            if self.upsampler == "test1":
+                self.up2_mode = "nearest"  # mimic stable behavior
+                self.use_se = False
+                self.use_gate = False
+                self.testing_overscale = 1.0
+            else:
+                # testing or test2
+                self.up2_mode = "bicubic" if self.upsampler == "test2" else "nearest"
+                self.use_se = True
+                self.use_gate = True
+                self.testing_overscale = 1.05 if self.upsampler == "test2" else 1.0
+
+            # Feature pre-upsample
+            self.conv_before_upsample = nn.Sequential(
+                nn.Conv2d(self.emb_dim, num_feat, 3, 1, 1, padding_mode="reflect"),
+                nn.LeakyReLU(inplace=True),
+            )
+
+            # Progressive 2x stages
+            n_two = int(np.floor(np.log2(self.scale)))
+            self._n_two = n_two
+            self.frac_scale = float(self.scale / (2**n_two))
+            self.up2_blocks = nn.ModuleList()
+            self.stage_gains = nn.ParameterList()
+            for _ in range(n_two):
+                block = nn.Sequential(
+                    nn.Conv2d(num_feat, num_feat, 3, 1, 1, padding_mode="reflect"),
+                    nn.LeakyReLU(inplace=True),
+                    DepthwiseSeparableConv(num_feat, 3, 1, 1),
+                    nn.LeakyReLU(inplace=True),
+                )
+                # Zero-init any 1x1 pointwise conv inside the block to start close to identity
+                for m in block.modules():
+                    if isinstance(m, nn.Conv2d) and m.kernel_size == (1, 1):
+                        nn.init.zeros_(m.weight)
+                        if m.bias is not None:
+                            nn.init.zeros_(m.bias)
+                self.up2_blocks.append(block)
+                # Per-stage gain (sigmoid) initialized small to enforce identity at start
+                self.stage_gains.append(nn.Parameter(torch.tensor([-4.0])))
+
+            # Fractional refine after bicubic (e.g., 1.25x for 5x)
+            self.refine_frac = nn.Conv2d(
+                num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
+            )
+            nn.init.zeros_(self.refine_frac.weight)
+            if self.refine_frac.bias is not None:
+                nn.init.zeros_(self.refine_frac.bias)
+
+            # Shallow feature skip to HR feature space (optional gated)
+            self.shallow_to_feat = nn.Conv2d(self.emb_dim, num_feat, kernel_size=1)
+            # gate exists but will be ignored if use_gate=False
+            self.shallow_gate = nn.Parameter(torch.tensor([-4.0]))
+
+            # Channel attention before final conv (Identity if disabled)
+            self.se = SEBlock(num_feat, reduction=8) if self.use_se else nn.Identity()
+
+            # HR refinement and last conv
+            self.conv_hr = nn.Conv2d(
+                num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
+            )
+            self.conv_last = nn.Conv2d(
+                num_feat, self.num_in_channels, 3, 1, 1, padding_mode="reflect"
+            )
+            nn.init.zeros_(self.conv_last.weight)
+            if self.conv_last.bias is not None:
+                nn.init.zeros_(self.conv_last.bias)
+
+            # Optional overscale-and-downsample path (enabled in test2 only)
+            self.conv_os = nn.Conv2d(
+                num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
+            )
+            nn.init.zeros_(self.conv_os.weight)
+            if self.conv_os.bias is not None:
+                nn.init.zeros_(self.conv_os.bias)
         else:
             raise ValueError(f"Unsupported upsampler: {self.upsampler}")
 
@@ -605,5 +733,69 @@ class MyModel(nn.Module):
             )
             x = self.lrelu(self.conv_hr(x))
             x = self.conv_last(x)
+        elif self.upsampler in ("testing", "test1", "test2"):
+            # Residual to bicubic base
+            base = F.interpolate(
+                x, scale_factor=self.scale, mode="bicubic", align_corners=False
+            )
+
+            # Feature trunk
+            shallow = self.conv_first(x)
+            feat = self.conv_after_body(self.forward_features(shallow)) + shallow
+            feat = self.conv_before_upsample(feat)
+
+            # Progressive 2x stages with residual identity and per-stage gains
+            for i, block in enumerate(self.up2_blocks):
+                if self.up2_mode == "nearest":
+                    feat = F.interpolate(feat, scale_factor=2, mode="nearest")
+                else:
+                    feat = F.interpolate(
+                        feat, scale_factor=2, mode="bicubic", align_corners=False
+                    )
+                alpha = torch.sigmoid(self.stage_gains[i])
+                feat = feat + alpha * block(feat)
+
+            # Fractional scale (e.g., 1.25x for 5x)
+            if abs(self.frac_scale - 1.0) > 1e-6:
+                feat = F.interpolate(
+                    feat,
+                    scale_factor=self.frac_scale,
+                    mode="bicubic",
+                    align_corners=False,
+                )
+                feat = self.lrelu(self.refine_frac(feat))
+
+            # Shallow skip (feature space)
+            shallow_hr = self.shallow_to_feat(shallow)
+            shallow_hr = F.interpolate(
+                shallow_hr, scale_factor=self.scale, mode="bicubic", align_corners=False
+            )
+            gate = torch.sigmoid(self.shallow_gate) if self.use_gate else 0.0
+            feat = feat + gate * shallow_hr
+
+            # Channel attention and refinement
+            feat = self.se(feat)
+            feat = self.lrelu(self.conv_hr(feat))
+
+            # Optional overscale and downsample of residual branch (test2 only)
+            if getattr(self, "testing_overscale", 1.0) > 1.0:
+                scale_os = float(self.testing_overscale)
+                feat_os = F.interpolate(
+                    feat, scale_factor=scale_os, mode="bicubic", align_corners=False
+                )
+                feat_os = self.lrelu(self.conv_os(feat_os))
+                pred = self.conv_last(feat_os)
+                pred = F.interpolate(
+                    pred,
+                    scale_factor=1.0 / scale_os,
+                    mode="bicubic",
+                    align_corners=False,
+                    antialias=True,
+                )
+            else:
+                pred = self.conv_last(feat)
+
+            # Final composition without extra HF injection for stability
+            x = base + self.res_scale * pred
 
         return x[:, :, : H * self.scale, : W * self.scale]
