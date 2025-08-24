@@ -338,6 +338,9 @@ def evaluate_model(
     lpips_total = 0.0
     num_batches = 0
 
+    bicubic_list = []
+    nearest_list = []
+
     with torch.no_grad():
         for low_res, high_res in dataloader:
             low_res = low_res.to(device)
@@ -367,6 +370,30 @@ def evaluate_model(
 
             num_batches += 1
 
+            # Upscaliamo l'immagine a bassa risoluzione per avere un confronto diretto
+
+            low_res_tensor = torch.nn.functional.interpolate(
+                low_res,
+                scale_factor=5,
+                mode="bicubic",
+                align_corners=False,
+            )
+
+            bicubic_list.append(
+                psnr(torch.clamp(low_res_tensor, 0, 1), high_res).item()
+            )
+
+            low_res_tensor = torch.nn.functional.interpolate(
+                low_res,
+                scale_factor=5,
+                mode="nearest",
+            )
+            nearest_list.append(
+                psnr(torch.clamp(low_res_tensor, 0, 1), high_res).item()
+            )
+
+    print(f"Avg Bicubic PSNR: {np.mean(bicubic_list):.4f}")
+    print(f"Avg Nearest PSNR: {np.mean(nearest_list):.4f}")
     return {
         "psnr": psnr_total / num_batches,
         "ssim": ssim_total / num_batches,

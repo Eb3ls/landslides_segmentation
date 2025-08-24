@@ -417,50 +417,150 @@ class RSTB(nn.Module):
 
 
 # ==============
-# Helper blocks for experimental upsamplers
+# Advanced Upsampling Modules
 # ==============
-class SEBlock(nn.Module):
-    """Squeeze-and-Excitation channel attention."""
-
-    def __init__(self, channels: int, reduction: int = 8):
-        super().__init__()
-        hidden = max(1, channels // reduction)
-        self.avg = nn.AdaptiveAvgPool2d(1)
-        self.fc1 = nn.Conv2d(channels, hidden, kernel_size=1)
-        self.act = nn.ReLU(inplace=True)
-        self.fc2 = nn.Conv2d(hidden, channels, kernel_size=1)
-        self.gate = nn.Sigmoid()
-
-    def forward(self, x: Tensor) -> Tensor:
-        w = self.avg(x)
-        w = self.fc2(self.act(self.fc1(w)))
-        w = self.gate(w)
-        return x * w
 
 
-class DepthwiseSeparableConv(nn.Module):
-    """Depthwise 3x3 + Pointwise 1x1 as light anti-alias/refine stage."""
+class SwinGuidedUpsampler(nn.Module):
+    """
+    SIMPLIFIED Swin-Guided Upsampler with Proper Dimension Management
+
+    Clean design focusing on:
+    1. Proper dimension tracking throughout the pipeline
+    2. Window attention for detail enhancement (like RSTB)
+    3. Nearest neighbor stability + bicubic refinement
+    4. Minimal overhead with maximum effectiveness
+    """
 
     def __init__(
-        self, channels: int, kernel_size: int = 3, stride: int = 1, padding: int = 1
+        self, embed_dim: int, num_feat: int, out_channels: int, window_size: int = 8
     ):
         super().__init__()
-        self.dw = nn.Conv2d(
-            channels,
-            channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            groups=channels,
-            padding_mode="reflect",
-            bias=True,
-        )
-        self.pw = nn.Conv2d(
-            channels, channels, kernel_size=1, stride=1, padding=0, bias=True
+
+        self.window_size = window_size
+
+        # === Feature Enhancement Pipeline ===
+        self.conv_first = nn.Conv2d(
+            embed_dim, num_feat, 3, 1, 1, padding_mode="reflect"
         )
 
+        # Nearest upsampling stages (proven stable)
+        self.stage1_conv = nn.Conv2d(
+            num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
+        )
+        self.stage2_conv = nn.Conv2d(
+            num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
+        )
+
+        # === Swin Window Attention for Detail Enhancement ===
+        self.detail_attention = WindowAttention(
+            dim=num_feat,
+            window_size=(window_size, window_size),
+            num_heads=max(1, num_feat // 32),
+            qkv_bias=True,
+            attn_drop=0.0,
+            proj_drop=0.0,
+        )
+
+        # Layer norm for attention (as in RSTB)
+        self.norm = nn.LayerNorm(num_feat)
+
+        # === Feature Refinement ===
+        self.feature_refine = nn.Sequential(
+            nn.Conv2d(num_feat, num_feat // 2, 1, 1, 0),
+            nn.LeakyReLU(inplace=True),
+            nn.Conv2d(num_feat // 2, num_feat, 3, 1, 1, padding_mode="reflect"),
+        )
+
+        # === Final Output Conversion ===
+        self.to_output = nn.Sequential(
+            nn.Conv2d(num_feat, num_feat // 2, 3, 1, 1, padding_mode="reflect"),
+            nn.LeakyReLU(inplace=True),
+            nn.Conv2d(num_feat // 2, out_channels, 3, 1, 1, padding_mode="reflect"),
+        )
+
+        # === Bicubic Baseline Branch ===
+        self.bicubic_conv = nn.Sequential(
+            nn.Conv2d(embed_dim, out_channels, 1, 1, 0),
+            nn.LeakyReLU(inplace=True),
+        )
+
+        # === Activation ===
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+
     def forward(self, x: Tensor) -> Tensor:
-        return self.pw(self.dw(x))
+        # === Feature Enhancement Branch ===
+        # x: [B, embed_dim, H, W] → [B, num_feat, H, W]
+        feat = self.lrelu(self.conv_first(x))
+
+        # Stage 1: 2x nearest + conv (proven stable)
+        feat = F.interpolate(feat, scale_factor=2, mode="nearest")  # [B, 64, 2H, 2W]
+        feat = self.lrelu(self.stage1_conv(feat))
+
+        # Stage 2: 2x nearest + conv
+        feat = F.interpolate(feat, scale_factor=2, mode="nearest")  # [B, 64, 4H, 4W]
+        feat = self.lrelu(self.stage2_conv(feat))
+
+        # === Swin Window Attention Enhancement ===
+        B, C, H_feat, W_feat = feat.shape
+
+        # Ensure dimensions are compatible with window partitioning
+        mod_pad_h = (self.window_size - H_feat % self.window_size) % self.window_size
+        mod_pad_w = (self.window_size - W_feat % self.window_size) % self.window_size
+        if mod_pad_h != 0 or mod_pad_w != 0:
+            feat = F.pad(feat, (0, mod_pad_w, 0, mod_pad_h), "reflect")
+            H_pad, W_pad = feat.shape[2], feat.shape[3]
+        else:
+            H_pad, W_pad = H_feat, W_feat
+
+        # Convert to sequence format for attention
+        feat_seq = feat.flatten(2).transpose(1, 2)  # B, H*W, C
+        feat_seq = self.norm(feat_seq)
+
+        # Apply window attention
+        feat_windows = window_partition(
+            feat_seq.view(B, H_pad, W_pad, C), self.window_size
+        )
+        feat_windows = feat_windows.view(-1, self.window_size * self.window_size, C)
+
+        # Apply attention
+        attn_windows = self.detail_attention(feat_windows)
+
+        # Reverse window partition
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        feat_enhanced = window_reverse(attn_windows, self.window_size, H_pad, W_pad)
+
+        # Remove padding if added
+        if mod_pad_h != 0 or mod_pad_w != 0:
+            feat_enhanced = feat_enhanced[:, :H_feat, :W_feat, :]
+
+        # Back to channel format and add residual
+        feat_enhanced = feat_enhanced.permute(0, 3, 1, 2).contiguous()
+        feat_enhanced = feat_enhanced + feat  # Residual connection
+
+        # === Feature Refinement ===
+        feat_enhanced = self.feature_refine(feat_enhanced)
+
+        # Final 1.25x to reach 5x total
+        feat_enhanced = F.interpolate(
+            feat_enhanced, scale_factor=5 / 4, mode="bicubic", align_corners=False
+        )  # [B, 64, 5H, 5W]
+
+        # Convert to output channels
+        learned_output = self.to_output(feat_enhanced)  # [B, 4, 5H, 5W]
+
+        # === Bicubic Baseline Branch ===
+        # Create bicubic baseline from original input
+        bicubic_baseline = F.interpolate(
+            x, scale_factor=5, mode="bicubic", align_corners=False
+        )  # [B, embed_dim, 5H, 5W]
+        bicubic_baseline = self.bicubic_conv(bicubic_baseline)  # [B, 4, 5H, 5W]
+
+        # === Final Combination ===
+        # Combine learned features with bicubic baseline
+        result = learned_output + bicubic_baseline
+
+        return result
 
 
 class MyModel(nn.Module):
@@ -553,19 +653,6 @@ class MyModel(nn.Module):
             self.conv_last = nn.Conv2d(
                 num_feat, self.num_in_channels, 3, 1, 1, padding_mode="reflect"
             )
-        elif self.upsampler == "x5_hybrid":
-            # 4x PixelShuffle + 1.25x bicubic + conv refine
-            self.conv_before_upsample = nn.Sequential(
-                nn.Conv2d(self.emb_dim, num_feat, 3, 1, 1, padding_mode="reflect"),
-                nn.LeakyReLU(inplace=True),
-            )
-            self.upsample4 = Upsample(4, num_feat)
-            self.conv_hr = nn.Conv2d(
-                num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
-            )
-            self.conv_last = nn.Conv2d(
-                num_feat, self.num_in_channels, 3, 1, 1, padding_mode="reflect"
-            )
         elif self.upsampler == "nearest+conv":
             print("Using nearest+conv upsampler")
             # Two 2x nearest stages + final 1.25x bicubic with refinement
@@ -585,89 +672,15 @@ class MyModel(nn.Module):
             self.conv_last = nn.Conv2d(
                 num_feat, self.num_in_channels, 3, 1, 1, padding_mode="reflect"
             )
-        elif self.upsampler in ("testing", "test1", "test2"):
-            print(f"Using experimental upsampler: {self.upsampler}")
-            # Residual-to-bicubic scaling for stable color
-            self.res_scale = 0.1  # conservative residual scaling
-
-            # Variant flags
-            if self.upsampler == "test1":
-                self.up2_mode = "nearest"  # mimic stable behavior
-                self.use_se = False
-                self.use_gate = False
-                self.testing_overscale = 1.0
-            else:
-                # testing or test2
-                self.up2_mode = "bicubic" if self.upsampler == "test2" else "nearest"
-                self.use_se = True
-                self.use_gate = True
-                self.testing_overscale = 1.05 if self.upsampler == "test2" else 1.0
-
-            # Feature pre-upsample
-            self.conv_before_upsample = nn.Sequential(
-                nn.Conv2d(self.emb_dim, num_feat, 3, 1, 1, padding_mode="reflect"),
-                nn.LeakyReLU(inplace=True),
+        elif self.upsampler == "swin_guided":
+            print("Using SwinGuidedUpsampler (Bicubic Residual + Window Attention)")
+            # Revolutionary combination of bicubic baseline + Swin attention
+            self.swin_upsampler = SwinGuidedUpsampler(
+                embed_dim=self.emb_dim,
+                num_feat=num_feat,
+                out_channels=self.num_in_channels,
+                window_size=self.window_size,
             )
-
-            # Progressive 2x stages
-            n_two = int(np.floor(np.log2(self.scale)))
-            self._n_two = n_two
-            self.frac_scale = float(self.scale / (2**n_two))
-            self.up2_blocks = nn.ModuleList()
-            self.stage_gains = nn.ParameterList()
-            for _ in range(n_two):
-                block = nn.Sequential(
-                    nn.Conv2d(num_feat, num_feat, 3, 1, 1, padding_mode="reflect"),
-                    nn.LeakyReLU(inplace=True),
-                    DepthwiseSeparableConv(num_feat, 3, 1, 1),
-                    nn.LeakyReLU(inplace=True),
-                )
-                # Zero-init any 1x1 pointwise conv inside the block to start close to identity
-                for m in block.modules():
-                    if isinstance(m, nn.Conv2d) and m.kernel_size == (1, 1):
-                        nn.init.zeros_(m.weight)
-                        if m.bias is not None:
-                            nn.init.zeros_(m.bias)
-                self.up2_blocks.append(block)
-                # Per-stage gain (sigmoid) initialized small to enforce identity at start
-                self.stage_gains.append(nn.Parameter(torch.tensor([-4.0])))
-
-            # Fractional refine after bicubic (e.g., 1.25x for 5x)
-            self.refine_frac = nn.Conv2d(
-                num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
-            )
-            nn.init.zeros_(self.refine_frac.weight)
-            if self.refine_frac.bias is not None:
-                nn.init.zeros_(self.refine_frac.bias)
-
-            # Shallow feature skip to HR feature space (optional gated)
-            self.shallow_to_feat = nn.Conv2d(self.emb_dim, num_feat, kernel_size=1)
-            # gate exists but will be ignored if use_gate=False
-            self.shallow_gate = nn.Parameter(torch.tensor([-4.0]))
-
-            # Channel attention before final conv (Identity if disabled)
-            self.se = SEBlock(num_feat, reduction=8) if self.use_se else nn.Identity()
-
-            # HR refinement and last conv
-            self.conv_hr = nn.Conv2d(
-                num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
-            )
-            self.conv_last = nn.Conv2d(
-                num_feat, self.num_in_channels, 3, 1, 1, padding_mode="reflect"
-            )
-            nn.init.zeros_(self.conv_last.weight)
-            if self.conv_last.bias is not None:
-                nn.init.zeros_(self.conv_last.bias)
-
-            # Optional overscale-and-downsample path (enabled in test2 only)
-            self.conv_os = nn.Conv2d(
-                num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
-            )
-            nn.init.zeros_(self.conv_os.weight)
-            if self.conv_os.bias is not None:
-                nn.init.zeros_(self.conv_os.bias)
-        else:
-            raise ValueError(f"Unsupported upsampler: {self.upsampler}")
 
     def check_image_size(self, x: Tensor) -> Tensor:
         """
@@ -707,19 +720,6 @@ class MyModel(nn.Module):
             x = self.upsample(x)
             x = self.lrelu(self.conv_hr(x))
             x = self.conv_last(x)
-        elif self.upsampler == "x5_hybrid":
-            x = self.conv_first(x)
-            res = x
-            x = self.forward_features(x)
-            x = self.conv_after_body(x) + res
-            x = self.conv_before_upsample(x)
-            x = self.upsample4(x)
-            # 1.25x to reach 5x
-            x = F.interpolate(
-                x, scale_factor=5 / 4, mode="bicubic", align_corners=False
-            )
-            x = self.lrelu(self.conv_hr(x))
-            x = self.conv_last(x)
         elif self.upsampler == "nearest+conv":
             # for real-world SR
             x = self.conv_first(x)
@@ -737,69 +737,10 @@ class MyModel(nn.Module):
             )
             x = self.lrelu(self.conv_hr(x))
             x = self.conv_last(x)
-        elif self.upsampler in ("testing", "test1", "test2"):
-            # Residual to bicubic base
-            base = F.interpolate(
-                x, scale_factor=self.scale, mode="bicubic", align_corners=False
-            )
-
-            # Feature trunk
-            shallow = self.conv_first(x)
-            feat = self.conv_after_body(self.forward_features(shallow)) + shallow
-            feat = self.conv_before_upsample(feat)
-
-            # Progressive 2x stages with residual identity and per-stage gains
-            for i, block in enumerate(self.up2_blocks):
-                if self.up2_mode == "nearest":
-                    feat = F.interpolate(feat, scale_factor=2, mode="nearest")
-                else:
-                    feat = F.interpolate(
-                        feat, scale_factor=2, mode="bicubic", align_corners=False
-                    )
-                alpha = torch.sigmoid(self.stage_gains[i])
-                feat = feat + alpha * block(feat)
-
-            # Fractional scale (e.g., 1.25x for 5x)
-            if abs(self.frac_scale - 1.0) > 1e-6:
-                feat = F.interpolate(
-                    feat,
-                    scale_factor=self.frac_scale,
-                    mode="bicubic",
-                    align_corners=False,
-                )
-                feat = self.lrelu(self.refine_frac(feat))
-
-            # Shallow skip (feature space)
-            shallow_hr = self.shallow_to_feat(shallow)
-            shallow_hr = F.interpolate(
-                shallow_hr, scale_factor=self.scale, mode="bicubic", align_corners=False
-            )
-            gate = torch.sigmoid(self.shallow_gate) if self.use_gate else 0.0
-            feat = feat + gate * shallow_hr
-
-            # Channel attention and refinement
-            feat = self.se(feat)
-            feat = self.lrelu(self.conv_hr(feat))
-
-            # Optional overscale and downsample of residual branch (test2 only)
-            if getattr(self, "testing_overscale", 1.0) > 1.0:
-                scale_os = float(self.testing_overscale)
-                feat_os = F.interpolate(
-                    feat, scale_factor=scale_os, mode="bicubic", align_corners=False
-                )
-                feat_os = self.lrelu(self.conv_os(feat_os))
-                pred = self.conv_last(feat_os)
-                pred = F.interpolate(
-                    pred,
-                    scale_factor=1.0 / scale_os,
-                    mode="bicubic",
-                    align_corners=False,
-                    antialias=True,
-                )
-            else:
-                pred = self.conv_last(feat)
-
-            # Final composition without extra HF injection for stability
-            x = base + self.res_scale * pred
+        elif self.upsampler == "swin_guided":
+            # Revolutionary bicubic residual + Swin attention upsampling
+            x = self.conv_first(x)
+            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.swin_upsampler(x)
 
         return x[:, :, : H * self.scale, : W * self.scale]
