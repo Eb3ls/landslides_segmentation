@@ -1,5 +1,6 @@
 import json
 import random
+from time import sleep
 import numpy as np
 import torch
 import torch.nn as nn
@@ -67,62 +68,8 @@ def save_metrics(metrics_dict: dict, config: Config) -> None:
     print(f"Metrics saved to {config.model.dir_path}{config.model.name}/metrics.json")
 
 
-def _cc_single_torch(
-    raw_tensor: torch.Tensor, dst_tensor: torch.Tensor
-) -> torch.Tensor:
-    """
-    Compute the Cross-Correlation (CC) metric between two input tensors representing images.
-
-    CC measures the similarity between two images by calculating the cross-correlation coefficient between spectral bands.
-
-    Args:
-        raw_tensor (torch.Tensor): The image tensor to be compared.
-        dst_tensor (torch.Tensor): The reference image tensor.
-
-    Returns:
-        CC (torch.Tensor): The Cross-Correlation (CC) metric score.
-
-    """
-    N_spectral = raw_tensor.shape[1]
-
-    # Reshaping fused and reference data
-    raw_tensor_reshaped = raw_tensor.view(N_spectral, -1)
-    dst_tensor_reshaped = dst_tensor.view(N_spectral, -1)
-
-    # Calculating mean value
-    mean_raw = torch.mean(raw_tensor_reshaped, 1).unsqueeze(1)
-    mean_dst = torch.mean(dst_tensor_reshaped, 1).unsqueeze(1)
-
-    CC = torch.sum(
-        (raw_tensor_reshaped - mean_raw) * (dst_tensor_reshaped - mean_dst), 1
-    ) / torch.sqrt(
-        torch.sum((raw_tensor_reshaped - mean_raw) ** 2, 1)
-        * torch.sum((dst_tensor_reshaped - mean_dst) ** 2, 1)
-    )
-
-    CC = torch.mean(CC)
-
-    return CC
-
-
-def ncc_loss(sr: torch.Tensor, hr: torch.Tensor) -> torch.Tensor:
-    """
-    Calculate the Normalized Cross-Correlation (NCC) loss between super-resolved and high-resolution images.
-
-    Args:
-        sr (torch.Tensor): Super-resolved image tensor.
-        hr (torch.Tensor): High-resolution image tensor.
-
-    Returns:
-        torch.Tensor: NCC loss value.
-    """
-    cc_value = _cc_single_torch(sr, hr)
-    # Normalizziamo il valore di CC per ottenere una loss
-    return 1 - ((cc_value + 1) * 0.5)
-
-
 def charbonnier_loss(
-    x: torch.Tensor, y: torch.Tensor, eps: float = 1e-3
+    x: torch.Tensor, y: torch.Tensor, eps: float = 1e-4
 ) -> torch.Tensor:
     """Charbonnier (pseudo L1) loss: sqrt((x-y)^2 + eps^2)."""
     diff = x - y
@@ -164,19 +111,77 @@ def _get_sobel_kernels(
 
 
 def sobel_gradient(t: torch.Tensor) -> torch.Tensor:
-    """Calcola il modulo del gradiente Sobel per ciascun canale e li concatena.
-    Ritorna tensore con stessa shape dell'input (approssimando: modulo normalizzato)."""
     dx_k, dy_k = _get_sobel_kernels(t.device, t.dtype)
     c = t.shape[1]
-    # group conv per applicare stesso kernel a ogni canale
-    dx = torch.nn.functional.conv2d(t, dx_k.repeat(c, 1, 1, 1), padding=1, groups=c)
-    dy = torch.nn.functional.conv2d(t, dy_k.repeat(c, 1, 1, 1), padding=1, groups=c)
-    grad = torch.sqrt(torch.clamp(dx * dx + dy * dy, min=0.0) + 1e-12)
+    t_pad = torch.nn.functional.pad(t, (1, 1, 1, 1), mode="reflect")
+    dx = torch.nn.functional.conv2d(t_pad, dx_k.repeat(c, 1, 1, 1), groups=c)
+    dy = torch.nn.functional.conv2d(t_pad, dy_k.repeat(c, 1, 1, 1), groups=c)
+    grad = torch.sqrt(dx * dx + dy * dy + 1e-12)
     return grad
 
 
 def gradient_loss(sr: torch.Tensor, hr: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.l1_loss(sobel_gradient(sr), sobel_gradient(hr))
+
+
+# High-Frequency loss via blur-subtraction: HF(x) = x - (x * b)
+_GAUSS_KERNELS: dict[tuple, torch.Tensor] | None = None
+
+
+def _get_gaussian_kernel2d(
+    device: torch.device, dtype: torch.dtype, ksize: int = 5, sigma: float = 1.0
+) -> torch.Tensor:
+    """Crea o recupera un kernel gaussiano 2D normalizzato (ksize x ksize).
+    Usato per separare le componenti a bassa frequenza (blur)."""
+    global _GAUSS_KERNELS
+    if _GAUSS_KERNELS is None:
+        _GAUSS_KERNELS = {}
+    key = (device, dtype, int(ksize), float(sigma))
+    if key in _GAUSS_KERNELS:
+        return _GAUSS_KERNELS[key]
+
+    ax = torch.arange(ksize, device=device, dtype=dtype) - (ksize - 1) / 2
+    xx, yy = torch.meshgrid(ax, ax, indexing="ij")
+    kernel = torch.exp(-(xx**2 + yy**2) / (2 * sigma * sigma))
+    kernel = kernel / (kernel.sum() + 1e-12)
+    kernel = kernel.view(1, 1, ksize, ksize)
+    _GAUSS_KERNELS[key] = kernel
+    return kernel
+
+
+def _gaussian_blur(x: torch.Tensor, ksize: int = 5, sigma: float = 1.0) -> torch.Tensor:
+    k = _get_gaussian_kernel2d(x.device, x.dtype, ksize, sigma)
+    c = x.shape[1]
+    # Applichiamo lo stesso kernel a ogni canale
+    padding = ksize // 2
+    x_padded = torch.nn.functional.pad(
+        x, (padding, padding, padding, padding), mode="reflect"
+    )
+    return torch.nn.functional.conv2d(
+        x_padded, k.repeat(c, 1, 1, 1), padding=0, groups=c
+    )
+
+
+def high_frequency_map(
+    x: torch.Tensor, ksize: int = 5, sigma: float = 1.0
+) -> torch.Tensor:
+    """Restituisce la componente ad alta frequenza: HF(x) = x - blur(x)."""
+    return x - _gaussian_blur(x, ksize, sigma)
+
+
+def high_frequency_loss(
+    sr: torch.Tensor, hr: torch.Tensor, ksize: int = 5, sigma: float = 1.0
+) -> torch.Tensor:
+    """|| HF(y) - HF(x) ||_1. Enfatizza bordi e texture.
+    Args:
+        sr: predizione (B,C,H,W)
+        hr: ground truth (B,C,H,W)
+        ksize: dimensione kernel gaussiano
+        sigma: deviazione standard gaussiana
+    """
+    sr_hf = high_frequency_map(sr, ksize, sigma)
+    hr_hf = high_frequency_map(hr, ksize, sigma)
+    return torch.nn.functional.l1_loss(sr_hf, hr_hf)
 
 
 def composite_loss(
@@ -191,25 +196,26 @@ def composite_loss(
 
     comps: dict[str, torch.Tensor] = {}
 
-    # NCC
-    if weights.get("ncc", 0.0) > 0:
-        ncc_v = ncc_loss(sr, hr)
-        comps["ncc"] = weights["ncc"] * ncc_v
-
-    # SSIM
-    if weights.get("ssim", 0.0) > 0:
-        ssim_v = SSIMLoss()(sr, hr)
-        comps["ssim"] = weights["ssim"] * ssim_v
-
     # Charbonnier
     if weights.get("charb", 0.0) > 0:
         charb_v = charbonnier_loss(sr, hr)
         comps["charb"] = weights["charb"] * charb_v
 
-    # Gradient HF
-    if weights.get("grad", 0.0) > 0:
+    # High-Frequency loss (blur-subtraction)
+    if weights.get("hf", 0.0) > 0:
+        hf_v = high_frequency_loss(sr, hr)
+        comps["hf"] = weights["hf"] * hf_v
+
+    # Gradient HF (Sobel)
+    if weights.get("sobel", 0.0) > 0:
         grad_v = gradient_loss(sr, hr)
-        comps["grad"] = weights["grad"] * grad_v
+        comps["sobel"] = weights["sobel"] * grad_v
+
+    # SSIM
+    if weights.get("ssim", 0.0) > 0:
+        sr_01 = torch.sigmoid(sr)
+        ssim_v = SSIMLoss()(sr_01, hr)
+        comps["ssim"] = weights["ssim"] * ssim_v
 
     # MoE
     if weights.get("moe", 0.0) > 0:
@@ -218,14 +224,6 @@ def composite_loss(
         else:
             moe_loss_tensor = moe_loss.to(device=sr.device, dtype=sr.dtype)
         comps["moe"] = weights["moe"] * moe_loss_tensor
-
-    if weights.get("l1", 0.0) > 0:
-        l1_v = torch.nn.functional.l1_loss(sr, hr)
-        comps["l1"] = weights["l1"] * l1_v
-
-    if weights.get("mse", 0.0) > 0:
-        mse_v = torch.nn.functional.mse_loss(sr, hr)
-        comps["mse"] = weights["mse"] * mse_v
 
     total = (
         torch.stack([v for v in comps.values()]).sum()
@@ -338,7 +336,6 @@ def evaluate_model(
     psnr_total = 0.0
     ssim_total = 0.0
     lpips_total = 0.0
-    ncc_total = 0.0
     num_batches = 0
 
     with torch.no_grad():
@@ -368,17 +365,12 @@ def evaluate_model(
                 outputs_clamped[:, :3, :, :], high_res[:, :3, :, :]
             ).item()
 
-            # NCC: range [-1, 1]
-            cc_value = _cc_single_torch(outputs_clamped, high_res).item()
-            ncc_total += (cc_value + 1) * 0.5
-
             num_batches += 1
 
     return {
         "psnr": psnr_total / num_batches,
         "ssim": ssim_total / num_batches,
         "lpips": lpips_total / num_batches,
-        "ncc": ncc_total / num_batches,
     }
 
 
