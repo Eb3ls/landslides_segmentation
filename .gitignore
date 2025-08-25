@@ -2,6 +2,7 @@
 *.json
 .vscode
 Comuni
+plots
 __pycache__
 *.pth
 Trash

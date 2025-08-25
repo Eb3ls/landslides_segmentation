@@ -257,7 +257,10 @@ def get_segmentation_stack(
 
     for filename in os.listdir(directory):
         # Saltiamo i file non rilevanti
-        if any(substr in filename.lower() for substr in ["sentinel2", "ndvi", "slope"]):
+        if any(
+            substr in filename.lower()
+            for substr in ["sentinel2", "s2"]
+        ):
             continue
 
         path = os.path.join(directory, filename)
@@ -274,10 +277,13 @@ def get_segmentation_stack(
                 input_stack.extend(bands)
             elif "Cgr" in filename:
                 input_stack.extend(bands)
+            elif "Slope" in filename:
+                input_stack.extend(bands)
+            elif "NDVI" in filename:
+                input_stack.extend(bands)
             elif "Frane" in filename:
                 landslide_mask = get_landslide_mask(bands)
                 output_stack.extend(landslide_mask)
-
             else:
                 print(f"File '{filename}' not recognized, skipping.")
 
@@ -606,3 +612,95 @@ class SuperResolutionDataset(Dataset):
             ).squeeze(0)
 
         return low_res_tensor, high_res_tensor
+
+
+class SegmentationSingleDataset(Dataset):
+    """Dataset per il training della segmentazione con un comune."""
+
+    def __init__(
+        self, comune: ComuneType, patch_size: int = 256, num_patches: int = 1000
+    ):
+        self.comune = comune
+        self.patch_size = patch_size
+        self.num_patches = num_patches
+
+        print(f"Loading data for {comune}...")
+
+        # Generiamo la maschera del dataset
+        self.mask = generate_dataset_mask(comune)
+
+        # Carichiamo gli stack di dati
+        self.stack_input, self.stack_landslide = get_segmentation_stack(comune)
+
+    def __len__(self) -> int:
+        return self.num_patches
+
+    def __getitem__(self, _) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        input_patch, landslide_patch, _ = get_random_patch(
+            self.stack_input, self.stack_landslide, self.patch_size, self.mask
+        )
+
+        # Convertiamo a tensori e assicuriamo il formato corretto
+        input_tensor = torch.from_numpy(input_patch).float()
+        landslide_tensor = torch.from_numpy(landslide_patch).float()
+
+        # Settiamo i valori NaN a 0
+        input_tensor = torch.nan_to_num(input_tensor, nan=0.0)
+        landslide_tensor = torch.nan_to_num(landslide_tensor, nan=0.0)
+
+        return input_tensor, landslide_tensor
+
+
+class SegmentationMultiDataset(Dataset):
+    """Dataset per il training della segmentazione con più comuni."""
+
+    def __init__(
+        self, comuni: list[ComuneType], patch_size: int = 256, num_patches: int = 1000
+    ):
+        self.comuni = comuni
+        self.patch_size = patch_size
+        self.num_patches = num_patches
+        self.masks = []
+        self.stack_input = []
+        self.stack_landslide = []
+
+        print(f"Loading data for {comuni}...")
+
+        for comune in comuni:
+            # Generiamo la maschera del dataset
+            self.masks.append(generate_dataset_mask(comune))
+            # Carichiamo gli stack di dati
+            input, landslide = get_segmentation_stack(comune)
+            self.stack_input.append(input)
+            self.stack_landslide.append(landslide)
+
+    def __len__(self) -> int:
+        return self.num_patches
+
+    def __getitem__(self, _) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Selezioniamo un comune casuale
+        comune_idx = np.random.choice(len(self.comuni))
+
+        input_patch, landslide_patch, patch_mask = get_random_patch(
+            self.stack_input[comune_idx],
+            self.stack_landslide[comune_idx],
+            self.patch_size,
+            self.masks[comune_idx],
+        )
+
+        # Convertiamo a tensori e assicuriamo il formato corretto
+        input_tensor = torch.from_numpy(input_patch).float()
+        landslide_tensor = torch.from_numpy(landslide_patch).float()
+        patch_mask_tensor = torch.from_numpy(patch_mask)
+
+        # Settiamo i valori NaN a 0
+        input_tensor = torch.nan_to_num(input_tensor, nan=0.0)
+        landslide_tensor = torch.nan_to_num(landslide_tensor, nan=0.0)
+
+        # Aggiungiamo eventuali augmentazioni
+        input_tensor, landslide_tensor = augment_data(
+            input_tensor, landslide_tensor, patch_mask_tensor, prob=0.5
+        )
+
+        return input_tensor, landslide_tensor

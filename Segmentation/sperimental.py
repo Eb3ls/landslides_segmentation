@@ -16,12 +16,14 @@ from typing import cast
 
 from data_utils import (
     ComuneType,
-    get_segmentation_stack,
-    get_random_patch,
-    generate_dataset_mask,
-    augment_data,
+    SegmentationMultiDataset,
+    SegmentationSingleDataset
 )
 
+PATCH_SIZE = 256
+NUM_PATCHES = 1000
+BATCH_SIZE = 4
+NUM_EPOCHS = 120
 
 class DoubleConv(nn.Module):
     """Blocco di doppia convoluzione utilizzato in U-Net."""
@@ -132,99 +134,6 @@ class UNet(nn.Module):
         logits = self.outc(x)  # Il logit è il valore grezzo di output al modello
         return logits
 
-
-class SegmentationSingleDataset(Dataset):
-    """Dataset per il training della segmentazione con un comune."""
-
-    def __init__(
-        self, comune: ComuneType, patch_size: int = 256, num_patches: int = 1000
-    ):
-        self.comune = comune
-        self.patch_size = patch_size
-        self.num_patches = num_patches
-
-        print(f"Loading data for {comune}...")
-
-        # Generiamo la maschera del dataset
-        self.mask = generate_dataset_mask(comune)
-
-        # Carichiamo gli stack di dati
-        self.stack_input, self.stack_landslide = get_segmentation_stack(comune)
-
-    def __len__(self) -> int:
-        return self.num_patches
-
-    def __getitem__(self, _) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        input_patch, landslide_patch, _ = get_random_patch(
-            self.stack_input, self.stack_landslide, self.patch_size, self.mask
-        )
-
-        # Convertiamo a tensori e assicuriamo il formato corretto
-        input_tensor = torch.from_numpy(input_patch).float()
-        landslide_tensor = torch.from_numpy(landslide_patch).float()
-
-        # Settiamo i valori NaN a 0
-        input_tensor = torch.nan_to_num(input_tensor, nan=0.0)
-        landslide_tensor = torch.nan_to_num(landslide_tensor, nan=0.0)
-
-        return input_tensor, landslide_tensor
-
-
-class SegmentationMultiDataset(Dataset):
-    """Dataset per il training della segmentazione con più comuni."""
-
-    def __init__(
-        self, comuni: list[ComuneType], patch_size: int = 256, num_patches: int = 1000
-    ):
-        self.comuni = comuni
-        self.patch_size = patch_size
-        self.num_patches = num_patches
-        self.masks = []
-        self.stack_input = []
-        self.stack_landslide = []
-
-        print(f"Loading data for {comuni}...")
-
-        for comune in comuni:
-            # Generiamo la maschera del dataset
-            self.masks.append(generate_dataset_mask(comune))
-            # Carichiamo gli stack di dati
-            input, landslide = get_segmentation_stack(comune)
-            self.stack_input.append(input)
-            self.stack_landslide.append(landslide)
-
-    def __len__(self) -> int:
-        return self.num_patches
-
-    def __getitem__(self, _) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Selezioniamo un comune casuale
-        comune_idx = np.random.choice(len(self.comuni))
-
-        input_patch, landslide_patch, patch_mask = get_random_patch(
-            self.stack_input[comune_idx],
-            self.stack_landslide[comune_idx],
-            self.patch_size,
-            self.masks[comune_idx],
-        )
-
-        # Convertiamo a tensori e assicuriamo il formato corretto
-        input_tensor = torch.from_numpy(input_patch).float()
-        landslide_tensor = torch.from_numpy(landslide_patch).float()
-        patch_mask_tensor = torch.from_numpy(patch_mask)
-
-        # Settiamo i valori NaN a 0
-        input_tensor = torch.nan_to_num(input_tensor, nan=0.0)
-        landslide_tensor = torch.nan_to_num(landslide_tensor, nan=0.0)
-
-        # Aggiungiamo eventuali augmentazioni
-        input_tensor, landslide_tensor = augment_data(
-            input_tensor, landslide_tensor, patch_mask_tensor, prob=0.5
-        )
-
-        return input_tensor, landslide_tensor
-
-
 def train_model(
     model: nn.Module,
     train_loader: DataLoader,
@@ -234,7 +143,7 @@ def train_model(
     device: torch.device,
     scheduler: ReduceLROnPlateau,
     num_epochs: int = 20,
-) -> Tuple[list[float], list[float], list[float], list[float]]:
+) -> Tuple[list[float], list[float], list[float], list[float], list[float]]:
     """Addestra il modello di segmentazione."""
 
     model.train()
@@ -242,6 +151,8 @@ def train_model(
     val_losses = []
     oa_values = []
     iou_values = []
+    dice_values = []
+
     best_iou = 0
 
     for epoch in range(num_epochs):
@@ -260,7 +171,7 @@ def train_model(
 
                 # Forward pass
                 outputs = model(data)  # Generazione delle predizioni
-                loss = criterion(outputs, landslide)  # Calcolo della loss
+                loss = criterion(outputs, landslide) 
 
                 # Backward pass
                 loss.backward()
@@ -276,29 +187,46 @@ def train_model(
         train_loss = epoch_loss_sum / max(1, num_samples)
         train_losses.append(train_loss)
 
-        val_loss, val_iou, oa = evaluate_model(
-                model, eval_loader, device, criterion
+        val_loss, val_iou, oa, dice_score, _ = evaluate_model(
+            model, eval_loader, device, criterion
         )
 
         model.train()
 
         val_losses.append(val_loss)
         iou_values.append(val_iou)
+        dice_values.append(dice_score)
         oa_values.append(oa)
 
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]["lr"]
         print(
-            f"Epoch [{epoch+1}/{num_epochs}], Average Loss: {train_loss:.6f}, Validation Loss: {val_loss:.6f}, Validation IoU: {val_iou:.6f}, Overall Accuracy: {oa:.6f}, LR: {current_lr:.2e}"
+            f"Epoch [{epoch+1}/{num_epochs}], Average Loss: {train_loss:.6f}, Validation Loss: {val_loss:.6f}, Validation IoU: {val_iou:.6f}, Validation Dice: {dice_score:.6f}, Overall Accuracy: {oa:.6f}, LR: {current_lr:.2e}"
         )
 
         # Salvataggio del modello migliore
-        if val_iou > best_iou and epoch > 50:  # Non salviamo il primo modello
+        if val_iou > best_iou and epoch > 30:
             best_iou = val_iou
-            print(f"New best model found at epoch {epoch+1} with average IoU {best_iou:.6f}")
+            print(
+                f"New best model found at epoch {epoch+1} with average IoU {best_iou:.6f}"
+            )
             torch.save(model.state_dict(), "best_model.pth")
 
-    return train_losses, val_losses, iou_values, oa_values
+    return train_losses, val_losses, iou_values, oa_values, dice_values
+
+
+def compute_confusion_matrix(
+    preds: torch.Tensor, labels: torch.Tensor
+) -> list[list[float]]:
+    """Calcola la matrice di confusione."""
+    total_elements = preds.numel()
+    preds = preds.view(-1)
+    labels = labels.view(-1)
+    tp = ((preds == 1) & (labels == 1)).sum().item() / total_elements
+    fp = ((preds == 1) & (labels == 0)).sum().item() / total_elements
+    tn = ((preds == 0) & (labels == 0)).sum().item() / total_elements
+    fn = ((preds == 0) & (labels == 1)).sum().item() / total_elements
+    return [[tn, fp], [fn, tp]]
 
 
 def evaluate_model(
@@ -307,8 +235,9 @@ def evaluate_model(
     device: torch.device,
     criterion: nn.Module,
     threshold: float = 0.5,
-) -> Tuple[float, float, float]:
-    """Valuta il modello restituendo (loss media, IoU, OA)."""
+    return_confusion_matrix: bool = False,
+) -> Tuple[float, float, float, float, np.ndarray | None]:
+    """Valuta il modello restituendo (loss media, IoU, OA, Dice). Ritorna opzionalmente anche la matrice di confusione."""
 
     model.eval()
     total_loss_sum = 0.0
@@ -319,6 +248,11 @@ def evaluate_model(
     union_sum = 0.0
     correct_sum = 0.0
     total_pixels = 0
+
+    # Inizializzazione matrice di confusione
+    confusion_matrix_total = (
+        np.zeros((2, 2), dtype=np.float32) if return_confusion_matrix else None
+    )
 
     with torch.no_grad():
         for input, labels in dataloader:
@@ -335,22 +269,34 @@ def evaluate_model(
             probs = torch.sigmoid(outputs)
             preds = (probs > threshold).float()
 
+            if confusion_matrix_total is not None:
+                # Calcolo matrice di confusione
+                confusion_matrix = compute_confusion_matrix(preds, labels)
+                confusion_matrix_total += confusion_matrix
+
             # Calcolo intersezione, unione e accuratezza -> ricordare che i valori sono binari
             inter = (preds * labels).sum().item()
             union = ((preds + labels) > 0).float().sum().item()
             intersection_sum += inter
             union_sum += union
+
             correct = (preds == labels).sum().item()
             total = preds.numel()
-
             correct_sum += correct
             total_pixels += total
-
 
     val_loss = total_loss_sum / max(1, num_samples)
     iou = intersection_sum / union_sum if union_sum > 0 else 1.0
     oa = correct_sum / max(1, total_pixels)
-    return val_loss, iou, oa
+    # Dice = 2 * intersezione / (ground truth + predizioni)
+    # ground truth + predizioni si ottiene anche come intersezione + unione di esse
+    dice = (
+        (2.0 * intersection_sum) / (intersection_sum + union_sum)
+        if (intersection_sum + union_sum) > 0
+        else 1.0
+    )
+
+    return val_loss, iou, oa, dice, confusion_matrix_total / len(dataloader) if confusion_matrix_total is not None else None #len(dataloader) è il numero di batch
 
 
 def visualize_results(
@@ -359,7 +305,7 @@ def visualize_results(
     device: torch.device,
     num_samples: int = 5,
 ) -> None:
-    """Visualizza i risultati del modello."""
+    """Visualizza i risultati del modello. Mostra le immagini rgb, le predizioni e le ground truth."""
 
     model.eval()
     viewer = napari.Viewer()
@@ -433,11 +379,6 @@ def main():
     train_comuni = cast(list[ComuneType], ["Predappio", "Modigliana", "Brisighella"])
     eval_comune = cast(ComuneType, "Casola-Valsenio")
 
-    patch_size = 256
-    num_patches = 2000
-    batch_size = 8
-    num_epochs = 170
-
     # Dispositivo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -447,8 +388,8 @@ def main():
 
     try:
         # Creazione del dataset
-        train_dataset = SegmentationMultiDataset(train_comuni, patch_size, num_patches)
-        eval_dataset = SegmentationSingleDataset(eval_comune, patch_size, num_patches)
+        train_dataset = SegmentationMultiDataset(train_comuni, PATCH_SIZE, NUM_PATCHES)
+        eval_dataset = SegmentationSingleDataset(eval_comune, PATCH_SIZE, NUM_PATCHES)
 
         # Printiamo shape in input e output
         sample_input, sample_landslide = train_dataset[0]
@@ -460,7 +401,7 @@ def main():
         # Creiamo i data loader
         train_loader = DataLoader(
             train_dataset,
-            batch_size=batch_size,
+            batch_size=BATCH_SIZE,
             # Parallelizziamo la generazione dei batch
             num_workers=0,
             worker_init_fn=seed_workers,
@@ -470,7 +411,7 @@ def main():
 
         eval_loader = DataLoader(
             eval_dataset,
-            batch_size=batch_size,
+            batch_size=BATCH_SIZE,
             num_workers=0,
             worker_init_fn=seed_workers,
             pin_memory=True if device.type == "cuda" else False,
@@ -496,18 +437,21 @@ def main():
 
         # Allenamento
         print("Starting training...")
-        train_losses, val_losses, iou_values, oa_values = train_model(
-            model, train_loader, eval_loader, criterion, optimizer, device, scheduler, num_epochs
+        train_losses, val_losses, iou_values, oa_values, dice_values = train_model(
+            model,
+            train_loader,
+            eval_loader,
+            criterion,
+            optimizer,
+            device,
+            scheduler,
+            NUM_EPOCHS
         )
 
-        # Valutazione con metriche
-        print("Evaluating model...")
-        val_loss, val_iou, val_oa = evaluate_model(
-            model, eval_loader, device, criterion
-        )
-        print(f"Validation Loss: {val_loss:.6f}")
-        print(f"Validation IoU: {val_iou:.4f}")
-        print(f"Validation OA: {val_oa:.4f}")
+        # Crea cartella plots se non esistente
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        plots_dir = os.path.join(base_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
 
         # Plot training losses
         plt.figure(figsize=(10, 5))
@@ -518,17 +462,33 @@ def main():
         plt.ylabel("Loss")
         plt.legend()
         plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, "losses.png"), dpi=150)
         plt.show()
 
-        # Plot IoU and OA
+        # Plot OA
         plt.figure(figsize=(10, 5))
-        plt.plot(iou_values, label="Validation IoU")
         plt.plot(oa_values, label="Validation OA")
-        plt.title("IoU and OA")
+        plt.title("OA")
         plt.xlabel("Epoch")
         plt.ylabel("Score")
         plt.legend()
         plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, "oa.png"), dpi=150)
+        plt.show()
+
+        # Plot Dice and IoU
+        plt.figure(figsize=(10, 5))
+        plt.plot(dice_values, label="Validation Dice")
+        plt.plot(iou_values, label="Validation IoU")
+        plt.title("Dice")
+        plt.xlabel("Epoch")
+        plt.ylabel("Score")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, "dice_iou.png"), dpi=150)
         plt.show()
 
         # Risultati
