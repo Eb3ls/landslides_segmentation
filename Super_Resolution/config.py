@@ -47,6 +47,19 @@ class MyModelConfig(ModelConfig):
 
 
 @dataclass
+class PSWinModelConfig(ModelConfig):
+    num_feat: int
+    emb_patch_size: int
+    embed_dim: int
+    depths: list[int]
+    num_heads: list[int]
+    window_size: int
+    resi_connection: Literal["1conv", "3conv"]
+    upsampler: str
+    multiscale_weights: list[float]
+
+
+@dataclass
 class TrainConfig:
     seed: int
     workers: int
@@ -139,6 +152,30 @@ class ConfigMyModel(Config):
             )
 
         if self.model.img_size % self.model.img_size != 0:
+            raise ValueError(
+                f"patch_size {self.model.img_size} must be divisible by window_size {self.model.window_size}"
+            )
+
+        if not os.path.exists(os.path.join(self.model.dir_path, self.model.name)):
+            os.makedirs(os.path.join(self.model.dir_path, self.model.name))
+
+
+class ConfigPSWin(Config):
+    def __init__(self, config_path="Super_Resolution/pswin/config.yml"):
+        with open(config_path, "r") as f:
+            config_dict = yaml.safe_load(f)
+
+        self.model = PSWinModelConfig(**config_dict["model"])
+        self.train = TrainConfig(**config_dict["train"])
+        self.test = TestConfig(**config_dict["test"])
+
+        # Controlliamo che embedded dim sia divisibile per ogni testa nella lista num_heads
+        if not all(self.model.embed_dim % n == 0 for n in self.model.num_heads):
+            raise ValueError(
+                f"embed_dim {self.model.embed_dim} must be divisible by every num_heads in {self.model.num_heads}"
+            )
+
+        if self.model.img_size % self.model.window_size != 0:
             raise ValueError(
                 f"patch_size {self.model.img_size} must be divisible by window_size {self.model.window_size}"
             )
