@@ -124,9 +124,12 @@ class PatchUnEmbed(nn.Module):
 
     def __init__(self, img_size: int, patch_size: int, in_chans: int, embed_dim: int):
         super().__init__()
-        img_size_list = [img_size, img_size]
-        patch_size_list = [patch_size, patch_size]
-        patch_resolution = [img_size // patch_size, img_size // patch_size]
+        img_size_list = (img_size, img_size)
+        patch_size_list = (patch_size, patch_size)
+        patch_resolution = (
+            img_size // patch_size,
+            img_size // patch_size,
+        )
         self.img_size = img_size_list
         self.patch_size = patch_size_list
         self.patch_resolution = patch_resolution

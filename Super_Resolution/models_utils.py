@@ -1,6 +1,5 @@
 import json
 import random
-from time import sleep
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,8 +10,11 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from dataclasses import asdict
 
-# LPIPS genera warning sul modo in cui carica i pesi
-from piq import ssim, psnr, LPIPS, SSIMLoss
+from torchmetrics.image import (
+    PeakSignalNoiseRatio,
+    StructuralSimilarityIndexMeasure,
+)
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from datetime import datetime
 from Super_Resolution.config import Config, ConfigMyModel, ConfigRCAN, ConfigSwin2Mose
 from Super_Resolution.rcan.rcan_model import RCAN
@@ -184,6 +186,18 @@ def high_frequency_loss(
     return torch.nn.functional.l1_loss(sr_hf, hr_hf)
 
 
+# Cache delle metriche per evitare ricreazioni continue
+_SSIM_METRIC: StructuralSimilarityIndexMeasure | None = None
+
+
+def _get_ssim_metric(device: torch.device) -> StructuralSimilarityIndexMeasure:
+    """Ottieni o crea la metrica SSIM sul device corretto."""
+    global _SSIM_METRIC
+    if _SSIM_METRIC is None or _SSIM_METRIC.device != device:
+        _SSIM_METRIC = StructuralSimilarityIndexMeasure().to(device)
+    return _SSIM_METRIC
+
+
 def composite_loss(
     sr: torch.Tensor,
     hr: torch.Tensor,
@@ -213,8 +227,12 @@ def composite_loss(
 
     # SSIM
     if weights.get("ssim", 0.0) > 0:
+        # SSIM loss = 1 - SSIM value
         sr_01 = torch.sigmoid(sr)
-        ssim_v = SSIMLoss()(sr_01, hr)
+
+        ssim_metric = _get_ssim_metric(sr.device)
+        ssim_value = ssim_metric(sr_01, hr)
+        ssim_v = 1.0 - ssim_value
         comps["ssim"] = weights["ssim"] * ssim_v
 
     # MoE
@@ -247,12 +265,14 @@ def train_model(
 
     # Loss and optimizer
     criterion = composite_loss
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
+    optimizer = optim.AdamW(
+        model.parameters(), lr=1e-4, weight_decay=1e-4, betas=(0.9, 0.999)
+    )
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
         factor=0.5,
-        patience=4,
+        patience=2,
         threshold=1e-4,
         min_lr=1e-6,
     )
@@ -308,7 +328,7 @@ def train_model(
 
                 pbar.set_postfix({"tot": f"{total_loss.item():.6f}"})
 
-        denom = max(1, len(dataloader))
+        denom = len(dataloader)
         losses_epoch["total"].append(accumulators["total"] / denom)
         for k in active_components:
             losses_epoch[k].append(
@@ -330,7 +350,7 @@ def train_model(
 def evaluate_model(
     model: nn.Module, dataloader: DataLoader, device: torch.device
 ) -> dict:
-    """Valuta il modello con PSNR, SSIM, LPIPS e NCC"""
+    """Valuta il modello con PSNR, SSIM e LPIPS"""
 
     model.eval()
     psnr_total = 0.0
@@ -340,6 +360,11 @@ def evaluate_model(
 
     bicubic_list = []
     nearest_list = []
+
+    # Inizializza le metriche
+    psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
+    ssim_metric = StructuralSimilarityIndexMeasure().to(device)
+    lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type="vgg").to(device)
 
     with torch.no_grad():
         for low_res, high_res in dataloader:
@@ -351,20 +376,14 @@ def evaluate_model(
                 # Se il modello restituisce anche la loss di Moe
                 outputs, _ = outputs
 
-            # Clamp dei valori per SSIM (deve essere in [0,1])
-            print(
-                f"Under 0 values: {torch.sum(outputs < 0)}, Over 1 values: {torch.sum(outputs > 1)}"
-            )
+            # Clamp dei valori per le metriche
             outputs_clamped = torch.clamp(outputs, 0, 1)
 
-            # PSNR: range [0, +inf]
-            psnr_total += psnr(outputs_clamped, high_res).item()
+            psnr_total += psnr_metric(outputs_clamped, high_res).item()
+            ssim_total += ssim_metric(outputs_clamped, high_res).item()
 
-            # SSIM: range [0, 1]
-            ssim_total += ssim(outputs_clamped, high_res).item()  # type: ignore
-
-            # LPIPS: range [0, 1], RGB only
-            lpips_total += LPIPS()(
+            # LPIPS: range [0, 1], solo per canali RGB (primi 3 canali)
+            lpips_total += lpips_metric(
                 outputs_clamped[:, :3, :, :], high_res[:, :3, :, :]
             ).item()
 
@@ -380,7 +399,7 @@ def evaluate_model(
             )
 
             bicubic_list.append(
-                psnr(torch.clamp(low_res_tensor, 0, 1), high_res).item()
+                psnr_metric(torch.clamp(low_res_tensor, 0, 1), high_res).item()
             )
 
             low_res_tensor = torch.nn.functional.interpolate(
@@ -389,7 +408,7 @@ def evaluate_model(
                 mode="nearest",
             )
             nearest_list.append(
-                psnr(torch.clamp(low_res_tensor, 0, 1), high_res).item()
+                psnr_metric(torch.clamp(low_res_tensor, 0, 1), high_res).item()
             )
 
     print(f"Avg Bicubic PSNR: {np.mean(bicubic_list):.4f}")

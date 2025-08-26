@@ -17,6 +17,11 @@ from torch.utils.data import Dataset, DataLoader
 from torch import Tensor
 from typing import Dict, List, Tuple
 from tqdm import tqdm
+from torchmetrics.image import (
+    PeakSignalNoiseRatio,
+    StructuralSimilarityIndexMeasure,
+)
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 # Ensure repo root is in path
 sys.path.insert(
@@ -29,6 +34,7 @@ from Super_Resolution.models_utils import (
     save_metrics,
     save_model,
     seed_workers,
+    composite_loss,
 )
 from Super_Resolution.pswin.pswin_model import MultiScaleProgressiveModel
 
@@ -91,35 +97,22 @@ class MultiScaleTargetsDataset(Dataset):
 def multi_scale_progressive_loss(
     predictions: Dict[str, Tensor],
     targets: Dict[str, Tensor],
-    stage_weights: List[float] = [0.2, 0.3, 0.5],
-    loss_type: str = "charbonnier",
+    config: ConfigPSWin,
+    stage_weights: List[float],
 ) -> Tuple[Tensor, Dict[str, Tensor]]:
     """
-    Compute multi-scale progressive loss.
+    Compute multi-scale progressive loss usando il sistema composite_loss.
 
     Args:
         predictions: Dictionary with model outputs for each stage
         targets: Dictionary with ground truth targets for each stage
         stage_weights: Weights for each supervision stage [stage_1, stage_2, final]
-        loss_type: Type of loss function ("l1", "l2", "charbonnier")
+        config: Configuration object for loss weights
 
     Returns:
         total_loss: Weighted sum of all stage losses
-        loss_components: Dictionary with individual stage losses
+        loss_components: Dictionary with individual stage losses per stage
     """
-
-    def compute_loss(pred: Tensor, target: Tensor, loss_type: str) -> Tensor:
-        if loss_type == "l1":
-            return F.l1_loss(pred, target)
-        elif loss_type == "l2":
-            return F.mse_loss(pred, target)
-        elif loss_type == "charbonnier":
-            eps = 1e-4
-            diff = pred - target
-            return torch.sqrt(diff * diff + eps * eps).mean()
-        else:
-            raise ValueError(f"Unknown loss type: {loss_type}")
-
     loss_components: Dict[str, Tensor] = {}
     total_loss = torch.tensor(0.0, device=next(iter(predictions.values())).device)
 
@@ -128,9 +121,17 @@ def multi_scale_progressive_loss(
 
     for i, stage in enumerate(stages):
         if stage in predictions and stage in targets:
-            stage_loss = compute_loss(predictions[stage], targets[stage], loss_type)
-            loss_components[stage] = stage_loss
+            # Usa composite_loss per ogni stage
+            stage_loss, stage_comps = composite_loss(
+                predictions[stage], targets[stage], config
+            )
+
+            loss_components[f"{stage}"] = stage_loss
             total_loss += stage_weights[i] * stage_loss
+
+            # Aggiungi anche le componenti individuali per logging dettagliato
+            for comp_name, comp_value in stage_comps.items():
+                loss_components[f"{stage}_{comp_name}"] = comp_value
 
     return total_loss, loss_components
 
@@ -198,8 +199,8 @@ def train_multi_scale_model(
                     total_loss, loss_components = multi_scale_progressive_loss(
                         predictions,
                         targets,
+                        config,
                         config.model.multiscale_weights,
-                        loss_type="charbonnier",
                     )
 
                 # Backward pass
@@ -219,7 +220,7 @@ def train_multi_scale_model(
                 pbar.set_postfix({"tot": f"{total_loss.item():.6f}"})
 
         # Average losses for epoch
-        num_batches = max(1, len(dataloader))
+        num_batches = len(dataloader)
         for key in epoch_losses:
             losses_epoch[key].append(epoch_losses[key] / num_batches)
 
@@ -255,7 +256,6 @@ def evaluate_multi_scale_model(
 
     model.eval()
     # Importiamo qui per evitare problemi di import
-    from piq import ssim, psnr, LPIPS
 
     # Metrics for each stage
     metrics = {
@@ -269,6 +269,11 @@ def evaluate_multi_scale_model(
     }
 
     num_batches = 0
+
+    # Inizializza le metriche
+    psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
+    ssim_metric = StructuralSimilarityIndexMeasure().to(device)
+    lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type="vgg").to(device)
 
     with torch.no_grad():
         for low_res, targets in dataloader:
@@ -287,42 +292,24 @@ def evaluate_multi_scale_model(
                     target = targets[stage]
 
                     # PSNR per tutti gli stage
-                    metrics[f"{stage}_psnr"] += psnr(pred_clamped, target).item()
+                    metrics[f"{stage}_psnr"] += psnr_metric(pred_clamped, target).item()
 
                     # SSIM per tutti gli stage
-                    ssim_val = ssim(pred_clamped, target)
-                    if isinstance(ssim_val, list):
-                        print("Warning: SSIM returned a list, taking first element.")
-                        ssim_val = ssim_val[0]  # Take first element if list
+                    ssim_val = ssim_metric(pred_clamped, target).item()
                     metrics[f"{stage}_ssim"] += float(ssim_val)
 
                     # LPIPS solo per lo stage finale (RGB channels)
                     if stage == "final":
-                        lpips_val = LPIPS()(
+                        lpips_val = lpips_metric(
                             pred_clamped[:, :3, :, :], target[:, :3, :, :]
                         )
                         metrics[f"{stage}_lpips"] += lpips_val.item()
 
             num_batches += 1
 
-    if num_batches == 0:
-        return {k: 0.0 for k in metrics.keys()}
-
     # Average metrics
     for key in metrics:
         metrics[key] /= num_batches
-
-    # Print dei risultati
-    print(f"=== Multi-Scale Evaluation Results ===")
-    print(
-        f"Stage 1 (2x) - PSNR: {metrics['stage_1_psnr']:.4f}, SSIM: {metrics['stage_1_ssim']:.4f}"
-    )
-    print(
-        f"Stage 2 (4x) - PSNR: {metrics['stage_2_psnr']:.4f}, SSIM: {metrics['stage_2_ssim']:.4f}"
-    )
-    print(
-        f"Final (5x) - PSNR: {metrics['final_psnr']:.4f}, SSIM: {metrics['final_ssim']:.4f}, LPIPS: {metrics['final_lpips']:.4f}"
-    )
 
     return metrics
 
@@ -396,10 +383,31 @@ def visualize_multi_scale_predictions(
     if config.test.run_napari:
         viewer = napari.Viewer()
         for i, img_data in enumerate(images):
+            # Solo RGB (primi 3 canali) per ogni immagine
             if img_data["low_res"] is not None:
                 viewer.add_image(
                     img_data["low_res"][:3].transpose(1, 2, 0),
                     name=f"Sample {i} - LR RGB",
+                )
+            if img_data["pred_stage_1"] is not None:
+                viewer.add_image(
+                    np.clip(img_data["pred_stage_1"][:3].transpose(1, 2, 0), 0, 1),
+                    name=f"Sample {i} - Pred Stage 1 RGB",
+                )
+            if img_data["target_stage_1"] is not None:
+                viewer.add_image(
+                    img_data["target_stage_1"][:3].transpose(1, 2, 0),
+                    name=f"Sample {i} - Target Stage 1 RGB",
+                )
+            if img_data["pred_stage_2"] is not None:
+                viewer.add_image(
+                    np.clip(img_data["pred_stage_2"][:3].transpose(1, 2, 0), 0, 1),
+                    name=f"Sample {i} - Pred Stage 2 RGB",
+                )
+            if img_data["target_stage_2"] is not None:
+                viewer.add_image(
+                    img_data["target_stage_2"][:3].transpose(1, 2, 0),
+                    name=f"Sample {i} - Target Stage 2 RGB",
                 )
             if img_data["pred_final"] is not None:
                 viewer.add_image(
@@ -415,9 +423,9 @@ def visualize_multi_scale_predictions(
 
     # Salva immagini come file PNG
     for i, img_data in enumerate(images):
-        fig, axes = plt.subplots(3, 4, figsize=(20, 15))
+        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
 
-        # Prima riga: RGB per ogni stage
+        # Prima riga: Low Res + Predizioni per ogni stage (solo RGB)
         if img_data["low_res"] is not None:
             axes[0, 0].imshow(img_data["low_res"][:3].transpose(1, 2, 0))
             axes[0, 0].set_title("Low Resolution RGB")
@@ -427,53 +435,41 @@ def visualize_multi_scale_predictions(
             axes[0, 1].imshow(
                 np.clip(img_data["pred_stage_1"][:3].transpose(1, 2, 0), 0, 1)
             )
-            axes[0, 1].set_title("Pred Stage 1 (2x)")
+            axes[0, 1].set_title("Pred Stage 1 (2x) RGB")
             axes[0, 1].axis("off")
 
         if img_data["pred_stage_2"] is not None:
             axes[0, 2].imshow(
                 np.clip(img_data["pred_stage_2"][:3].transpose(1, 2, 0), 0, 1)
             )
-            axes[0, 2].set_title("Pred Stage 2 (4x)")
+            axes[0, 2].set_title("Pred Stage 2 (4x) RGB")
             axes[0, 2].axis("off")
 
         if img_data["pred_final"] is not None:
-            axes[0, 3].imshow(img_data["pred_final"][:3].transpose(1, 2, 0))
-            axes[0, 3].set_title("Pred Final (5x)")
+            axes[0, 3].imshow(
+                np.clip(img_data["pred_final"][:3].transpose(1, 2, 0), 0, 1)
+            )
+            axes[0, 3].set_title("Pred Final (5x) RGB")
             axes[0, 3].axis("off")
 
-        # Seconda riga: Target per ogni stage
+        # Seconda riga: Target per ogni stage (solo RGB)
+        # Primo posto vuoto (non c'è target per LR)
+        axes[1, 0].axis("off")
+
         if img_data["target_stage_1"] is not None:
             axes[1, 1].imshow(img_data["target_stage_1"][:3].transpose(1, 2, 0))
-            axes[1, 1].set_title("Target Stage 1 (2x)")
+            axes[1, 1].set_title("Target Stage 1 (2x) RGB")
             axes[1, 1].axis("off")
 
         if img_data["target_stage_2"] is not None:
             axes[1, 2].imshow(img_data["target_stage_2"][:3].transpose(1, 2, 0))
-            axes[1, 2].set_title("Target Stage 2 (4x)")
+            axes[1, 2].set_title("Target Stage 2 (4x) RGB")
             axes[1, 2].axis("off")
 
         if img_data["target_final"] is not None:
             axes[1, 3].imshow(img_data["target_final"][:3].transpose(1, 2, 0))
-            axes[1, 3].set_title("Target Final (5x)")
+            axes[1, 3].set_title("Target Final (5x) RGB")
             axes[1, 3].axis("off")
-
-        # Terza riga: NIR channels per LR e Final
-        if img_data["low_res"] is not None and img_data["low_res"].shape[0] > 3:
-            axes[2, 0].imshow(img_data["low_res"][3], cmap="gray")
-            axes[2, 0].set_title("Low Resolution NIR")
-            axes[2, 0].axis("off")
-
-        if img_data["pred_final"] is not None and img_data["pred_final"].shape[0] > 3:
-            axes[2, 3].imshow(img_data["pred_final"][3], cmap="gray")
-            axes[2, 3].set_title("Pred Final NIR")
-            axes[2, 3].axis("off")
-
-        # Hide unused subplots
-        for row in range(3):
-            for col in range(4):
-                if axes[row, col].get_images() == []:
-                    axes[row, col].axis("off")
 
         plt.tight_layout()
         plt.savefig(

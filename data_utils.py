@@ -257,10 +257,7 @@ def get_segmentation_stack(
 
     for filename in os.listdir(directory):
         # Saltiamo i file non rilevanti
-        if any(
-            substr in filename.lower()
-            for substr in ["sentinel2", "s2"]
-        ):
+        if any(substr in filename.lower() for substr in ["sentinel2", "s2"]):
             continue
 
         path = os.path.join(directory, filename)
@@ -550,7 +547,9 @@ class SuperResolutionDataset(Dataset):
                 for c in ["Brisighella", "Casola-Valsenio", "Modigliana", "Predappio"]
                 if c != comune
             ]
+            print(f"Using comuni {self.set_comuni} for training.")
         else:
+            print(f"Using comune {comune} for validation/testing.")
             self.set_comuni = [comune]
 
         self.mask = {}
@@ -607,7 +606,7 @@ class SuperResolutionDataset(Dataset):
                 # Necessario aggiungere una dimensione batch
                 low_res_tensor.unsqueeze(0),
                 scale_factor=1 / self.scale,
-                mode="bilinear",
+                mode="bicubic",
                 align_corners=False,
             ).squeeze(0)
 
