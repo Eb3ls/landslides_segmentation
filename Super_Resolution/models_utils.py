@@ -294,6 +294,7 @@ def train_model(
 
     for epoch in range(config.train.epochs):
         accumulators = {k: 0.0 for k in ["total", *active_components]}
+        batch_count = 0
 
         with tqdm(
             dataloader,
@@ -321,6 +322,8 @@ def train_model(
                 scaler.step(optimizer)
                 scaler.update()
 
+                batch_count += 1
+
                 accumulators["total"] += float(total_loss.detach().item())
                 for k in active_components:
                     if k in comps:
@@ -328,12 +331,9 @@ def train_model(
 
                 pbar.set_postfix({"tot": f"{total_loss.item():.6f}"})
 
-        denom = len(dataloader)
-        losses_epoch["total"].append(accumulators["total"] / denom)
+        losses_epoch["total"].append(accumulators["total"] / batch_count)
         for k in active_components:
-            losses_epoch[k].append(
-                accumulators[k] / denom if accumulators[k] != 0 else 0.0
-            )
+            losses_epoch[k].append(accumulators[k] / batch_count)
 
         scheduler.step(losses_epoch["total"][-1])
 
@@ -341,7 +341,8 @@ def train_model(
             f"{k}:{losses_epoch[k][-1]:.5f}" for k in active_components
         )
         print(
-            f"Epoch [{epoch+1}/{config.train.epochs}] | avg tot: {losses_epoch['total'][-1]:.6f} | lr: {optimizer.param_groups[0]['lr']:.6e} | {comps_log}"
+            f"Epoch [{epoch+1}/{config.train.epochs}] | avg tot: {losses_epoch['total'][-1]:.6f} "
+            f"| lr: {optimizer.param_groups[0]['lr']:.6e} | {comps_log}"
         )
 
     return losses_epoch
