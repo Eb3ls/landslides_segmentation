@@ -10,6 +10,7 @@ Super_Resolution/rcan/*
 Super_Resolution/swin2mose/*
 Super_Resolution/mymodel/*
 Super_Resolution/pswin/*
+Super_Resolution/myDRCT/*
 venv
 
 # Files to keep
@@ -20,3 +21,4 @@ venv
 !Super_Resolution/mymodel/mymodel_model.py
 !Super_Resolution/pswin/pswin_model.py
 !Super_Resolution/pswin/train.py
+!Super_Resolution/myDRCT/DRCT.py

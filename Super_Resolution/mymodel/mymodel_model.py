@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from typing import Literal
 from timm.layers.weight_init import trunc_normal_
-from Super_Resolution.config import ConfigMyModel
+from Super_Resolution.config import Config, MyModelConfig
 from Super_Resolution.models_functions import (
     PatchEmbed,
     PatchUnEmbed,
@@ -564,7 +564,7 @@ class SwinGuidedUpsampler(nn.Module):
 
 
 class MyModel(nn.Module):
-    def __init__(self, cfg: ConfigMyModel):
+    def __init__(self, cfg: Config[MyModelConfig]):
         super(MyModel, self).__init__()
 
         self.scale = cfg.model.scale

@@ -104,6 +104,7 @@ class PatchEmbed(nn.Module):
         self.embed_dim = embed_dim
 
         # Avendo stride uguale al kernel le patch sono non sovrapposte
+        # Permette di cambiare il numero di canali in input e in output, lavora sui canali
         self.proj = nn.Conv2d(
             in_chans, embed_dim, kernel_size=patch_size, stride=patch_size
         )

@@ -16,10 +16,17 @@ from torchmetrics.image import (
 )
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from datetime import datetime
-from Super_Resolution.config import Config, ConfigMyModel, ConfigRCAN, ConfigSwin2Mose
+from Super_Resolution.config import (
+    Config,
+    RCANModelConfig,
+    Swin2MoseModelConfig,
+    MyModelConfig,
+    DRCTModelConfig,
+)
 from Super_Resolution.rcan.rcan_model import RCAN
 from Super_Resolution.swin2mose.swin2mose_model import Swin2MoSE
 from Super_Resolution.mymodel.mymodel_model import MyModel
+from Super_Resolution.myDRCT.DRCT import DRCT
 from data_utils import SuperResolutionDataset
 
 
@@ -561,7 +568,7 @@ def load_model(
 
 
 def launch_all(
-    config: ConfigRCAN | ConfigSwin2Mose | ConfigMyModel,
+    config: Config,
 ) -> None:
     """Funzione principale per addestrare e valutare il modello di super risoluzione."""
 
@@ -599,12 +606,16 @@ def launch_all(
         )
 
         # Creazione del modello
-        if isinstance(config, ConfigRCAN):
+        if isinstance(config.model, RCANModelConfig):
             model = RCAN(config).to(device)  # type: ignore
-        elif isinstance(config, ConfigSwin2Mose):
+        elif isinstance(config.model, Swin2MoseModelConfig):
             model = Swin2MoSE(config).to(device)  # type: ignore
-        elif isinstance(config, ConfigMyModel):
+        elif isinstance(config.model, MyModelConfig):
             model = MyModel(config).to(device)  # type: ignore
+        elif isinstance(config.model, DRCTModelConfig):
+            model = DRCT(config).to(device)  # type: ignore
+        else:
+            raise ValueError(f"Unsupported config type: {type(config.model)}")
 
         print(f"Parametri: {sum(p.numel() for p in model.parameters())}")
 
