@@ -27,58 +27,25 @@ def drop_path(x, drop_prob: float = 0.0, training: bool = False):
     return output
 
 
-class ChannelAttention(nn.Module):
-    """Channel attention used in RCAN.
-    Args:
-        num_feat (int): Channel number of intermediate features.
-        squeeze_factor (int): Channel squeeze factor. Default: 16.
-    """
-
-    def __init__(self, num_feat, squeeze_factor=16):
-        super(ChannelAttention, self).__init__()
-        self.attention = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(num_feat, num_feat // squeeze_factor, 1, padding=0),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(num_feat // squeeze_factor, num_feat, 1, padding=0),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x):
-        y = self.attention(x)
-        return x * y
-
-
-class CAB(nn.Module):
-
-    def __init__(self, num_feat, compress_ratio=3, squeeze_factor=30):
-        super(CAB, self).__init__()
-
-        self.cab = nn.Sequential(
-            nn.Conv2d(num_feat, num_feat // compress_ratio, 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(num_feat // compress_ratio, num_feat, 3, 1, 1),
-            ChannelAttention(num_feat, squeeze_factor),
-        )
-
-    def forward(self, x):
-        return self.cab(x)
-
-
 class ECA(nn.Module):
     """Efficient Channel Attention - più leggero di SE ma efficace"""
 
     def __init__(self, channels, gamma=2, b=1):
         super().__init__()
+        # Calcola il kernel size in base ai canali
         t = int(abs((math.log(channels, 2) + b) / gamma))
-        k = t if t % 2 else t + 1
+        # Aumenta di 1 se pari
+        k = t if t % 2 == 1 else t + 1
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # Processa i canali come finestra di k vicini
         self.conv = nn.Conv1d(1, 1, kernel_size=k, padding=k // 2, bias=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        y = self.avg_pool(x)
+        y = self.avg_pool(x)  # [B, C, H, W] -> [B, C, 1, 1]
+        # [B, C, 1, 1] -> [B, C, 1] -> [B, 1, C]
         y = self.conv(y.squeeze(-1).transpose(-1, -2))
+        # Ritorna a [B, C, 1, 1]
         y = y.transpose(-1, -2).unsqueeze(-1)
         y = self.sigmoid(y)
         return x * y.expand_as(x)
@@ -90,12 +57,14 @@ class TextureEnhancementBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
         # Multi-scale feature extraction
+        # Concatenando poi le 4 conv ritorniamo a channels
         self.conv1x1 = nn.Conv2d(channels, channels // 4, 1)
         self.conv3x3 = nn.Conv2d(channels, channels // 4, 3, padding=1)
         self.conv5x5 = nn.Conv2d(channels, channels // 4, 5, padding=2)
         self.conv7x7 = nn.Conv2d(channels, channels // 4, 7, padding=3)
 
         # Feature fusion with attention
+        # Conv sulla concatenazione
         self.fusion = nn.Conv2d(channels, channels, 1)
         self.attention = nn.Sequential(
             nn.Conv2d(channels, channels // 8, 1),
@@ -126,8 +95,11 @@ class SpatialAttention(nn.Module):
         )
 
     def forward(self, x):
+        # Pooling medio sui canali -> attivazione media in ogni pixel
         avg_out = torch.mean(x, dim=1, keepdim=True)
+        # Pooling max sui canali -> attivazione massima in ogni pixel
         max_out, _ = torch.max(x, dim=1, keepdim=True)
+        # Concatena e passa attraverso conv + sigmoid
         attn_input = torch.cat([avg_out, max_out], dim=1)
         attn = self.conv(attn_input)
         return x * attn
@@ -907,7 +879,7 @@ class DRCT(nn.Module):
             self.conv_before_upsample_res = nn.Sequential(
                 nn.Conv2d(embed_dim, num_feat, 3, 1, 1),
                 nn.LeakyReLU(inplace=True),
-                ECA(num_feat),  # Attention anche sul path residuo
+                ECA(num_feat),
             )
 
             # Fusione migliorata con spatial attention
@@ -983,7 +955,7 @@ class DRCT(nn.Module):
             )  # (B, 64, 64, 64) → (B, 64, 128, 128) + ECA
             x_detail = self.upsample2(
                 x_detail
-            )  # (B, 64, 128, 128) → (B, 64, 256, 256) + ECA
+            )  # (B, 64, 128, 128) → (B, 64, 256, 256) + SEBlockECA
             x_detail = F.interpolate(
                 x_detail, scale_factor=5 / 4, mode="bicubic", align_corners=False
             )  # (B, 64, 256, 256) → (B, 64, 320, 320)

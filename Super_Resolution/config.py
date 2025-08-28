@@ -91,6 +91,8 @@ class TrainConfig:
     show_progress: bool
     use_moe_loss: bool
     loss_weights: dict[str, float]
+    # opzionale
+    info: str | None = None
 
 
 @dataclass
