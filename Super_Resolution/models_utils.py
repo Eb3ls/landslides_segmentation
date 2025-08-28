@@ -197,6 +197,7 @@ def high_frequency_loss(
 _SSIM_METRIC: StructuralSimilarityIndexMeasure | None = None
 
 
+# TODO: vedere differenza con MSSIM
 def _get_ssim_metric(device: torch.device) -> StructuralSimilarityIndexMeasure:
     """Ottieni o crea la metrica SSIM sul device corretto."""
     global _SSIM_METRIC
@@ -273,7 +274,7 @@ def train_model(
     # Loss and optimizer
     criterion = composite_loss
     optimizer = optim.AdamW(
-        model.parameters(), lr=1e-4, weight_decay=1e-4, betas=(0.9, 0.999)
+        model.parameters(), lr=2e-4, weight_decay=2e-4, betas=(0.9, 0.999)
     )
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -284,12 +285,11 @@ def train_model(
         min_lr=1e-6,
     )
 
-    use_amp = False  # Disabilitiamo AMP per semplicità/stabilità con nuove loss
-    if use_amp:
-        print("Using Automatic Mixed Precision (AMP) for training.")
-    else:
-        print("Training in full precision (AMP disabilitato).")
-    scaler = torch.GradScaler(enabled=use_amp)
+    # Gradient Accumulation (default 1 = no accumulation)
+    accumulation_steps = config.train.accumulation_steps
+    print(
+        f"Training in full precision. Gradient accumulation: {accumulation_steps} step(s)."
+    )
 
     # Prepara dizionario dinamico delle curve
     active_components = [k for k, w in config.train.loss_weights.items() if w > 0]
@@ -303,38 +303,43 @@ def train_model(
         accumulators = {k: 0.0 for k in ["total", *active_components]}
         batch_count = 0
 
+        # Clear grads at the start of epoch for accumulation
+        optimizer.zero_grad(set_to_none=True)
+
         with tqdm(
             dataloader,
             desc=f"Epoch {epoch+1}/{config.train.epochs}",
             disable=not config.train.show_progress,
         ) as pbar:
-            for _, (low_res, high_res) in enumerate(pbar):
+            for step, (low_res, high_res) in enumerate(pbar):
                 low_res = low_res.to(device, non_blocking=True)
                 high_res = high_res.to(device, non_blocking=True)
 
-                with torch.autocast(
-                    device_type=device.type, dtype=torch.float16, enabled=use_amp
-                ):
-                    outputs = model(low_res)
-                    if isinstance(outputs, tuple):
-                        outputs, moe_loss_val = outputs
-                    else:
-                        moe_loss_val = 0.0
-                    total_loss, comps = criterion(
-                        outputs, high_res, config, moe_loss_val
-                    )
+                # Forward
+                outputs = model(low_res)
+                if isinstance(outputs, tuple):
+                    outputs, moe_loss_val = outputs
+                else:
+                    moe_loss_val = 0.0
+                total_loss, comps = criterion(outputs, high_res, config, moe_loss_val)
 
-                optimizer.zero_grad()
-                scaler.scale(total_loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                # Backward with gradient accumulation (scale to keep loss magnitude consistent)
+                (total_loss / accumulation_steps).backward()
 
                 batch_count += 1
 
+                # Accumulate metrics using unscaled loss for readability
                 accumulators["total"] += float(total_loss.detach().item())
                 for k in active_components:
                     if k in comps:
                         accumulators[k] += float(comps[k].detach().item())
+
+                # Optimizer step at accumulation boundary or last batch
+                if ((step + 1) % accumulation_steps == 0) or (
+                    (step + 1) == len(dataloader)
+                ):
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
 
                 pbar.set_postfix({"tot": f"{total_loss.item():.6f}"})
 
@@ -603,6 +608,8 @@ def launch_all(
             config.test.batch_size,
             num_workers=config.train.workers,
             persistent_workers=True,
+            pin_memory=torch.cuda.is_available(),
+            worker_init_fn=seed_workers,
         )
 
         # Creazione del modello
@@ -643,6 +650,8 @@ def launch_all(
             config.train.batch_size,
             num_workers=config.train.workers,
             persistent_workers=True,
+            pin_memory=torch.cuda.is_available(),
+            worker_init_fn=seed_workers,
         )
 
         # Allenamento

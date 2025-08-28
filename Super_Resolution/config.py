@@ -92,6 +92,7 @@ class TrainConfig:
     loss_weights: dict[str, float]
     # opzionale
     info: str | None = None
+    accumulation_steps: int = 1
 
 
 @dataclass

@@ -837,7 +837,6 @@ class DRCT(nn.Module):
         # Parametri fissi non configurabili
         norm_layer = nn.LayerNorm
         patch_norm = True
-        img_range = 1.0
         super(DRCT, self).__init__()
 
         print("Preparing model...")
@@ -848,12 +847,6 @@ class DRCT(nn.Module):
         num_in_ch = in_chans
         num_out_ch = in_chans
         num_feat = 64
-        self.img_range = img_range
-        if in_chans == 3:
-            rgb_mean = (0.4488, 0.4371, 0.4040)
-            self.mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
-        else:
-            self.mean = torch.zeros(1, 1, 1, 1)
         self.upscale = upscale
         self.upsampler = upsampler
 
@@ -1001,9 +994,6 @@ class DRCT(nn.Module):
         return x
 
     def forward(self, x):
-        self.mean = self.mean.type_as(x)
-        x = (x - self.mean) * self.img_range
-
         if self.upsampler == "pixelshuffle":
             x = self.conv_first(x)
             x = self.conv_after_body(self.forward_features(x)) + x
@@ -1064,7 +1054,5 @@ class DRCT(nn.Module):
             )
             x = self.lrelu(self.conv_hr(x))
             x = self.conv_last(x)
-
-        x = x / self.img_range + self.mean
 
         return x
