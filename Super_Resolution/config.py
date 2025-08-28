@@ -73,7 +73,6 @@ class DRCTModelConfig(ModelConfig):
     qkv_bias: bool
     drop_rate: float
     attn_drop_rate: float
-    drop_path_rate: float
     upsampler: str
     resi_connection: Literal["1conv", "3conv"]
     gc: int

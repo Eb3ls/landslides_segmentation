@@ -58,6 +58,7 @@ class WindowAttention(nn.Module):
             torch.log(10 * torch.ones((num_heads, 1, 1))), requires_grad=True
         )
 
+        # mlp to generate continuous relative position bias
         self.cpb_mlp = nn.Sequential(
             nn.Linear(2, 512, bias=True),
             nn.ReLU(inplace=True),
@@ -128,6 +129,8 @@ class WindowAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         # Applicata ai vettori dell'ultima dimensione
         self.softmax = nn.Softmax(dim=-1)
+
+        self.register_buffer("relative_coords_table", relative_coords_table)
 
     def forward(self, x: Tensor, mask=None) -> Tensor:
         """

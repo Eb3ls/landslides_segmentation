@@ -1,4 +1,5 @@
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 from timm.layers.weight_init import trunc_normal_
@@ -167,45 +168,78 @@ def window_reverse(windows, window_size, H, W):
 
 
 class WindowAttention(nn.Module):
-    r"""Window based multi-head self attention (W-MSA) module with relative position bias.
-    It supports both of shifted and non-shifted window.
+    r"""Window based multi-head self attention (W-MSA) con rpe e LePE,
+    Supporta anche Shifted Window Attention (SW-MSA).
+
     Args:
         dim (int): Number of input channels.
         window_size (tuple[int]): The height and width of the window.
         num_heads (int): Number of attention heads.
         qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
-        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set
         attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
         proj_drop (float, optional): Dropout ratio of output. Default: 0.0
+        pretrained_window_size (tuple[int]): The height and width of the window in pre-training.
     """
 
     def __init__(
         self,
-        dim,
-        window_size,
-        num_heads,
-        qkv_bias=True,
-        qk_scale=None,
-        attn_drop=0.0,
-        proj_drop=0.0,
+        dim: int,
+        window_size: tuple[int, int],
+        num_heads: int,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
     ):
-
         super().__init__()
         self.dim = dim
         self.window_size = window_size  # Wh, Ww
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim**-0.5
 
-        # define a parameter table of relative position bias
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads)
-        )  # 2*Wh-1 * 2*Ww-1, nH
+        # Parametro moltiplicato prima della softmax con l'attn QxK
+        # Requires grad fa si che qualsiasi operazione da questa venga tracciata per il backpropagation
+        self.logit_scale = nn.Parameter(
+            torch.log(10 * torch.ones((num_heads, 1, 1))), requires_grad=True
+        )
+
+        # mlp to generate continuous relative position bias
+        self.cpb_mlp = nn.Sequential(
+            nn.Linear(2, 512, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, num_heads, bias=False),
+        )
+
+        # get relative_coords_table
+        relative_coords_h = torch.arange(
+            -(self.window_size[0] - 1), self.window_size[0], dtype=torch.float32
+        )
+        relative_coords_w = torch.arange(
+            -(self.window_size[1] - 1), self.window_size[1], dtype=torch.float32
+        )
+        relative_coords_table = (
+            torch.stack(
+                torch.meshgrid([relative_coords_h, relative_coords_w], indexing="ij")
+            )
+            .permute(1, 2, 0)
+            .contiguous()
+            .unsqueeze(0)
+        )  # 1, 2*Wh-1, 2*Ww-1, 2
+        relative_coords_table[:, :, :, 0] /= self.window_size[0] - 1
+        relative_coords_table[:, :, :, 1] /= self.window_size[1] - 1
+        relative_coords_table *= 8  # normalize to -8, 8
+        relative_coords_table = (
+            torch.sign(relative_coords_table)
+            * torch.log2(torch.abs(relative_coords_table) + 1.0)
+            / np.log2(8)
+        )
+
+        self.register_buffer("relative_coords_table", relative_coords_table)
 
         # get pair-wise relative position index for each token inside the window
         coords_h = torch.arange(self.window_size[0])
         coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+        coords = torch.stack(
+            torch.meshgrid([coords_h, coords_w], indexing="ij")
+        )  # 2, Wh, Ww
         coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
         relative_coords = (
             coords_flatten[:, :, None] - coords_flatten[:, None, :]
@@ -219,37 +253,71 @@ class WindowAttention(nn.Module):
         relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
         self.register_buffer("relative_position_index", relative_position_index)
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        # Query, Key, Value
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        # Se vero aggiunge un bias che il modello può imparare
+        if qkv_bias:
+            self.q_bias = nn.Parameter(torch.zeros(dim))
+            self.v_bias = nn.Parameter(torch.zeros(dim))
+        else:
+            self.q_bias = None
+            self.v_bias = None
+
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
-
         self.proj_drop = nn.Dropout(proj_drop)
-
-        trunc_normal_(self.relative_position_bias_table, std=0.02)
+        # Applicata ai vettori dell'ultima dimensione
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x, mask=None):
+        self.register_buffer("relative_coords_table", relative_coords_table)
+
+    def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
         """
         Args:
             x: input features with shape of (num_windows*B, N, C)
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
+        # num_windows sono state estratte dalle immagini e quindi batch diventa num_windows*B
+        # N é Wh * Ww, dimensione spaziale collassata in un vettore
         B_, N, C = x.shape
-        qkv = (
-            self.qkv(x)
-            .reshape(B_, N, 3, self.num_heads, C // self.num_heads)
-            .permute(2, 0, 3, 1, 4)
-        )
+        qkv_bias = None
+        if self.q_bias is not None and self.v_bias is not None:
+            qkv_bias = torch.cat(
+                (
+                    self.q_bias,
+                    torch.zeros_like(self.v_bias, requires_grad=False),
+                    self.v_bias,
+                )
+            )
+
+        # Calcola qvk con shape (B_, N, 3 * C), espande quindi le dimensioni di 3 per ognuna
+        qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
+        # -1 dice di calcolare la dimensione automaticamente per lasciare il numero di elementi invariato
+        # Reshape per ottenere (B_, N, 3, num_heads, head_dim)
+        # Permuta per ottenere (3, B_, num_heads, N, head_dim), il numero indica la dimensione da mettere in quel posto
+        qkv = qkv.reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         q, k, v = (
             qkv[0],
             qkv[1],
             qkv[2],
-        )  # make torchscript happy (cannot use tensor as tuple)
+        )
 
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
+        # Prima normalizza Q e K, poi calcola l'attenzione (@ é il prodotto scalare)
+        # É la similaritá coseno tra ogni coppia query-key, valori [-1, 1]
+        attn = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1)
+        logit_scale = torch.clamp(
+            self.logit_scale,
+            max=torch.log(torch.tensor(1.0 / 0.01)).to(self.logit_scale.device),
+        ).exp()
+        # Moltiplica per il logit scale prima della softmax, amplifica/riduce la temperatura dell'attenzione
+        # Aiuta a stabilizzare l'addestramento
+        attn = attn * logit_scale
 
-        relative_position_bias = self.relative_position_bias_table[
+        # relative position bias
+        relative_position_bias_table = self.cpb_mlp(self.relative_coords_table).view(
+            -1, self.num_heads
+        )
+        relative_position_bias = relative_position_bias_table[
             self.relative_position_index.view(-1)  # type: ignore
         ].view(
             self.window_size[0] * self.window_size[1],
@@ -259,13 +327,19 @@ class WindowAttention(nn.Module):
         relative_position_bias = relative_position_bias.permute(
             2, 0, 1
         ).contiguous()  # nH, Wh*Ww, Wh*Ww
+        relative_position_bias = 16 * torch.sigmoid(relative_position_bias)
         attn = attn + relative_position_bias.unsqueeze(0)
 
         if mask is not None:
+            # Numero di finestre per immagine
             nW = mask.shape[0]
+            # Raggruppato in (batch_size, nW, nH, N, N)
+            # Espansa mask per avere la forma (1, nW, 1, N, N), con il broadcasting é applicato a tutti i batch e alle finestre
+            # Se due token sono in finestre diverse nel layer prima sono da annullare
             attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(
                 1
             ).unsqueeze(0)
+            # Tornato alla forma originale per la softmax
             attn = attn.view(-1, self.num_heads, N, N)
             attn = self.softmax(attn)
         else:
@@ -273,26 +347,14 @@ class WindowAttention(nn.Module):
 
         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        # Prodotto scalare tra l'attenzione e V
+        x = attn @ v
+
+        # Ritorna alla forma originale (B_, N, C)
+        x = x.transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
-
-    def extra_repr(self) -> str:
-        return f"dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}"
-
-    def flops(self, N):
-        # calculate flops for 1 window with token length of N
-        flops = 0
-        # qkv = self.qkv(x)
-        flops += N * self.dim * 3 * self.dim
-        # attn = (q @ k.transpose(-2, -1))
-        flops += self.num_heads * N * (self.dim // self.num_heads) * N
-        #  x = (attn @ v)
-        flops += self.num_heads * N * N * (self.dim // self.num_heads)
-        # x = self.proj(x)
-        flops += N * self.dim * self.dim
-        return flops
 
 
 class RDG(nn.Module):
@@ -300,16 +362,12 @@ class RDG(nn.Module):
         self,
         dim,
         input_resolution,
-        depth,
         num_heads,
         window_size,
-        shift_size,
         mlp_ratio,
         qkv_bias,
-        qk_scale,
         drop,
         attn_drop,
-        drop_path,
         gc,
         patch_size,
         img_size,
@@ -324,7 +382,6 @@ class RDG(nn.Module):
             shift_size=0,  # For first block
             mlp_ratio=mlp_ratio,
             qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
             drop=drop,
             attn_drop=attn_drop,
         )
@@ -338,7 +395,6 @@ class RDG(nn.Module):
             shift_size=window_size // 2,  # For first block
             mlp_ratio=mlp_ratio,
             qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
             drop=drop,
             attn_drop=attn_drop,
         )
@@ -352,7 +408,6 @@ class RDG(nn.Module):
             shift_size=0,  # For first block
             mlp_ratio=mlp_ratio,
             qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
             drop=drop,
             attn_drop=attn_drop,
         )
@@ -366,7 +421,6 @@ class RDG(nn.Module):
             shift_size=window_size // 2,  # For first block
             mlp_ratio=1,
             qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
             drop=drop,
             attn_drop=attn_drop,
         )
@@ -380,7 +434,6 @@ class RDG(nn.Module):
             shift_size=0,  # For first block
             mlp_ratio=1,
             qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
             drop=drop,
             attn_drop=attn_drop,
         )
@@ -388,46 +441,107 @@ class RDG(nn.Module):
 
         self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
-        self.pe = PatchEmbed(
+        self.pe1 = PatchEmbed(
             img_size=img_size,
             patch_size=patch_size,
-            in_chans=0,
-            embed_dim=dim,
+            in_chans=gc,  # Dopo adjust1
+            embed_dim=gc,
+            norm_layer=None,
+        )
+        self.pue1 = PatchUnEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=0,  # Output di swin1
+            embed_dim=0,
             norm_layer=None,
         )
 
-        self.pue = PatchUnEmbed(
+        self.pe2 = PatchEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=gc,  # Dopo adjust2
+            embed_dim=gc,
+            norm_layer=None,
+        )
+        self.pue2 = PatchUnEmbed(
             img_size=img_size,
             patch_size=patch_size,
             in_chans=0,
+            embed_dim=0,
+            norm_layer=None,
+        )
+
+        self.pe3 = PatchEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=gc,  # Dopo adjust3
+            embed_dim=gc,
+            norm_layer=None,
+        )
+        self.pue3 = PatchUnEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=0,
+            embed_dim=0,
+            norm_layer=None,
+        )
+
+        self.pe4 = PatchEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=gc,  # Dopo adjust4
+            embed_dim=gc,
+            norm_layer=None,
+        )
+        self.pue4 = PatchUnEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=0,  # Output di swin4
+            embed_dim=0,
+            norm_layer=None,
+        )
+
+        self.pe5 = PatchEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=dim,  # Dopo adjust5
             embed_dim=dim,
+            norm_layer=None,
+        )
+        self.pue5 = PatchUnEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=0,  # Output di swin5
+            embed_dim=0,
             norm_layer=None,
         )
 
     def forward(self, x, xsize):
-        x1 = self.pe(self.lrelu(self.adjust1(self.pue(self.swin1(x, xsize), xsize))))
-        x2 = self.pe(
+        x1 = self.pe1(self.lrelu(self.adjust1(self.pue1(self.swin1(x, xsize), xsize))))
+        x2 = self.pe2(
             self.lrelu(
-                self.adjust2(self.pue(self.swin2(torch.cat((x, x1), -1), xsize), xsize))
+                self.adjust2(
+                    self.pue2(self.swin2(torch.cat((x, x1), -1), xsize), xsize)
+                )
             )
         )
-        x3 = self.pe(
+        x3 = self.pe3(
             self.lrelu(
                 self.adjust3(
-                    self.pue(self.swin3(torch.cat((x, x1, x2), -1), xsize), xsize)
+                    self.pue3(self.swin3(torch.cat((x, x1, x2), -1), xsize), xsize)
                 )
             )
         )
-        x4 = self.pe(
+        x4 = self.pe4(
             self.lrelu(
                 self.adjust4(
-                    self.pue(self.swin4(torch.cat((x, x1, x2, x3), -1), xsize), xsize)
+                    self.pue4(self.swin4(torch.cat((x, x1, x2, x3), -1), xsize), xsize)
                 )
             )
         )
-        x5 = self.pe(
+        x5 = self.pe5(
             self.adjust5(
-                self.pue(self.swin5(torch.cat((x, x1, x2, x3, x4), -1), xsize), xsize)
+                self.pue5(self.swin5(torch.cat((x, x1, x2, x3, x4), -1), xsize), xsize)
             )
         )
 
@@ -454,16 +568,15 @@ class SwinTransformerBlock(nn.Module):
 
     def __init__(
         self,
-        dim,
-        input_resolution,
-        num_heads,
-        window_size=7,
-        shift_size=0,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        qk_scale=None,
-        drop=0.0,
-        attn_drop=0.0,
+        dim: int,
+        input_resolution: tuple[int, int],
+        num_heads: int,
+        window_size: int = 7,
+        shift_size: int = 0,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
         act_layer=nn.GELU,
         norm_layer=nn.LayerNorm,
     ):
@@ -485,10 +598,9 @@ class SwinTransformerBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
             dim,
-            window_size=to_2tuple(self.window_size),
+            window_size=(self.window_size, self.window_size),
             num_heads=num_heads,
             qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
             attn_drop=attn_drop,
             proj_drop=drop,
         )
@@ -542,7 +654,7 @@ class SwinTransformerBlock(nn.Module):
 
     def forward(self, x, x_size):
         H, W = x_size
-        B, L, C = x.shape
+        B, _, C = x.shape
         # assert L == H * W, "input feature has wrong size"
 
         shortcut = x
@@ -594,26 +706,6 @@ class SwinTransformerBlock(nn.Module):
 
         return x
 
-    def extra_repr(self) -> str:
-        return (
-            f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, "
-            f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
-        )
-
-    def flops(self):
-        flops = 0
-        H, W = self.input_resolution
-        # norm1
-        flops += self.dim * H * W
-        # W-MSA/SW-MSA
-        nW = H * W / self.window_size / self.window_size
-        flops += nW * self.attn.flops(self.window_size * self.window_size)
-        # mlp
-        flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio
-        # norm2
-        flops += self.dim * H * W
-        return flops
-
 
 class PatchEmbed(nn.Module):
     r"""Image to Patch Embedding
@@ -649,24 +741,15 @@ class PatchEmbed(nn.Module):
         else:
             self.norm = None
 
+        self.proj = nn.Conv2d(
+            in_chans, embed_dim, kernel_size=patch_size[0], stride=patch_size[0]
+        )
+
     def forward(self, x):
-        x = x.flatten(2).transpose(1, 2)  # 结构为 [B, num_patches, C]
+        x = self.proj(x).flatten(2).transpose(1, 2)  # 结构为 [B, num_patches, C]
         if self.norm is not None:
             x = self.norm(x)  # 归一化
         return x
-
-    def flops(self):
-        Ho, Wo = self.patches_resolution
-        flops = (
-            Ho
-            * Wo
-            * self.embed_dim
-            * self.in_chans
-            * (self.patch_size[0] * self.patch_size[1])
-        )
-        if self.norm is not None:
-            flops += Ho * Wo * self.embed_dim
-        return flops
 
 
 class PatchUnEmbed(nn.Module):
@@ -701,10 +784,8 @@ class PatchUnEmbed(nn.Module):
         self.embed_dim = embed_dim  # 线性 projection 输出的通道数
 
     def forward(self, x, x_size):
-        B, HW, C = x.shape  # 输入 x 的结构
-        x = x.transpose(1, 2).view(
-            B, -1, x_size[0], x_size[1]
-        )  # 输出结构为 [B, Ph*Pw, C]
+        B, _, _ = x.shape  # 输入 x 的结构
+        x = x.transpose(1, 2).view(B, -1, x_size[0], x_size[1])
         return x
 
 
@@ -748,14 +829,12 @@ class DRCT(nn.Module):
         qkv_bias = config.model.qkv_bias
         drop_rate = config.model.drop_rate
         attn_drop_rate = config.model.attn_drop_rate
-        drop_path_rate = config.model.drop_path_rate
         upscale = config.model.scale  # Usa 'scale' dal config base
         upsampler = config.model.upsampler
         resi_connection = config.model.resi_connection
         gc = config.model.gc
 
         # Parametri fissi non configurabili
-        qk_scale = None
         norm_layer = nn.LayerNorm
         patch_norm = True
         img_range = 1.0
@@ -808,11 +887,6 @@ class DRCT(nn.Module):
             norm_layer=norm_layer if self.patch_norm else None,
         )
 
-        # stochastic depth
-        dpr = [
-            x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))
-        ]  # stochastic depth decay rule
-
         # build
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
@@ -822,14 +896,10 @@ class DRCT(nn.Module):
                 input_resolution=(patches_resolution[0], patches_resolution[1]),
                 num_heads=num_heads[i_layer],
                 window_size=window_size,
-                depth=0,
-                shift_size=window_size // 2,
                 mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias,
-                qk_scale=qk_scale,
                 drop=drop_rate,
                 attn_drop=attn_drop_rate,
-                drop_path=dpr[sum(depths[:i_layer]) : sum(depths[: i_layer + 1])],
                 gc=gc,
                 img_size=img_size,
                 patch_size=patch_size,
@@ -955,7 +1025,7 @@ class DRCT(nn.Module):
             )  # (B, 64, 64, 64) → (B, 64, 128, 128) + ECA
             x_detail = self.upsample2(
                 x_detail
-            )  # (B, 64, 128, 128) → (B, 64, 256, 256) + SEBlockECA
+            )  # (B, 64, 128, 128) → (B, 64, 256, 256) + ECA
             x_detail = F.interpolate(
                 x_detail, scale_factor=5 / 4, mode="bicubic", align_corners=False
             )  # (B, 64, 256, 256) → (B, 64, 320, 320)
