@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from .sperimental import (
+from .seg_unet import (
     UNet,
     evaluate_model,
     visualize_results,
@@ -15,11 +15,11 @@ from .sperimental import (
 
 from data_utils import SegmentationSingleDataset
 
-MODEL_PATH = "ndvi_slope_model.pth"
+MODEL_PATH = "attention_ndvi_model.pth"
 PATCH_SIZE = 256
 NUM_PATCHES = 1000
 BATCH_SIZE = 4
-FIXED_THRESHOLD = 0.5  # Non utilizzato per soglia variabile
+FIXED_THRESHOLD = 0.42  # Non utilizzato per soglia variabile
 VIS_SAMPLES = 5
 
 
@@ -59,7 +59,7 @@ def main():
     else:
         threshold = FIXED_THRESHOLD
 
-    seed_everything(42)
+    seed_everything(420)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -118,7 +118,7 @@ def main():
         print(f"  IoU        : {val_iou:.4f}")
         print(f"  OA         : {val_oa:.4f}")
         print(f"  Dice       : {val_dice:.4f}")
-        print(f"  Confusion Matrix:\n{confusion_matrix:.4f}")
+        print(f"  Confusion Matrix:\n{confusion_matrix}")
 
         print("Apro visualizzazione napari...")
         visualize_results(
@@ -133,7 +133,6 @@ def main():
 
         iou_values = []
         oa_values = []
-        
 
         thresholds = np.arange(0.2, 0.8 + 1e-9, 0.02)
 
@@ -148,7 +147,7 @@ def main():
             oa = (preds == y_true).mean()
             iou_values.append(iou)
             oa_values.append(oa)
-        
+
         max_iou = np.max(iou_values)
         max_oa = np.max(oa_values)
         max_iou_index = np.argmax(iou_values)
@@ -178,6 +177,7 @@ def main():
         plt.tight_layout()
         plt.savefig(os.path.join(plots_dir, "threshold_metrics.png"), dpi=150)
         plt.show()
+
 
 if __name__ == "__main__":
     main()

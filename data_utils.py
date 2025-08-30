@@ -274,9 +274,9 @@ def get_segmentation_stack(
                 input_stack.extend(bands)
             elif "Cgr" in filename:
                 input_stack.extend(bands)
-            elif "Slope" in filename:
-                input_stack.extend(bands)
             elif "NDVI" in filename:
+                input_stack.extend(bands)
+            elif "Slope" in filename:
                 input_stack.extend(bands)
             elif "Frane" in filename:
                 landslide_mask = get_landslide_mask(bands)
@@ -699,7 +699,7 @@ class SegmentationMultiDataset(Dataset):
 
         # Aggiungiamo eventuali augmentazioni
         input_tensor, landslide_tensor = augment_data(
-            input_tensor, landslide_tensor, patch_mask_tensor, prob=0.5
+            input_tensor, landslide_tensor, patch_mask_tensor
         )
 
         return input_tensor, landslide_tensor

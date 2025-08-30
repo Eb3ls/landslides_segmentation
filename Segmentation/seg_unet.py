@@ -14,16 +14,13 @@ from typing import cast
 
 # TODO: early stopping, data augmentation modificata, sperimentazioni sul modello
 
-from data_utils import (
-    ComuneType,
-    SegmentationMultiDataset,
-    SegmentationSingleDataset
-)
+from data_utils import ComuneType, SegmentationMultiDataset, SegmentationSingleDataset
 
 PATCH_SIZE = 256
-NUM_PATCHES = 1000
-BATCH_SIZE = 4
+NUM_PATCHES = 2000
+BATCH_SIZE = 8
 NUM_EPOCHS = 120
+
 
 class DoubleConv(nn.Module):
     """Blocco di doppia convoluzione utilizzato in U-Net."""
@@ -58,10 +55,74 @@ class Down(nn.Module):
         return self.pool_conv(x)
 
 
+class AttentionGate(nn.Module):
+    """Gate di attenzione additiva per filtrare le skip connections."""
+
+    def __init__(
+        self, skip_channels: int, gate_channels: int, inter_channels: int
+    ):  # inter_channels è il numero di canali in cui proietto skip e gate
+        super().__init__()
+        self.W_g = nn.Conv2d(
+            gate_channels,
+            inter_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=True,
+        )
+        self.W_x = nn.Conv2d(  # ottengo i pesi processati della skip connection
+            skip_channels,
+            inter_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=True,
+        )
+
+        self.psi = nn.Sequential(  # funzione psi dello scoring dell'attention gate
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(inter_channels, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.Sigmoid(),
+        )
+
+        self._init_open()
+
+    def _init_open(self):
+        # Piccole proiezioni e bias della psi alto → alpha≈1 all’inizio
+        with torch.no_grad():  # per inizializzare i pesi si può disattivare il tracciamento dei gradienti
+            nn.init.normal_(self.W_g.weight, std=1e-3)
+            if self.W_g.bias is not None:
+                nn.init.zeros_(self.W_g.bias)
+
+            nn.init.normal_(self.W_x.weight, std=1e-3)
+            if self.W_x.bias is not None:
+                nn.init.zeros_(self.W_x.bias)
+
+            # self.psi[1] è la Conv2d(1x1) -> esplicito il tipo per il type checker
+            conv = cast(nn.Conv2d, self.psi[1])
+            nn.init.zeros_(conv.weight)
+            assert conv.bias is not None
+            nn.init.constant_(conv.bias, 1.0)
+
+    def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        # x: feature da encoder (skip), g: gating dal decoder (upsampled)
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        alpha = self.psi(g1 + x1)  # output: coefficiente di attenzione in [0,1]
+        with torch.no_grad():
+            a = alpha.detach()
+            self._alpha_stats = (
+                float(a.mean().item()),
+                float(a.min().item()),
+                float(a.max().item()),
+            )
+        return x * alpha  # applica il gate
+
+
 class Up(nn.Module):
     """Upscaling seguito da doppia convoluzione."""
 
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(self, in_channels: int, out_channels: int, attention: bool = False):
         super(Up, self).__init__()
 
         self.up = nn.ConvTranspose2d(
@@ -70,6 +131,17 @@ class Up(nn.Module):
             kernel_size=2,
             stride=2,  # I canali nel decoder dimezzano a ogni up
         )
+
+        self.attention = attention
+
+        if self.attention:
+            # Skip e gating hanno canali = in_channels//2 a questo livello di decoder
+            inter = max(in_channels // 4, 1)
+            self.att_gate = AttentionGate(
+                skip_channels=in_channels // 2,
+                gate_channels=in_channels // 2,
+                inter_channels=inter,
+            )
 
         self.conv = DoubleConv(in_channels, out_channels)
 
@@ -84,6 +156,9 @@ class Up(nn.Module):
         x1 = nn.functional.pad(
             x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2]
         )
+
+        if self.attention:
+            x2 = self.att_gate(x2, x1)
 
         # Concatenazione della skip connection
         x = torch.cat([x2, x1], dim=1)
@@ -134,6 +209,52 @@ class UNet(nn.Module):
         logits = self.outc(x)  # Il logit è il valore grezzo di output al modello
         return logits
 
+
+class AttentionUNet(nn.Module):
+    """Modello U-Net per segmentazione."""
+
+    def __init__(self, n_channels: int, n_classes: int):
+        super(AttentionUNet, self).__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+
+        self.in_conv = DoubleConv(n_channels, 64)
+        self.down1 = Down(64, 128)
+        self.down2 = Down(128, 256)
+        self.down3 = Down(256, 512)
+        self.down4 = Down(512, 1024)
+        self.up1 = Up(1024, 512, True)
+        self.up2 = Up(512, 256, True)
+        self.up3 = Up(256, 128, True)
+        self.up4 = Up(128, 64, True)
+        self.outc = OutConv(64, n_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1 = self.in_conv(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x = self.down4(x4)
+        x = self.up1(x, x4)
+        x = self.up2(x, x3)
+        x = self.up3(x, x2)
+        x = self.up4(x, x1)
+        logits = self.outc(x)  # Il logit è il valore grezzo di output al modello
+        return logits
+
+
+def log_attention_stats(model: nn.Module, prefix: str = "") -> None:
+    """Stampa statistiche delle mappe di attenzione (mean/min/max) per ogni gate."""
+    idx = 0
+    for m in model.modules():
+        if isinstance(m, AttentionGate) and hasattr(m, "_alpha_stats"):
+            mean_, min_, max_ = m._alpha_stats  # type: ignore[attr-defined]
+            print(
+                f"{prefix}AttnGate[{idx}]: mean={mean_:.3f} min={min_:.3f} max={max_:.3f}"
+            )
+            idx += 1
+
+
 def train_model(
     model: nn.Module,
     train_loader: DataLoader,
@@ -171,7 +292,7 @@ def train_model(
 
                 # Forward pass
                 outputs = model(data)  # Generazione delle predizioni
-                loss = criterion(outputs, landslide) 
+                loss = criterion(outputs, landslide)
 
                 # Backward pass
                 loss.backward()
@@ -204,6 +325,8 @@ def train_model(
             f"Epoch [{epoch+1}/{num_epochs}], Average Loss: {train_loss:.6f}, Validation Loss: {val_loss:.6f}, Validation IoU: {val_iou:.6f}, Validation Dice: {dice_score:.6f}, Overall Accuracy: {oa:.6f}, LR: {current_lr:.2e}"
         )
 
+        log_attention_stats(model, prefix=f"Epoch {epoch+1}: ")
+
         # Salvataggio del modello migliore
         if val_iou > best_iou and epoch > 30:
             best_iou = val_iou
@@ -219,13 +342,12 @@ def compute_confusion_matrix(
     preds: torch.Tensor, labels: torch.Tensor
 ) -> list[list[float]]:
     """Calcola la matrice di confusione."""
-    total_elements = preds.numel()
     preds = preds.view(-1)
     labels = labels.view(-1)
-    tp = ((preds == 1) & (labels == 1)).sum().item() / total_elements
-    fp = ((preds == 1) & (labels == 0)).sum().item() / total_elements
-    tn = ((preds == 0) & (labels == 0)).sum().item() / total_elements
-    fn = ((preds == 0) & (labels == 1)).sum().item() / total_elements
+    tp = ((preds == 1) & (labels == 1)).sum().item()
+    fp = ((preds == 1) & (labels == 0)).sum().item()
+    tn = ((preds == 0) & (labels == 0)).sum().item()
+    fn = ((preds == 0) & (labels == 1)).sum().item()
     return [[tn, fp], [fn, tp]]
 
 
@@ -281,8 +403,8 @@ def evaluate_model(
             union_sum += union
 
             correct = (preds == labels).sum().item()
-            total = preds.numel()
             correct_sum += correct
+            total = preds.numel()
             total_pixels += total
 
     val_loss = total_loss_sum / max(1, num_samples)
@@ -296,7 +418,17 @@ def evaluate_model(
         else 1.0
     )
 
-    return val_loss, iou, oa, dice, confusion_matrix_total / len(dataloader) if confusion_matrix_total is not None else None #len(dataloader) è il numero di batch
+    return (
+        val_loss,
+        iou,
+        oa,
+        dice,
+        (
+            confusion_matrix_total / total_pixels
+            if confusion_matrix_total is not None
+            else None
+        ),
+    )  # len(dataloader) è il numero di batch
 
 
 def visualize_results(
@@ -402,6 +534,7 @@ def main():
         train_loader = DataLoader(
             train_dataset,
             batch_size=BATCH_SIZE,
+            shuffle=True,
             # Parallelizziamo la generazione dei batch
             num_workers=0,
             worker_init_fn=seed_workers,
@@ -412,6 +545,7 @@ def main():
         eval_loader = DataLoader(
             eval_dataset,
             batch_size=BATCH_SIZE,
+            shuffle=False,
             num_workers=0,
             worker_init_fn=seed_workers,
             pin_memory=True if device.type == "cuda" else False,
@@ -419,7 +553,9 @@ def main():
 
         # Creazione
         print("Creating model...")
-        model = UNet(n_channels=n_channels_in, n_classes=n_channels_out).to(device)
+        model = AttentionUNet(n_channels=n_channels_in, n_classes=n_channels_out).to(
+            device
+        )
         total_params = sum(p.numel() for p in model.parameters())
         print(f"Parametri totali: {total_params:,}")
 
@@ -445,7 +581,7 @@ def main():
             optimizer,
             device,
             scheduler,
-            NUM_EPOCHS
+            NUM_EPOCHS,
         )
 
         # Crea cartella plots se non esistente
