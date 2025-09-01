@@ -10,9 +10,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from dataclasses import asdict
 
+from pytorch_msssim import ms_ssim
 from torchmetrics.image import (
     PeakSignalNoiseRatio,
-    StructuralSimilarityIndexMeasure,
 )
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from datetime import datetime
@@ -78,7 +78,7 @@ def save_metrics(metrics_dict: dict, config: Config) -> None:
 
 
 def charbonnier_loss(
-    x: torch.Tensor, y: torch.Tensor, eps: float = 1e-4
+    x: torch.Tensor, y: torch.Tensor, eps: float = 1e-3
 ) -> torch.Tensor:
     """Charbonnier (pseudo L1) loss: sqrt((x-y)^2 + eps^2)."""
     diff = x - y
@@ -158,7 +158,7 @@ def _get_gaussian_kernel2d(
     return kernel
 
 
-def _gaussian_blur(x: torch.Tensor, ksize: int = 5, sigma: float = 1.0) -> torch.Tensor:
+def _gaussian_blur(x: torch.Tensor, ksize: int = 5, sigma: float = 2) -> torch.Tensor:
     k = _get_gaussian_kernel2d(x.device, x.dtype, ksize, sigma)
     c = x.shape[1]
     # Applichiamo lo stesso kernel a ogni canale
@@ -193,17 +193,24 @@ def high_frequency_loss(
     return torch.nn.functional.l1_loss(sr_hf, hr_hf)
 
 
-# Cache delle metriche per evitare ricreazioni continue
-_SSIM_METRIC: StructuralSimilarityIndexMeasure | None = None
+# LPIPS per la loss (cache per device)
+_LPIPS_LOSS: LearnedPerceptualImagePatchSimilarity | None = None
 
 
-# TODO: vedere differenza con MSSIM
-def _get_ssim_metric(device: torch.device) -> StructuralSimilarityIndexMeasure:
-    """Ottieni o crea la metrica SSIM sul device corretto."""
-    global _SSIM_METRIC
-    if _SSIM_METRIC is None or _SSIM_METRIC.device != device:
-        _SSIM_METRIC = StructuralSimilarityIndexMeasure().to(device)
-    return _SSIM_METRIC
+def _get_lpips_loss(device: torch.device) -> LearnedPerceptualImagePatchSimilarity:
+    """Ottieni o crea LPIPS (VGG) sul device corretto per usarlo come loss."""
+    global _LPIPS_LOSS
+    if _LPIPS_LOSS is None or _LPIPS_LOSS.device != device:
+        _LPIPS_LOSS = LearnedPerceptualImagePatchSimilarity(
+            net_type="vgg", normalize=True
+        ).to(device)
+    return _LPIPS_LOSS
+
+
+def total_variation_loss(x: torch.Tensor) -> torch.Tensor:
+    loss_h = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :]).mean()
+    loss_w = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1]).mean()
+    return loss_h + loss_w
 
 
 def composite_loss(
@@ -233,15 +240,24 @@ def composite_loss(
         grad_v = gradient_loss(sr, hr)
         comps["sobel"] = weights["sobel"] * grad_v
 
-    # SSIM
     if weights.get("ssim", 0.0) > 0:
-        # SSIM loss = 1 - SSIM value
-        sr_01 = torch.sigmoid(sr)
-
-        ssim_metric = _get_ssim_metric(sr.device)
-        ssim_value = ssim_metric(sr_01, hr)
-        ssim_v = 1.0 - ssim_value
+        ssim_v = 1 - ms_ssim(sr, hr, data_range=1.0, weights=[0.5, 0.5])
         comps["ssim"] = weights["ssim"] * ssim_v
+
+    if weights.get("tv", 0.0) > 0:
+        sr_clamp = torch.clamp(sr, 0.0, 1.0)
+        comps["tv"] = weights["tv"] * total_variation_loss(sr_clamp)
+
+    # LPIPS (solo RGB, clamped [0,1])
+    if weights.get("lpips", 0.0) > 0:
+        lpips_module = _get_lpips_loss(sr.device)
+        # Usa solo i primi 3 canali (RGB), clamp in [0,1]
+        sr_rgb = sr[:, :3, :, :]
+        hr_rgb = hr[:, :3, :, :]
+        sr_rgb = torch.clamp(sr_rgb, 0.0, 1.0)
+        hr_rgb = torch.clamp(hr_rgb, 0.0, 1.0)
+        lpips_v = lpips_module(sr_rgb, hr_rgb)
+        comps["lpips"] = weights["lpips"] * lpips_v
 
     # MoE
     if weights.get("moe", 0.0) > 0:
@@ -271,39 +287,43 @@ def train_model(
     Ritorna un dizionario con le curve per-epoca: total, ncc, ssim, moe
     """
 
+    # Gradient Accumulation
+    accumulation_steps = config.train.accumulation_steps
+
     # Loss and optimizer
     criterion = composite_loss
+    # Optimizer: Adam senza weight decay
     optimizer = optim.AdamW(
-        model.parameters(), lr=2e-4, weight_decay=2e-4, betas=(0.9, 0.999)
+        model.parameters(), lr=2e-4, weight_decay=0, betas=(0.9, 0.999)
     )
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    total_updates = config.train.epochs * len(dataloader) // accumulation_steps
+    milestones = [
+        int(0.5 * total_updates),
+        int(0.75 * total_updates),
+        int(0.9 * total_updates),
+    ]
+    scheduler = optim.lr_scheduler.MultiStepLR(
         optimizer,
-        mode="min",
-        factor=0.5,
-        patience=2,
-        threshold=1e-4,
-        min_lr=1e-6,
+        milestones=milestones,
+        gamma=0.5,
     )
 
-    # Gradient Accumulation (default 1 = no accumulation)
-    accumulation_steps = config.train.accumulation_steps
-    print(
-        f"Training in full precision. Gradient accumulation: {accumulation_steps} step(s)."
-    )
+    print("Total updates:", total_updates)
 
     # Prepara dizionario dinamico delle curve
-    active_components = [k for k, w in config.train.loss_weights.items() if w > 0]
-    losses_epoch: dict[str, list[float]] = {"total": []}
-    for k in active_components:
-        losses_epoch[k] = []
+    active_losses = [k for k, w in config.train.loss_weights.items() if w > 0]
+    tracking: dict[str, list[float]] = {"total": []}
+    # Aggiungiamo le loss al tracking
+    for k in active_losses:
+        tracking[k] = []
+    tracking["lr"] = []
 
     model.train()
 
     for epoch in range(config.train.epochs):
-        accumulators = {k: 0.0 for k in ["total", *active_components]}
+        accumulators = {k: 0.0 for k in ["total", *active_losses]}
         batch_count = 0
 
-        # Clear grads at the start of epoch for accumulation
         optimizer.zero_grad(set_to_none=True)
 
         with tqdm(
@@ -321,43 +341,43 @@ def train_model(
                     outputs, moe_loss_val = outputs
                 else:
                     moe_loss_val = 0.0
-                total_loss, comps = criterion(outputs, high_res, config, moe_loss_val)
 
-                # Backward with gradient accumulation (scale to keep loss magnitude consistent)
+                total_loss, comps = criterion(outputs, high_res, config, moe_loss_val)
                 (total_loss / accumulation_steps).backward()
 
                 batch_count += 1
 
-                # Accumulate metrics using unscaled loss for readability
                 accumulators["total"] += float(total_loss.detach().item())
-                for k in active_components:
-                    if k in comps:
-                        accumulators[k] += float(comps[k].detach().item())
+                for k in active_losses:
+                    accumulators[k] += float(comps[k].detach().item())
 
-                # Optimizer step at accumulation boundary or last batch
-                if ((step + 1) % accumulation_steps == 0) or (
+                # Se è l'ultimo step di accumulazione, esegui l'update
+                do_step = ((step + 1) % accumulation_steps == 0) or (
                     (step + 1) == len(dataloader)
-                ):
+                )
+                if do_step:
+                    # Clip dei gradienti per stabilitá
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                    scheduler.step()
 
                 pbar.set_postfix({"tot": f"{total_loss.item():.6f}"})
 
-        losses_epoch["total"].append(accumulators["total"] / batch_count)
-        for k in active_components:
-            losses_epoch[k].append(accumulators[k] / batch_count)
+        # Fine epoca
 
-        scheduler.step(losses_epoch["total"][-1])
+        tracking["total"].append(accumulators["total"] / batch_count)
+        for k in active_losses:
+            tracking[k].append(accumulators[k] / batch_count)
+        tracking["lr"].append(optimizer.param_groups[0]["lr"])
 
-        comps_log = " | ".join(
-            f"{k}:{losses_epoch[k][-1]:.5f}" for k in active_components
-        )
+        comps_log = " | ".join(f"{k}:{tracking[k][-1]:.5f}" for k in active_losses)
         print(
-            f"Epoch [{epoch+1}/{config.train.epochs}] | avg tot: {losses_epoch['total'][-1]:.6f} "
+            f"Epoch [{epoch+1}/{config.train.epochs}] | avg tot: {tracking['total'][-1]:.6f} "
             f"| lr: {optimizer.param_groups[0]['lr']:.6e} | {comps_log}"
         )
 
-    return losses_epoch
+    return tracking
 
 
 def evaluate_model(
@@ -367,6 +387,8 @@ def evaluate_model(
 
     model.eval()
     psnr_total = 0.0
+    psnr_total_no_nir = 0.0
+    psnr_only_nir = 0.0
     ssim_total = 0.0
     lpips_total = 0.0
     num_batches = 0
@@ -376,7 +398,7 @@ def evaluate_model(
 
     # Inizializza le metriche
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
-    ssim_metric = StructuralSimilarityIndexMeasure().to(device)
+    ssim_metric = ms_ssim
     lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type="vgg").to(device)
 
     with torch.no_grad():
@@ -389,15 +411,20 @@ def evaluate_model(
                 # Se il modello restituisce anche la loss di Moe
                 outputs, _ = outputs
 
-            # Clamp dei valori per le metriche
-            outputs_clamped = torch.clamp(outputs, 0, 1)
-
-            psnr_total += psnr_metric(outputs_clamped, high_res).item()
-            ssim_total += ssim_metric(outputs_clamped, high_res).item()
+            psnr_total += psnr_metric(outputs, high_res).item()
+            psnr_total_no_nir += psnr_metric(
+                outputs[:, :3, :, :], high_res[:, :3, :, :]
+            ).item()
+            psnr_only_nir += psnr_metric(
+                outputs[:, 3:, :, :], high_res[:, 3:, :, :]
+            ).item()
+            ssim_total += ssim_metric(
+                outputs, high_res, data_range=1.0, weights=[0.5, 0.5]
+            ).item()
 
             # LPIPS: range [0, 1], solo per canali RGB (primi 3 canali)
             lpips_total += lpips_metric(
-                outputs_clamped[:, :3, :, :], high_res[:, :3, :, :]
+                outputs[:, :3, :, :], high_res[:, :3, :, :]
             ).item()
 
             num_batches += 1
@@ -428,6 +455,8 @@ def evaluate_model(
     print(f"Avg Nearest PSNR: {np.mean(nearest_list):.4f}")
     return {
         "psnr": psnr_total / num_batches,
+        "psnr_no_nir": psnr_total_no_nir / num_batches,
+        "psnr_only_nir": psnr_only_nir / num_batches,
         "ssim": ssim_total / num_batches,
         "lpips": lpips_total / num_batches,
     }
@@ -600,7 +629,7 @@ def launch_all(
             num_patches=config.test.dataset_size,
             for_training=False,
             to_augment=False,
-            syntetic_data=config.train.syntetic_data,
+            synthetic_data=config.train.synthetic_data,
         )
 
         test_loader = DataLoader(
@@ -624,7 +653,8 @@ def launch_all(
         else:
             raise ValueError(f"Unsupported config type: {type(config.model)}")
 
-        print(f"Parametri: {sum(p.numel() for p in model.parameters())}")
+        params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Parametri: {params}")
 
         if config.test.load_model:
             # Caricamento del modello esistente
@@ -642,7 +672,7 @@ def launch_all(
             num_patches=config.train.dataset_size,
             for_training=True,
             to_augment=config.train.augment_data,
-            syntetic_data=config.train.syntetic_data,
+            synthetic_data=config.train.synthetic_data,
         )
 
         train_loader = DataLoader(
@@ -695,6 +725,7 @@ def launch_all(
         metrics = evaluate_model(model, test_loader, device)
         # Salviamo anche le curve di loss attive nel JSON metrics
         metrics["training_curves"] = losses
+        metrics["params"] = params
         save_metrics(metrics, config)
 
         visualize_predictions(model, test_dataset, device, config)

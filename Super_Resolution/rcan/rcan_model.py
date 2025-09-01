@@ -5,7 +5,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn as nn
-from Super_Resolution.config import ConfigRCAN
+from Super_Resolution.config import Config, RCANModelConfig
+from torch.nn import functional as F
 
 
 class RCAB(nn.Module):
@@ -68,14 +69,13 @@ class ResidualGroup(nn.Module):
 class RCAN(nn.Module):
     """Residual Channel Attention Network"""
 
-    def __init__(self, config: ConfigRCAN):
+    def __init__(self, config: Config[RCANModelConfig]):
         super(RCAN, self).__init__()
         self.in_channels = 4
         self.n_channels = config.model.feature_extraction_channels
         self.reduction = config.model.reduction_channels
 
-        scale = config.model.scale
-
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
         self.conv1 = nn.Conv2d(
             self.in_channels, self.n_channels, kernel_size=3, padding=1
         )
@@ -85,33 +85,47 @@ class RCAN(nn.Module):
                 for _ in range(config.model.residual_groups)
             ]
         )
-        self.conv2 = nn.Conv2d(
-            self.n_channels, self.n_channels, kernel_size=3, padding=1
+        self.conv_after_body = nn.Conv2d(
+            self.n_channels,
+            self.n_channels,
+            kernel_size=3,
+            padding=1,
+            padding_mode="reflect",
         )
-        self.conv3 = nn.Conv2d(
-            self.n_channels, self.n_channels * (scale**2), kernel_size=3, padding=1
+        self.conv_before_upsample = nn.Sequential(
+            nn.Conv2d(
+                self.n_channels, self.n_channels, 3, 1, 1, padding_mode="reflect"
+            ),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True),
         )
-        self.pixel_shuffle = nn.PixelShuffle(scale)
-        self.conv4 = nn.Conv2d(
-            self.n_channels, self.in_channels, kernel_size=3, padding=1
+        self.conv_up1 = nn.Conv2d(
+            self.n_channels, self.n_channels, 3, 1, 1, padding_mode="reflect"
         )
+        self.conv_up2 = nn.Conv2d(
+            self.n_channels, self.n_channels, 3, 1, 1, padding_mode="reflect"
+        )
+        self.conv_hr = nn.Conv2d(
+            self.n_channels, self.n_channels, 3, 1, 1, padding_mode="reflect"
+        )
+        self.conv_last = nn.Conv2d(self.n_channels, 4, 3, 1, 1, padding_mode="reflect")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
 
         # Feature extraction
-        out = self.conv1(x)
-        feat = out
+        x = self.conv1(x)
+        res = x
 
         # RIR (Residual In Residual)
         for group in self.groups:
-            out = group(out)
-        out = self.conv2(out)
+            x = group(x)
 
-        # Residual connection
-        out = out + feat
+        x = self.conv_after_body(x) + res
+        x = self.conv_before_upsample(x)
+        x = self.lrelu(self.conv_up1(F.interpolate(x, scale_factor=2, mode="nearest")))
+        x = self.lrelu(self.conv_up2(F.interpolate(x, scale_factor=2, mode="nearest")))
+        # Final 1.25x to reach 5x
+        x = F.interpolate(x, scale_factor=5 / 4, mode="bicubic", align_corners=False)
+        x = self.lrelu(self.conv_hr(x))
+        x = self.conv_last(x)
 
-        out = self.conv3(out)
-        out = self.pixel_shuffle(out)
-        out = self.conv4(out)
-
-        return out
+        return x

@@ -532,7 +532,7 @@ class SuperResolutionDataset(Dataset):
         patch_size: int = 256,
         num_patches: int = 1000,
         for_training: bool = False,
-        syntetic_data: bool = False,
+        synthetic_data: bool = False,
         to_augment: bool = True,
     ) -> None:
         self.comune = comune
@@ -540,7 +540,7 @@ class SuperResolutionDataset(Dataset):
         self.patch_size = patch_size
         self.num_patches = num_patches
         self.to_augment = to_augment
-        self.syntetic_data = syntetic_data
+        self.synthetic_data = synthetic_data
         if for_training:
             self.set_comuni = [
                 c
@@ -584,7 +584,7 @@ class SuperResolutionDataset(Dataset):
         random_comune = np.random.choice(self.set_comuni)
 
         low_res_patch, high_res_patch, patch_mask = get_random_patch(
-            self.stack_post[random_comune][1 if self.syntetic_data else 0],
+            self.stack_post[random_comune][1 if self.synthetic_data else 0],
             self.stack_post[random_comune][1],
             self.patch_size * self.scale,
             self.mask[random_comune],

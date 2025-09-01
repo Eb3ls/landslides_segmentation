@@ -64,6 +64,7 @@ class PSWinModelConfig(ModelConfig):
 class DRCTModelConfig(ModelConfig):
     patch_size: int
     in_chans: int
+    num_feat: int
     embed_dim: int
     depths: list[int]
     num_heads: list[int]
@@ -84,7 +85,7 @@ class TrainConfig:
     workers: int
     dataset_size: int
     augment_data: bool
-    syntetic_data: bool
+    synthetic_data: bool
     batch_size: int
     epochs: int
     show_progress: bool

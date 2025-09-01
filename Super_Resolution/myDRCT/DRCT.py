@@ -833,6 +833,7 @@ class DRCT(nn.Module):
         upsampler = config.model.upsampler
         resi_connection = config.model.resi_connection
         gc = config.model.gc
+        num_feat = config.model.num_feat
 
         # Parametri fissi non configurabili
         norm_layer = nn.LayerNorm
@@ -846,7 +847,6 @@ class DRCT(nn.Module):
 
         num_in_ch = in_chans
         num_out_ch = in_chans
-        num_feat = 64
         self.upscale = upscale
         self.upsampler = upsampler
 
@@ -916,24 +916,27 @@ class DRCT(nn.Module):
                 nn.Conv2d(embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
             )
 
+            self.antialisiasing = nn.Conv2d(
+                num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
+            )
             # Enhanced PixelShuffle blocks with ECA attention
             self.upsample1 = nn.Sequential(
                 nn.Conv2d(num_feat, 4 * num_feat, 3, 1, 1),
                 nn.PixelShuffle(2),
-                nn.LeakyReLU(inplace=True),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
                 ECA(num_feat),  # ECA attention dopo 2x upsampling
             )
             self.upsample2 = nn.Sequential(
                 nn.Conv2d(num_feat, 4 * num_feat, 3, 1, 1),
                 nn.PixelShuffle(2),
-                nn.LeakyReLU(inplace=True),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
                 ECA(num_feat),  # ECA attention dopo 4x upsampling
             )
 
             # Texture enhancement e spatial attention
             self.conv_hr = nn.Sequential(
                 nn.Conv2d(num_feat, num_feat, 3, 1, 1),
-                nn.LeakyReLU(inplace=True),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
                 TextureEnhancementBlock(num_feat),  # Multi-scale texture enhancement
             )
             self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
@@ -941,22 +944,22 @@ class DRCT(nn.Module):
             # Residual path migliorato
             self.conv_before_upsample_res = nn.Sequential(
                 nn.Conv2d(embed_dim, num_feat, 3, 1, 1),
-                nn.LeakyReLU(inplace=True),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
                 ECA(num_feat),
             )
 
             # Fusione migliorata con spatial attention
             self.fusion_conv = nn.Sequential(
                 nn.Conv2d(2 * num_feat, num_feat, 1, 1, 0),
-                nn.LeakyReLU(inplace=True),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
             )
             self.spatial_attention = SpatialAttention()
         elif self.upsampler == "nearest+conv":
             print("Using nearest+conv upsampler")
             # Two 2x nearest stages + final 1.25x bicubic with refinement
             self.conv_before_upsample = nn.Sequential(
-                nn.Conv2d(128, num_feat, 3, 1, 1, padding_mode="reflect"),
-                nn.LeakyReLU(inplace=True),
+                nn.Conv2d(embed_dim, num_feat, 3, 1, 1, padding_mode="reflect"),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
             )
             self.conv_up1 = nn.Conv2d(
                 num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
@@ -967,6 +970,20 @@ class DRCT(nn.Module):
             self.conv_hr = nn.Conv2d(
                 num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
             )
+
+            self.conv3_hr = nn.Conv2d(
+                num_feat, num_feat, 3, 1, 1, padding_mode="reflect"
+            )
+            self.conv5_hr = nn.Conv2d(
+                num_feat, num_feat, 5, 1, 2, padding_mode="reflect"
+            )
+            self.conv7_hr = nn.Conv2d(
+                num_feat, num_feat, 7, 1, 3, padding_mode="reflect"
+            )
+            self.conv_combine = nn.Conv2d(
+                4 * num_feat, num_feat, 1, 1, 0, padding_mode="reflect"
+            )
+
             self.conv_last = nn.Conv2d(num_feat, 4, 3, 1, 1, padding_mode="reflect")
 
         self.apply(self._init_weights)
@@ -1005,6 +1022,7 @@ class DRCT(nn.Module):
             res = F.interpolate(
                 res, scale_factor=5, mode="bicubic", align_corners=False
             )  # (B, 64, 64, 64) → (B, 64, 320, 320)
+            res = self.antialisiasing(res)  # Antialiasing per ridurre aliasing
 
             # Path 2: Enhanced PixelShuffle path con ECA ad ogni step
             x_detail = self.conv_before_upsample(
@@ -1053,6 +1071,12 @@ class DRCT(nn.Module):
                 x, scale_factor=5 / 4, mode="bicubic", align_corners=False
             )
             x = self.lrelu(self.conv_hr(x))
+            res = x
+            x1 = self.conv3_hr(x)
+            x2 = self.conv5_hr(x)
+            x3 = self.conv7_hr(x)
+            x = torch.cat([x, x1, x2, x3], dim=1)
+            x = self.conv_combine(x) + res
             x = self.conv_last(x)
 
         return x
