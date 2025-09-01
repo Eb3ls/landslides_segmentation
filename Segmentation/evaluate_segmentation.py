@@ -8,18 +8,20 @@ from torch.utils.data import DataLoader
 
 from .seg_unet import (
     UNet,
+    AttentionUNet,
     evaluate_model,
     visualize_results,
     seed_everything,
+    log_attention_stats
 )
 
 from data_utils import SegmentationSingleDataset
 
-MODEL_PATH = "attention_ndvi_model.pth"
+MODEL_PATH = "best_model.pth"
 PATCH_SIZE = 256
 NUM_PATCHES = 1000
-BATCH_SIZE = 4
-FIXED_THRESHOLD = 0.42  # Non utilizzato per soglia variabile
+BATCH_SIZE = 8
+FIXED_THRESHOLD = 0.44  # Non utilizzato per soglia variabile
 VIS_SAMPLES = 5
 
 

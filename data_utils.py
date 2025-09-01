@@ -257,7 +257,7 @@ def get_segmentation_stack(
 
     for filename in os.listdir(directory):
         # Saltiamo i file non rilevanti
-        if any(substr in filename.lower() for substr in ["sentinel2", "s2"]):
+        if any(substr in filename.lower() for substr in ["sentinel2", "s2", "ndvi", "slope"]):
             continue
 
         path = os.path.join(directory, filename)
@@ -273,10 +273,6 @@ def get_segmentation_stack(
             if "Agea" in filename:
                 input_stack.extend(bands)
             elif "Cgr" in filename:
-                input_stack.extend(bands)
-            elif "NDVI" in filename:
-                input_stack.extend(bands)
-            elif "Slope" in filename:
                 input_stack.extend(bands)
             elif "Frane" in filename:
                 landslide_mask = get_landslide_mask(bands)

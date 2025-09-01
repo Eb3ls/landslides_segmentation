@@ -17,9 +17,9 @@ from typing import cast
 from data_utils import ComuneType, SegmentationMultiDataset, SegmentationSingleDataset
 
 PATCH_SIZE = 256
-NUM_PATCHES = 2000
-BATCH_SIZE = 8
-NUM_EPOCHS = 120
+NUM_PATCHES = 4000
+BATCH_SIZE = 16
+NUM_EPOCHS = 60
 
 
 class DoubleConv(nn.Module):
@@ -29,12 +29,12 @@ class DoubleConv(nn.Module):
         super(DoubleConv, self).__init__()
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(max(4, out_channels // 32), out_channels),
+            nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(
                 out_channels, out_channels, kernel_size=3, padding=1
             ),  # La seconda convoluzione mantiene la dimensione dei canali
-            nn.GroupNorm(max(4, out_channels // 32), out_channels),
+            nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
         )
 
@@ -86,6 +86,11 @@ class AttentionGate(nn.Module):
         )
 
         self._init_open()
+        # Accumulatori aggregati
+        self._alpha_sum: float = 0.0
+        self._alpha_count: int = 0
+        self._alpha_min: float = float("inf")
+        self._alpha_max: float = float("-inf")
 
     def _init_open(self):
         # Piccole proiezioni e bias della psi alto → alpha≈1 all’inizio
@@ -116,7 +121,19 @@ class AttentionGate(nn.Module):
                 float(a.min().item()),
                 float(a.max().item()),
             )
+            # Accumulo aggregato per tutta la validazione (se abilitato)
+            if getattr(self, "_collect_alpha", False):
+                self._alpha_sum += float(a.sum().item())
+                self._alpha_count += int(a.numel())
+                self._alpha_min = min(self._alpha_min, float(a.min().item()))
+                self._alpha_max = max(self._alpha_max, float(a.max().item()))
         return x * alpha  # applica il gate
+
+    def reset_alpha_aggregate(self) -> None:
+        self._alpha_sum = 0.0
+        self._alpha_count = 0
+        self._alpha_min = float("inf")
+        self._alpha_max = float("-inf")
 
 
 class Up(nn.Module):
@@ -247,11 +264,17 @@ def log_attention_stats(model: nn.Module, prefix: str = "") -> None:
     """Stampa statistiche delle mappe di attenzione (mean/min/max) per ogni gate."""
     idx = 0
     for m in model.modules():
-        if isinstance(m, AttentionGate) and hasattr(m, "_alpha_stats"):
-            mean_, min_, max_ = m._alpha_stats  # type: ignore[attr-defined]
-            print(
-                f"{prefix}AttnGate[{idx}]: mean={mean_:.3f} min={min_:.3f} max={max_:.3f}"
-            )
+        if isinstance(m, AttentionGate):
+            # Preferisci statistiche aggregate se presenti
+            if hasattr(m, "_alpha_count") and getattr(m, "_alpha_count") > 0:
+                mean_ = m._alpha_sum / max(1, m._alpha_count)
+                min_ = m._alpha_min
+                max_ = m._alpha_max
+            elif hasattr(m, "_alpha_stats"):
+                mean_, min_, max_ = m._alpha_stats
+            else:
+                continue
+            print(f"{prefix}AttnGate[{idx}]: mean={mean_:.3f} min={min_:.3f} max={max_:.3f}")
             idx += 1
 
 
@@ -325,7 +348,8 @@ def train_model(
             f"Epoch [{epoch+1}/{num_epochs}], Average Loss: {train_loss:.6f}, Validation Loss: {val_loss:.6f}, Validation IoU: {val_iou:.6f}, Validation Dice: {dice_score:.6f}, Overall Accuracy: {oa:.6f}, LR: {current_lr:.2e}"
         )
 
-        log_attention_stats(model, prefix=f"Epoch {epoch+1}: ")
+        # Rimosso: logging non aggregato post-epoch (si logga già in evaluate_model)
+        # log_attention_stats(model, prefix=f"Epoch {epoch+1}: ")
 
         # Salvataggio del modello migliore
         if val_iou > best_iou and epoch > 30:
@@ -376,6 +400,11 @@ def evaluate_model(
         np.zeros((2, 2), dtype=np.float32) if return_confusion_matrix else None
     )
 
+    # Abilita raccolta aggregata alpha sugli AttentionGate e resetta accumulatori
+    for m in model.modules():
+        if isinstance(m, AttentionGate):
+            m.reset_alpha_aggregate()
+
     with torch.no_grad():
         for input, labels in dataloader:
             input = input.to(device)
@@ -406,6 +435,12 @@ def evaluate_model(
             correct_sum += correct
             total = preds.numel()
             total_pixels += total
+
+    # Log statistiche aggregate su tutta la validazione e disabilita raccolta
+    log_attention_stats(model, prefix="Alpha stats (val) - ")
+    for m in model.modules():
+        if isinstance(m, AttentionGate):
+            m.reset_alpha_aggregate()
 
     val_loss = total_loss_sum / max(1, num_samples)
     iou = intersection_sum / union_sum if union_sum > 0 else 1.0
