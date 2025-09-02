@@ -7,6 +7,9 @@ from timm.layers.helpers import to_2tuple
 import torch.nn.functional as F
 import sys
 import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -441,107 +444,46 @@ class RDG(nn.Module):
 
         self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
-        self.pe1 = PatchEmbed(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_chans=gc,  # Dopo adjust1
-            embed_dim=gc,
-            norm_layer=None,
-        )
-        self.pue1 = PatchUnEmbed(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_chans=0,  # Output di swin1
-            embed_dim=0,
-            norm_layer=None,
-        )
-
-        self.pe2 = PatchEmbed(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_chans=gc,  # Dopo adjust2
-            embed_dim=gc,
-            norm_layer=None,
-        )
-        self.pue2 = PatchUnEmbed(
+        self.pe = PatchEmbed(
             img_size=img_size,
             patch_size=patch_size,
             in_chans=0,
-            embed_dim=0,
-            norm_layer=None,
-        )
-
-        self.pe3 = PatchEmbed(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_chans=gc,  # Dopo adjust3
-            embed_dim=gc,
-            norm_layer=None,
-        )
-        self.pue3 = PatchUnEmbed(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_chans=0,
-            embed_dim=0,
-            norm_layer=None,
-        )
-
-        self.pe4 = PatchEmbed(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_chans=gc,  # Dopo adjust4
-            embed_dim=gc,
-            norm_layer=None,
-        )
-        self.pue4 = PatchUnEmbed(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_chans=0,  # Output di swin4
-            embed_dim=0,
-            norm_layer=None,
-        )
-
-        self.pe5 = PatchEmbed(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_chans=dim,  # Dopo adjust5
             embed_dim=dim,
             norm_layer=None,
         )
-        self.pue5 = PatchUnEmbed(
+
+        self.pue = PatchUnEmbed(
             img_size=img_size,
             patch_size=patch_size,
-            in_chans=0,  # Output di swin5
-            embed_dim=0,
+            in_chans=0,
+            embed_dim=dim,
             norm_layer=None,
         )
 
     def forward(self, x, xsize):
-        x1 = self.pe1(self.lrelu(self.adjust1(self.pue1(self.swin1(x, xsize), xsize))))
-        x2 = self.pe2(
+        x1 = self.pe(self.lrelu(self.adjust1(self.pue(self.swin1(x, xsize), xsize))))
+        x2 = self.pe(
             self.lrelu(
-                self.adjust2(
-                    self.pue2(self.swin2(torch.cat((x, x1), -1), xsize), xsize)
-                )
+                self.adjust2(self.pue(self.swin2(torch.cat((x, x1), -1), xsize), xsize))
             )
         )
-        x3 = self.pe3(
+        x3 = self.pe(
             self.lrelu(
                 self.adjust3(
-                    self.pue3(self.swin3(torch.cat((x, x1, x2), -1), xsize), xsize)
+                    self.pue(self.swin3(torch.cat((x, x1, x2), -1), xsize), xsize)
                 )
             )
         )
-        x4 = self.pe4(
+        x4 = self.pe(
             self.lrelu(
                 self.adjust4(
-                    self.pue4(self.swin4(torch.cat((x, x1, x2, x3), -1), xsize), xsize)
+                    self.pue(self.swin4(torch.cat((x, x1, x2, x3), -1), xsize), xsize)
                 )
             )
         )
-        x5 = self.pe5(
+        x5 = self.pe(
             self.adjust5(
-                self.pue5(self.swin5(torch.cat((x, x1, x2, x3, x4), -1), xsize), xsize)
+                self.pue(self.swin5(torch.cat((x, x1, x2, x3, x4), -1), xsize), xsize)
             )
         )
 
@@ -741,12 +683,8 @@ class PatchEmbed(nn.Module):
         else:
             self.norm = None
 
-        self.proj = nn.Conv2d(
-            in_chans, embed_dim, kernel_size=patch_size[0], stride=patch_size[0]
-        )
-
     def forward(self, x):
-        x = self.proj(x).flatten(2).transpose(1, 2)  # 结构为 [B, num_patches, C]
+        x = x.flatten(2).transpose(1, 2)  # 结构为 [B, num_patches, C]
         if self.norm is not None:
             x = self.norm(x)  # 归一化
         return x
@@ -985,6 +923,16 @@ class DRCT(nn.Module):
             )
 
             self.conv_last = nn.Conv2d(num_feat, 4, 3, 1, 1, padding_mode="reflect")
+        elif self.upsampler == "test":
+            self.tail = UpsampleTail5x(embed_dim, num_feat, num_out_ch)
+        elif self.upsampler == "only_shuffle":
+            print("Using only upsample")
+            self.tail = nn.Sequential(
+                nn.Conv2d(embed_dim, num_feat * 5 * 5, 3, 1, 1, padding_mode="reflect"),
+                nn.PixelShuffle(5),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                nn.Conv2d(num_feat, num_out_ch, 3, 1, 1, padding_mode="reflect"),
+            )
 
         self.apply(self._init_weights)
 
@@ -1078,5 +1026,121 @@ class DRCT(nn.Module):
             x = torch.cat([x, x1, x2, x3], dim=1)
             x = self.conv_combine(x) + res
             x = self.conv_last(x)
+        elif self.upsampler == "test":
+            x = self.conv_first(x)
+            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.tail(x)
+        elif self.upsampler == "only_shuffle":
+            x = self.conv_first(x)
+            x = self.conv_after_body(self.forward_features(x)) + x
+            print(x.shape)
+            x = self.tail(x)
 
         return x
+
+
+# --- piccolo blocco residuo (senza BatchNorm) ---
+class ResBlock(nn.Module):
+    def __init__(self, channels, kernel=3, bias=True):
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            channels, channels, kernel, padding=kernel // 2, bias=bias
+        )
+        self.act = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(
+            channels, channels, kernel, padding=kernel // 2, bias=bias
+        )
+        self.scale = 1.0
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        out = self.conv2(self.act(self.conv1(x)))
+        return x + out * 0.1  # small residual scale
+
+
+# --- channel attention leggero (SE style) ---
+class ChannelAttention(nn.Module):
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        self.fc1 = nn.Conv2d(channels, channels // reduction, 1)
+        self.fc2 = nn.Conv2d(channels // reduction, channels, 1)
+        self.act = nn.ReLU(inplace=True)
+        self.sig = nn.Sigmoid()
+
+    def forward(self, x):
+        s = F.adaptive_avg_pool2d(x, 1)
+        s = self.fc2(self.act(self.fc1(s)))
+        return x * self.sig(s)
+
+
+# --- texture enhancement leggero (multi-scale ma controllato) ---
+class TextureEnhancementLite(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        # reduce channels for multi-kernel ops for stability
+        mid = max(channels // 4, 8)
+        self.conv1 = nn.Conv2d(channels, mid, 1, padding=0)
+        self.conv3 = nn.Conv2d(channels, mid, 3, padding=1)
+        self.conv5 = nn.Conv2d(channels, mid, 5, padding=2)
+        self.fuse = nn.Conv2d(mid * 3, channels, 1)
+        self.attn = ChannelAttention(channels, reduction=8)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        f1 = self.conv1(x)
+        f3 = self.conv3(x)
+        f5 = self.conv5(x)
+        fused = self.fuse(torch.cat([f1, f3, f5], dim=1))
+        fused = self.attn(fused)
+        return x + 0.2 * fused
+
+
+# --- Tail per SR 5x: bicubic upsample + HR refinement ---
+class UpsampleTail5x(nn.Module):
+    def __init__(self, embed_dim, num_feat=64, num_out_ch=4, num_resblocks=8, scale=5):
+        super().__init__()
+        self.scale = scale
+        self.conv_before_upsample = nn.Conv2d(embed_dim, num_feat, 3, 1, 1)
+        self.antialias = nn.Conv2d(num_feat, num_feat, 3, 1, 1, padding_mode="reflect")
+        # HR refinement: a stack of ResBlocks at HR
+        self.hr_refine = nn.Sequential(
+            *[ResBlock(num_feat) for _ in range(num_resblocks)]
+        )
+        self.texture = TextureEnhancementLite(num_feat)
+        self.fusion_conv = nn.Conv2d(2 * num_feat, num_feat, 1)
+        # learnable scalar blending (per-channel could be used too)
+        self.alpha_param = nn.Parameter(torch.tensor(0.5))  # init 0.5
+        self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        # x: (B, embed_dim, H, W)  LR features
+        feat = self.conv_before_upsample(x)  # (B, num_feat, H, W)
+        # Upsample both paths with the SAME bicubic grid -> no misalignment
+        H_hr = feat.size(2) * self.scale
+        W_hr = feat.size(3) * self.scale
+        res = F.interpolate(
+            feat, size=(H_hr, W_hr), mode="bicubic", align_corners=False
+        )
+        res = self.antialias(res)
+        detail = res
+        detail = self.hr_refine(detail)
+        detail = self.texture(detail)
+        fused = torch.cat([res, detail], dim=1)
+        fused = self.fusion_conv(fused)
+        alpha = torch.sigmoid(self.alpha_param)
+        out_feat = alpha * fused + (1.0 - alpha) * res
+        out = self.conv_last(out_feat)
+        return out

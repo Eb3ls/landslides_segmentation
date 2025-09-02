@@ -9,7 +9,6 @@ import torch.nn.functional as F
 
 from torch import Tensor, nn
 from typing import Literal
-from timm.layers.weight_init import trunc_normal_
 from Super_Resolution.config import Config, MyModelConfig
 from Super_Resolution.models_functions import (
     PatchEmbed,
@@ -18,7 +17,6 @@ from Super_Resolution.models_functions import (
     window_partition,
     window_reverse,
     Mlp,
-    Upsample,
 )
 
 
