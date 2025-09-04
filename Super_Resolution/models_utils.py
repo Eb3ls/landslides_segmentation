@@ -6,9 +6,11 @@ import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 import napari
+import os
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from dataclasses import asdict
+from typing import Optional
 
 from pytorch_msssim import ms_ssim
 from torchmetrics.image import (
@@ -227,8 +229,10 @@ def composite_loss(
 
     # Charbonnier
     if weights.get("charb", 0.0) > 0:
-        charb_v = charbonnier_loss(sr, hr)
-        comps["charb"] = weights["charb"] * charb_v
+        charb_v_rgb = charbonnier_loss(sr[:, :3], hr[:, :3])
+        charb_v_nir = charbonnier_loss(sr[:, 3:], hr[:, 3:])
+        avg = 0.7 * charb_v_rgb + 0.3 * charb_v_nir
+        comps["charb"] = weights["charb"] * avg
 
     # High-Frequency loss (blur-subtraction)
     if weights.get("hf", 0.0) > 0:
@@ -241,7 +245,13 @@ def composite_loss(
         comps["sobel"] = weights["sobel"] * grad_v
 
     if weights.get("ssim", 0.0) > 0:
-        ssim_v = 1 - ms_ssim(sr, hr, data_range=1.0, weights=[0.5, 0.5])
+        # MS-SSIM richiede [0,1]; clamp solo per questo termine
+        ssim_v = 1 - ms_ssim(
+            torch.clamp(sr[:, :3, :, :], 0.0, 1.0),
+            torch.clamp(hr[:, :3, :, :], 0.0, 1.0),
+            data_range=1.0,
+            weights=[0.5, 0.5],
+        )
         comps["ssim"] = weights["ssim"] * ssim_v
 
     if weights.get("tv", 0.0) > 0:
@@ -281,10 +291,11 @@ def train_model(
     dataloader: DataLoader,
     device: torch.device,
     config: Config,
+    params_override: Optional[list[nn.Parameter]] = None,
 ) -> dict[str, list[float]]:
     """Addestra il modello di super risoluzione.
 
-    Ritorna un dizionario con le curve per-epoca: total, ncc, ssim, moe
+    Ritorna un dizionario con le curve per-epoca
     """
 
     # Gradient Accumulation
@@ -293,22 +304,59 @@ def train_model(
     # Loss and optimizer
     criterion = composite_loss
     # Optimizer: Adam senza weight decay
-    optimizer = optim.AdamW(
-        model.parameters(), lr=2e-4, weight_decay=0, betas=(0.9, 0.999)
+    opt_params = (
+        params_override
+        if params_override is not None
+        else [p for p in model.parameters() if p.requires_grad]
     )
-    total_updates = config.train.epochs * len(dataloader) // accumulation_steps
-    milestones = [
-        int(0.5 * total_updates),
-        int(0.75 * total_updates),
-        int(0.9 * total_updates),
-    ]
-    scheduler = optim.lr_scheduler.MultiStepLR(
+    optimizer = optim.AdamW(opt_params, lr=2e-4, weight_decay=0, betas=(0.9, 0.999))
+
+    total_steps = config.train.epochs * len(dataloader) // accumulation_steps
+    # milestones = [
+    #     int(0.5 * total_steps),
+    #     int(0.75 * total_steps),
+    #     int(0.9 * total_steps),
+    # ]
+    # scheduler = optim.lr_scheduler.MultiStepLR(
+    #     optimizer,
+    #     milestones=milestones,
+    #     gamma=0.5,
+    # )
+    steps_per_epoch = len(dataloader) // accumulation_steps
+
+    # scheduler = optim.lr_scheduler.OneCycleLR(
+    #     optimizer,
+    #     max_lr=2e-4,
+    #     epochs=config.train.epochs,
+    #     steps_per_epoch=steps_per_epoch,
+    #     pct_start=0.2,
+    #     anneal_strategy="cos",
+    #     div_factor=25.0,  # Lr iniziale = max_lr / div_factor
+    #     final_div_factor=1000,  # Lr finale = max_lr / final_div_factor
+    #     three_phase=False,  # solo salita e discesa
+    #     last_epoch=-1,  # inizia da 0
+    #     cycle_momentum=False,  # Gestito da AdamW
+    # )
+
+    warmup_epochs = 0.1 * config.train.epochs
+    warmup_steps = int(warmup_epochs * steps_per_epoch)
+
+    warmup = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1 / 10, end_factor=1.0, total_iters=warmup_steps
+    )
+    cosine = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        milestones=milestones,
-        gamma=0.5,
+        T_max=total_steps - warmup_steps,
+        eta_min=1e-5,
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_steps],
     )
 
-    print("Total updates:", total_updates)
+    print("Total updates:", total_steps, "and each epoch:", steps_per_epoch)
+    # print("Warmup steps:", warmup_steps, "cosine steps:", total_steps - warmup_steps)
 
     # Prepara dizionario dinamico delle curve
     active_losses = [k for k, w in config.train.loss_weights.items() if w > 0]
@@ -408,38 +456,35 @@ def evaluate_model(
 
             outputs = model(low_res)
             if isinstance(outputs, tuple):
-                # Se il modello restituisce anche la loss di Moe
                 outputs, _ = outputs
 
-            psnr_total += psnr_metric(outputs, high_res).item()
+            # Clamp solo per metriche
+            outputs_c = torch.clamp(outputs, 0.0, 1.0)
+            target_c = torch.clamp(high_res, 0.0, 1.0)
+
+            psnr_total += psnr_metric(outputs_c, target_c).item()
             psnr_total_no_nir += psnr_metric(
-                outputs[:, :3, :, :], high_res[:, :3, :, :]
+                outputs_c[:, :3, :, :], target_c[:, :3, :, :]
             ).item()
             psnr_only_nir += psnr_metric(
-                outputs[:, 3:, :, :], high_res[:, 3:, :, :]
+                outputs_c[:, 3:, :, :], target_c[:, 3:, :, :]
             ).item()
             ssim_total += ssim_metric(
-                outputs, high_res, data_range=1.0, weights=[0.5, 0.5]
+                outputs_c, target_c, data_range=1.0, weights=[0.5, 0.5]
             ).item()
 
-            # LPIPS: range [0, 1], solo per canali RGB (primi 3 canali)
             lpips_total += lpips_metric(
-                outputs[:, :3, :, :], high_res[:, :3, :, :]
+                outputs_c[:, :3, :, :], target_c[:, :3, :, :]
             ).item()
 
             num_batches += 1
 
-            # Upscaliamo l'immagine a bassa risoluzione per avere un confronto diretto
-
+            # Bicubica/nearest di baseline
             low_res_tensor = torch.nn.functional.interpolate(
-                low_res,
-                scale_factor=5,
-                mode="bicubic",
-                align_corners=False,
+                low_res, scale_factor=5, mode="bicubic", align_corners=False
             )
-
             bicubic_list.append(
-                psnr_metric(torch.clamp(low_res_tensor, 0, 1), high_res).item()
+                psnr_metric(torch.clamp(low_res_tensor, 0, 1), target_c).item()
             )
 
             low_res_tensor = torch.nn.functional.interpolate(
@@ -448,7 +493,7 @@ def evaluate_model(
                 mode="nearest",
             )
             nearest_list.append(
-                psnr_metric(torch.clamp(low_res_tensor, 0, 1), high_res).item()
+                psnr_metric(torch.clamp(low_res_tensor, 0, 1), target_c).item()
             )
 
     print(f"Avg Bicubic PSNR: {np.mean(bicubic_list):.4f}")
@@ -601,6 +646,52 @@ def load_model(
     return model
 
 
+def _freeze_module(m: nn.Module) -> None:
+    for p in m.parameters():
+        p.requires_grad = False
+
+
+def _enable_module(m: nn.Module) -> None:
+    for p in m.parameters():
+        p.requires_grad = True
+
+
+def _prepare_finetune_head_only(model: nn.Module) -> list[nn.Parameter]:
+    """Freeze everything except the SR tail for DRCT.
+    Returns the list of trainable parameters.
+    """
+    # Freeze everything first
+    for p in model.parameters():
+        p.requires_grad = False
+
+    if isinstance(model, DRCT) and getattr(model, "upsampler", "") == "test":
+        if hasattr(model, "tail") and isinstance(model.tail, nn.Module):
+            _enable_module(model.tail)
+            if hasattr(model.tail, "antialias") and isinstance(
+                model.tail.antialias, nn.Module
+            ):
+                _freeze_module(model.tail.antialias)
+    else:
+        if hasattr(model, "conv_last") and isinstance(model.conv_last, nn.Module):
+            _enable_module(model.conv_last)
+
+    return [p for p in model.parameters() if p.requires_grad]
+
+
+def _load_finetune_checkpoint(
+    model: nn.Module, ckpt_path: str, device: torch.device
+) -> None:
+    if ckpt_path and os.path.isfile(ckpt_path):
+        state = torch.load(ckpt_path, map_location=device)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            print(f"[Finetune] Missing keys: {len(missing)} (ok if tail changed)")
+        if unexpected:
+            print(f"[Finetune] Unexpected keys: {len(unexpected)}")
+    else:
+        print("[Finetune] No valid checkpoint provided; training from current init")
+
+
 def launch_all(
     config: Config,
 ) -> None:
@@ -662,7 +753,27 @@ def launch_all(
             visualize_predictions(model, test_dataset, device, config)
             return
 
-        # Altrimenti alleniamo il modello
+        # Fine-tuning setup
+        finetune = getattr(config.train, "finetune", False)
+        finetune_scope = getattr(config.train, "finetune_scope", "head")
+        finetune_ckpt = getattr(config.train, "finetune_from", "")
+        if finetune:
+            # Rinomina la cartella di output aggiungendo _finetune
+            base_name = config.model.name
+            if not str(base_name).endswith("_finetune"):
+                config.model.name = f"{base_name}_finetune"
+            os.makedirs(f"{config.model.dir_path}{config.model.name}", exist_ok=True)
+            print(f"[Finetune] Output dir: {config.model.dir_path}{config.model.name}")
+
+            _load_finetune_checkpoint(model, finetune_ckpt, device)
+            if finetune_scope == "head":
+                trainable_params = _prepare_finetune_head_only(model)
+            else:
+                trainable_params = [p for p in model.parameters() if p.requires_grad]
+        else:
+            # Assicura la cartella esista comunque
+            os.makedirs(f"{config.model.dir_path}{config.model.name}", exist_ok=True)
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
 
         # Dataset di addestramento
         train_dataset = SuperResolutionDataset(
@@ -686,7 +797,9 @@ def launch_all(
 
         # Allenamento
         print("Starting training...")
-        losses = train_model(model, train_loader, device, config)
+        losses = train_model(
+            model, train_loader, device, config, params_override=trainable_params
+        )
 
         # Plot dinamico solo delle componenti attive
         active_components = [k for k, w in config.train.loss_weights.items() if w > 0]

@@ -535,7 +535,7 @@ class SwinTransformerBlock(nn.Module):
             self.window_size = min(self.input_resolution)
         assert (
             0 <= self.shift_size < self.window_size
-        ), "shift_size must in 0-window_size"
+        ), "shift_size must in 0-window-size"
 
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
@@ -877,7 +877,9 @@ class DRCT(nn.Module):
                 nn.LeakyReLU(negative_slope=0.2, inplace=True),
                 TextureEnhancementBlock(num_feat),  # Multi-scale texture enhancement
             )
-            self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+            self.conv_last = nn.Conv2d(
+                num_feat, num_out_ch, 3, 1, 1, padding_mode="reflect"
+            )
 
             # Residual path migliorato
             self.conv_before_upsample_res = nn.Sequential(
@@ -1027,15 +1029,18 @@ class DRCT(nn.Module):
             x = self.conv_combine(x) + res
             x = self.conv_last(x)
         elif self.upsampler == "test":
+            lr = x
             x = self.conv_first(x)
             x = self.conv_after_body(self.forward_features(x)) + x
             x = self.tail(x)
+            # Image residual: add bicubic upscaled LR
+            x = x + F.interpolate(
+                lr, scale_factor=5, mode="bicubic", align_corners=False
+            )
         elif self.upsampler == "only_shuffle":
             x = self.conv_first(x)
             x = self.conv_after_body(self.forward_features(x)) + x
-            print(x.shape)
             x = self.tail(x)
-
         return x
 
 
@@ -1081,7 +1086,6 @@ class ChannelAttention(nn.Module):
 class TextureEnhancementLite(nn.Module):
     def __init__(self, channels):
         super().__init__()
-        # reduce channels for multi-kernel ops for stability
         mid = max(channels // 4, 8)
         self.conv1 = nn.Conv2d(channels, mid, 1, padding=0)
         self.conv3 = nn.Conv2d(channels, mid, 3, padding=1)
@@ -1100,7 +1104,8 @@ class TextureEnhancementLite(nn.Module):
         f5 = self.conv5(x)
         fused = self.fuse(torch.cat([f1, f3, f5], dim=1))
         fused = self.attn(fused)
-        return x + 0.2 * fused
+        # Moderazione del dettaglio per stabilità PSNR
+        return x + 0.08 * fused
 
 
 # --- Tail per SR 5x: bicubic upsample + HR refinement ---
@@ -1108,39 +1113,78 @@ class UpsampleTail5x(nn.Module):
     def __init__(self, embed_dim, num_feat=64, num_out_ch=4, num_resblocks=8, scale=5):
         super().__init__()
         self.scale = scale
-        self.conv_before_upsample = nn.Conv2d(embed_dim, num_feat, 3, 1, 1)
-        self.antialias = nn.Conv2d(num_feat, num_feat, 3, 1, 1, padding_mode="reflect")
-        # HR refinement: a stack of ResBlocks at HR
+        self.num_feat = num_feat
+        # Pre-UPS: porta a feature a bassa risoluzione
+        self.conv_before_upsample = nn.Conv2d(
+            embed_dim, num_feat, 3, 1, 1, padding_mode="reflect"
+        )
+        # Anti-alias depthwise con init gaussiano (non mescola canali)
+        self.antialias = nn.Conv2d(
+            num_feat,
+            num_feat,
+            3,
+            1,
+            1,
+            padding_mode="reflect",
+            groups=num_feat,
+            bias=False,
+        )
+        with torch.no_grad():
+            k = (
+                torch.tensor([[1, 2, 1], [2, 4, 2], [1, 2, 1]], dtype=torch.float32)
+                / 16.0
+            )
+            k = k.view(1, 1, 3, 3).repeat(num_feat, 1, 1, 1)
+            self.antialias.weight.copy_(k)
+        # HR refinement: ResBlocks in HR
         self.hr_refine = nn.Sequential(
             *[ResBlock(num_feat) for _ in range(num_resblocks)]
         )
         self.texture = TextureEnhancementLite(num_feat)
-        self.fusion_conv = nn.Conv2d(2 * num_feat, num_feat, 1)
-        # learnable scalar blending (per-channel could be used too)
-        self.alpha_param = nn.Parameter(torch.tensor(0.5))  # init 0.5
-        self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+        # Fusione res/detail -> feature
+        self.fusion_conv = nn.Conv2d(2 * num_feat, num_feat, 1, padding=0)
+        # Gate α per‑canale (C×1×1) con global pooling
+        self.alpha_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(num_feat, num_feat, 1, padding=0),
+            nn.Sigmoid(),
+        )
+        # Teste separate RGB e NIR (dual head)
+        self.conv_rgb = nn.Conv2d(num_feat, 3, 3, 1, 1, padding_mode="reflect")
+        self.conv_nir = nn.Conv2d(num_feat, 1, 3, 1, 1, padding_mode="reflect")
+        # Affine per‑canale in uscita
+        self.out_gamma = nn.Parameter(torch.ones(1, num_out_ch, 1, 1))
+        self.out_beta = nn.Parameter(torch.zeros(1, num_out_ch, 1, 1))
+        # conv_last is unused now; keep or set with reflect to avoid border artifacts if used later
+        self.conv_last = nn.Conv2d(
+            num_feat, num_out_ch, 3, 1, 1, padding_mode="reflect"
+        )
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
+            if isinstance(m, nn.Conv2d) and m is not self.antialias:
                 nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        # x: (B, embed_dim, H, W)  LR features
-        feat = self.conv_before_upsample(x)  # (B, num_feat, H, W)
-        # Upsample both paths with the SAME bicubic grid -> no misalignment
+        # x: (B, embed_dim, H, W)
+        feat = self.conv_before_upsample(x)  # (B, C, H, W)
+        # Bicubica a HR su feature (griglia condivisa)
         H_hr = feat.size(2) * self.scale
         W_hr = feat.size(3) * self.scale
         res = F.interpolate(
             feat, size=(H_hr, W_hr), mode="bicubic", align_corners=False
         )
         res = self.antialias(res)
-        detail = res
-        detail = self.hr_refine(detail)
+        # Path dettaglio in HR
+        detail = self.hr_refine(res)
         detail = self.texture(detail)
-        fused = torch.cat([res, detail], dim=1)
-        fused = self.fusion_conv(fused)
-        alpha = torch.sigmoid(self.alpha_param)
+        fused = self.fusion_conv(torch.cat([res, detail], dim=1))
+        # Gate per‑canale, broadcast su H,W
+        alpha = self.alpha_gate(fused)  # (B,C,1,1) in [0,1]
         out_feat = alpha * fused + (1.0 - alpha) * res
-        out = self.conv_last(out_feat)
+        # Dual head
+        rgb = self.conv_rgb(out_feat)
+        nir = self.conv_nir(out_feat)
+        out = torch.cat([rgb, nir], dim=1)
+        out = self.out_gamma * out + self.out_beta
         return out
