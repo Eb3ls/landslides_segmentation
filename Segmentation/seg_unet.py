@@ -4,6 +4,7 @@ import napari
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
@@ -11,48 +12,47 @@ from typing import Tuple
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from typing import cast
+from typing import Any
+from typing import List
+import timm
 
 # TODO: early stopping, data augmentation modificata, sperimentazioni sul modello
 
 from data_utils import ComuneType, SegmentationMultiDataset, SegmentationSingleDataset
 
 PATCH_SIZE = 256
-NUM_PATCHES = 4000
-BATCH_SIZE = 16
-NUM_EPOCHS = 60
+NUM_PATCHES = 4000  # 2000
+BATCH_SIZE = 8
+NUM_EPOCHS = 60  # 120
+LR = 1e-3
 
 
 class DoubleConv(nn.Module):
     """Blocco di doppia convoluzione utilizzato in U-Net."""
 
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(self, in_channels: int, out_channels: int, groupnorm: bool = False):
         super(DoubleConv, self).__init__()
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
+            (
+                nn.BatchNorm2d(out_channels)
+                if not groupnorm
+                else nn.GroupNorm(8, out_channels)
+            ),
             nn.ReLU(inplace=True),
             nn.Conv2d(
                 out_channels, out_channels, kernel_size=3, padding=1
             ),  # La seconda convoluzione mantiene la dimensione dei canali
-            nn.BatchNorm2d(out_channels),
+            (
+                nn.BatchNorm2d(out_channels)
+                if not groupnorm
+                else nn.GroupNorm(8, out_channels)
+            ),
             nn.ReLU(inplace=True),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.double_conv(x)
-
-
-class Down(nn.Module):
-    """Downscaling con maxpool seguito da doppia convoluzione."""
-
-    def __init__(self, in_channels: int, out_channels: int):
-        super(Down, self).__init__()
-        self.pool_conv = nn.Sequential(
-            nn.MaxPool2d(2), DoubleConv(in_channels, out_channels)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.pool_conv(x)
 
 
 class AttentionGate(nn.Module):
@@ -86,11 +86,6 @@ class AttentionGate(nn.Module):
         )
 
         self._init_open()
-        # Accumulatori aggregati
-        self._alpha_sum: float = 0.0
-        self._alpha_count: int = 0
-        self._alpha_min: float = float("inf")
-        self._alpha_max: float = float("-inf")
 
     def _init_open(self):
         # Piccole proiezioni e bias della psi alto → alpha≈1 all’inizio
@@ -121,25 +116,26 @@ class AttentionGate(nn.Module):
                 float(a.min().item()),
                 float(a.max().item()),
             )
-            # Accumulo aggregato per tutta la validazione (se abilitato)
-            if getattr(self, "_collect_alpha", False):
-                self._alpha_sum += float(a.sum().item())
-                self._alpha_count += int(a.numel())
-                self._alpha_min = min(self._alpha_min, float(a.min().item()))
-                self._alpha_max = max(self._alpha_max, float(a.max().item()))
         return x * alpha  # applica il gate
 
-    def reset_alpha_aggregate(self) -> None:
-        self._alpha_sum = 0.0
-        self._alpha_count = 0
-        self._alpha_min = float("inf")
-        self._alpha_max = float("-inf")
+
+class Down(nn.Module):
+    """Downscaling con maxpool seguito da doppia convoluzione."""
+
+    def __init__(self, in_channels: int, out_channels: int, groupnorm: bool = False):
+        super(Down, self).__init__()
+        self.pool_conv = nn.Sequential(
+            nn.MaxPool2d(2), DoubleConv(in_channels, out_channels, groupnorm=groupnorm)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.pool_conv(x)
 
 
 class Up(nn.Module):
     """Upscaling seguito da doppia convoluzione."""
 
-    def __init__(self, in_channels: int, out_channels: int, attention: bool = False):
+    def __init__(self, in_channels: int, out_channels: int, attention: bool = False, groupnorm: bool = False):
         super(Up, self).__init__()
 
         self.up = nn.ConvTranspose2d(
@@ -160,7 +156,7 @@ class Up(nn.Module):
                 inter_channels=inter,
             )
 
-        self.conv = DoubleConv(in_channels, out_channels)
+        self.conv = DoubleConv(in_channels, out_channels, groupnorm=groupnorm)
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         x1 = self.up(x1)
@@ -228,23 +224,23 @@ class UNet(nn.Module):
 
 
 class AttentionUNet(nn.Module):
-    """Modello U-Net per segmentazione."""
+    """Modello Attention U-Net per segmentazione."""
 
     def __init__(self, n_channels: int, n_classes: int):
         super(AttentionUNet, self).__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
 
-        self.in_conv = DoubleConv(n_channels, 64)
-        self.down1 = Down(64, 128)
-        self.down2 = Down(128, 256)
-        self.down3 = Down(256, 512)
-        self.down4 = Down(512, 1024)
-        self.up1 = Up(1024, 512, True)
-        self.up2 = Up(512, 256, True)
-        self.up3 = Up(256, 128, True)
-        self.up4 = Up(128, 64, True)
-        self.outc = OutConv(64, n_classes)
+        self.in_conv = DoubleConv(n_channels, 48)
+        self.down1 = Down(48, 96)
+        self.down2 = Down(96, 192)
+        self.down3 = Down(192, 384)
+        self.down4 = Down(384, 768)
+        self.up1 = Up(768, 384, attention=True)
+        self.up2 = Up(384, 192, attention=True)
+        self.up3 = Up(192, 96, attention=True)
+        self.up4 = Up(96, 48, attention=True)
+        self.outc = OutConv(48, n_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x1 = self.in_conv(x)
@@ -260,21 +256,91 @@ class AttentionUNet(nn.Module):
         return logits
 
 
+class SwinUNet(nn.Module):
+    """
+    Swin U-Net: encoder gerarchico Swin Transformer (timm) + decoder U-Net.
+    Basato su "Swin-Unet: Unet-like Pure Transformer for Medical Image Segmentation" (https://arxiv.org/abs/2105.05537)
+    """
+
+    def __init__(
+        self,
+        n_channels: int,
+        n_classes: int,
+        backbone_name: str = "swin_tiny_patch4_window7_224",
+        out_indices: tuple[int, int, int, int] = (0, 1, 2, 3),
+    ) -> None:
+        super().__init__()
+
+        # Crea backbone che restituisce le feature intermedie (stride 2,4,8,16)
+        t = cast(Any, timm)
+        self.backbone = t.create_model(
+            backbone_name,
+            features_only=True,
+            pretrained=False,
+            in_chans=n_channels,
+            out_indices=out_indices,
+            img_size=PATCH_SIZE,
+            drop_path_rate=0.1,
+            patch_size=2,
+        )
+
+        chs_list = cast(List[int], self.backbone.feature_info.channels())  # type: ignore[attr-defined]
+
+        self.chs: tuple[int, int, int, int] = (
+            chs_list[out_indices[0]],
+            chs_list[out_indices[1]],
+            chs_list[out_indices[2]],
+            chs_list[out_indices[3]],
+        )
+
+        # Decoder: 1/16 -> 1/8 -> 1/4 -> 1/2 -> 1×
+        self.up3 = Up(self.chs[3], self.chs[2], groupnorm=True)
+        self.up2 = Up(self.chs[2], self.chs[1], groupnorm=True)
+        self.up1 = Up(self.chs[1], self.chs[0], groupnorm=True)
+        up0_ch = self.chs[0] // 2
+        self.up0 = Up(self.chs[0], up0_ch)
+
+        # la backbone non genera feature a piena risoluzione che è la prima skip della unet
+        self.stem0 = DoubleConv(n_channels, 48, groupnorm=True)
+
+        # Testa di segmentazione
+        self.seg_head = nn.Conv2d(up0_ch, n_classes, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # feature maps da backbone (1/2, 1/4, 1/8, 1/16)
+        f1, f2, f3, f4 = self.backbone(x)
+        s0 = self.stem0(x)  # 1×
+
+        def _to_nchw(t: torch.Tensor, exp_c: int) -> torch.Tensor:
+            # Se dim canali non è in dim=1 ma è in dim=-1, permuta
+            if t.ndim == 4 and t.shape[1] != exp_c and t.shape[-1] == exp_c:
+                return t.permute(0, 3, 1, 2).contiguous()
+            return t
+
+        f1 = _to_nchw(f1, self.chs[0])
+        f2 = _to_nchw(f2, self.chs[1])
+        f3 = _to_nchw(f3, self.chs[2])
+        f4 = _to_nchw(f4, self.chs[3])
+
+        # Decoder
+        x = self.up3(f4, f3)  # -> 1/8
+        x = self.up2(x, f2)  # -> 1/4
+        x = self.up1(x, f1)  # -> 1/2
+        x = self.up0(x, s0)  # -> 1
+
+        logits = self.seg_head(x)
+        return logits
+
+
 def log_attention_stats(model: nn.Module, prefix: str = "") -> None:
     """Stampa statistiche delle mappe di attenzione (mean/min/max) per ogni gate."""
     idx = 0
     for m in model.modules():
-        if isinstance(m, AttentionGate):
-            # Preferisci statistiche aggregate se presenti
-            if hasattr(m, "_alpha_count") and getattr(m, "_alpha_count") > 0:
-                mean_ = m._alpha_sum / max(1, m._alpha_count)
-                min_ = m._alpha_min
-                max_ = m._alpha_max
-            elif hasattr(m, "_alpha_stats"):
-                mean_, min_, max_ = m._alpha_stats
-            else:
-                continue
-            print(f"{prefix}AttnGate[{idx}]: mean={mean_:.3f} min={min_:.3f} max={max_:.3f}")
+        if isinstance(m, AttentionGate) and hasattr(m, "_alpha_stats"):
+            mean_, min_, max_ = m._alpha_stats
+            print(
+                f"{prefix}AttnGate[{idx}]: mean={mean_:.3f} min={min_:.3f} max={max_:.3f}"
+            )
             idx += 1
 
 
@@ -348,11 +414,10 @@ def train_model(
             f"Epoch [{epoch+1}/{num_epochs}], Average Loss: {train_loss:.6f}, Validation Loss: {val_loss:.6f}, Validation IoU: {val_iou:.6f}, Validation Dice: {dice_score:.6f}, Overall Accuracy: {oa:.6f}, LR: {current_lr:.2e}"
         )
 
-        # Rimosso: logging non aggregato post-epoch (si logga già in evaluate_model)
-        # log_attention_stats(model, prefix=f"Epoch {epoch+1}: ")
+        log_attention_stats(model, prefix=f"Epoch {epoch+1}: ")
 
         # Salvataggio del modello migliore
-        if val_iou > best_iou and epoch > 30:
+        if val_iou > best_iou and epoch > 10:
             best_iou = val_iou
             print(
                 f"New best model found at epoch {epoch+1} with average IoU {best_iou:.6f}"
@@ -400,11 +465,6 @@ def evaluate_model(
         np.zeros((2, 2), dtype=np.float32) if return_confusion_matrix else None
     )
 
-    # Abilita raccolta aggregata alpha sugli AttentionGate e resetta accumulatori
-    for m in model.modules():
-        if isinstance(m, AttentionGate):
-            m.reset_alpha_aggregate()
-
     with torch.no_grad():
         for input, labels in dataloader:
             input = input.to(device)
@@ -435,12 +495,6 @@ def evaluate_model(
             correct_sum += correct
             total = preds.numel()
             total_pixels += total
-
-    # Log statistiche aggregate su tutta la validazione e disabilita raccolta
-    log_attention_stats(model, prefix="Alpha stats (val) - ")
-    for m in model.modules():
-        if isinstance(m, AttentionGate):
-            m.reset_alpha_aggregate()
 
     val_loss = total_loss_sum / max(1, num_samples)
     iou = intersection_sum / union_sum if union_sum > 0 else 1.0
@@ -570,6 +624,7 @@ def main():
             train_dataset,
             batch_size=BATCH_SIZE,
             shuffle=True,
+            drop_last=True,
             # Parallelizziamo la generazione dei batch
             num_workers=0,
             worker_init_fn=seed_workers,
@@ -588,15 +643,39 @@ def main():
 
         # Creazione
         print("Creating model...")
-        model = AttentionUNet(n_channels=n_channels_in, n_classes=n_channels_out).to(
-            device
-        )
+        model = SwinUNet(n_channels=n_channels_in, n_classes=n_channels_out).to(device)
         total_params = sum(p.numel() for p in model.parameters())
         print(f"Parametri totali: {total_params:,}")
 
         # Loss and optimizer
         criterion = nn.BCEWithLogitsLoss()
-        optimizer = optim.AdamW(model.parameters())
+        if isinstance(model, SwinUNet):
+            bb_params = [
+                p
+                for n, p in model.named_parameters()
+                if n.startswith("backbone") and p.requires_grad
+            ]
+            dec_params = [
+                p
+                for n, p in model.named_parameters()
+                if not n.startswith("backbone") and p.requires_grad
+            ]
+            optimizer = optim.AdamW(
+                [
+                    {
+                        "params": bb_params,
+                        "lr": LR * 0.3,
+                        "weight_decay": 5e-2,
+                    },  # backbone più conservativo
+                    {
+                        "params": dec_params,
+                        "lr": LR,
+                        "weight_decay": 1e-2,
+                    },  # decoder/head
+                ]
+            )
+        else:
+            optimizer = optim.AdamW(model.parameters(), lr=LR)
         scheduler = ReduceLROnPlateau(
             optimizer,
             mode="min",
