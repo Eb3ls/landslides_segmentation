@@ -289,6 +289,7 @@ def composite_loss(
 def train_model(
     model: nn.Module,
     dataloader: DataLoader,
+    eval_dataloader: DataLoader,
     device: torch.device,
     config: Config,
     params_override: Optional[list[nn.Parameter]] = None,
@@ -312,16 +313,17 @@ def train_model(
     optimizer = optim.AdamW(opt_params, lr=2e-4, weight_decay=0, betas=(0.9, 0.999))
 
     total_steps = config.train.epochs * len(dataloader) // accumulation_steps
-    # milestones = [
-    #     int(0.5 * total_steps),
-    #     int(0.75 * total_steps),
-    #     int(0.9 * total_steps),
-    # ]
-    # scheduler = optim.lr_scheduler.MultiStepLR(
-    #     optimizer,
-    #     milestones=milestones,
-    #     gamma=0.5,
-    # )
+    milestones = [
+        int(0.3 * total_steps),
+        int(0.5 * total_steps),
+        int(0.75 * total_steps),
+        int(0.9 * total_steps),
+    ]
+    scheduler = optim.lr_scheduler.MultiStepLR(
+        optimizer,
+        milestones=milestones,
+        gamma=0.5,
+    )
     steps_per_epoch = len(dataloader) // accumulation_steps
 
     # scheduler = optim.lr_scheduler.OneCycleLR(
@@ -338,22 +340,22 @@ def train_model(
     #     cycle_momentum=False,  # Gestito da AdamW
     # )
 
-    warmup_epochs = 0.1 * config.train.epochs
-    warmup_steps = int(warmup_epochs * steps_per_epoch)
+    # warmup_epochs = 0.1 * config.train.epochs
+    # warmup_steps = int(warmup_epochs * steps_per_epoch)
 
-    warmup = optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=1 / 10, end_factor=1.0, total_iters=warmup_steps
-    )
-    cosine = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=total_steps - warmup_steps,
-        eta_min=1e-5,
-    )
-    scheduler = optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup, cosine],
-        milestones=[warmup_steps],
-    )
+    # warmup = optim.lr_scheduler.LinearLR(
+    #     optimizer, start_factor=1 / 10, end_factor=1.0, total_iters=warmup_steps
+    # )
+    # cosine = optim.lr_scheduler.CosineAnnealingLR(
+    #     optimizer,
+    #     T_max=total_steps - warmup_steps,
+    #     eta_min=1e-5,
+    # )
+    # scheduler = optim.lr_scheduler.SequentialLR(
+    #     optimizer,
+    #     schedulers=[warmup, cosine],
+    #     milestones=[warmup_steps],
+    # )
 
     print("Total updates:", total_steps, "and each epoch:", steps_per_epoch)
     # print("Warmup steps:", warmup_steps, "cosine steps:", total_steps - warmup_steps)
@@ -365,8 +367,13 @@ def train_model(
     for k in active_losses:
         tracking[k] = []
     tracking["lr"] = []
+    tracking["psnr_total"] = []
+    tracking["psnr_rgb"] = []
+    tracking["psnr_nir"] = []
 
     model.train()
+
+    psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
 
     for epoch in range(config.train.epochs):
         accumulators = {k: 0.0 for k in ["total", *active_losses]}
@@ -424,6 +431,33 @@ def train_model(
             f"Epoch [{epoch+1}/{config.train.epochs}] | avg tot: {tracking['total'][-1]:.6f} "
             f"| lr: {optimizer.param_groups[0]['lr']:.6e} | {comps_log}"
         )
+
+        # Valutazione ad ogni epoca psnr only
+        psnr_total = 0.0
+        psnr_rgb = 0.0
+        psnr_nir = 0.0
+
+        model.eval()
+        with torch.no_grad():
+            for low_res, high_res in eval_dataloader:
+                low_res = low_res.to(device)
+                high_res = high_res.to(device)
+
+                outputs = model(low_res)
+                if isinstance(outputs, tuple):
+                    outputs, _ = outputs
+
+                psnr_total += psnr_metric(outputs, high_res).item()
+                psnr_rgb += psnr_metric(
+                    outputs[:, :3, :, :], high_res[:, :3, :, :]
+                ).item()
+                psnr_nir += psnr_metric(
+                    outputs[:, 3:, :, :], high_res[:, 3:, :, :]
+                ).item()
+        num_batches = len(eval_dataloader)
+        tracking["psnr_total"].append(psnr_total / num_batches)
+        tracking["psnr_rgb"].append(psnr_rgb / num_batches)
+        tracking["psnr_nir"].append(psnr_nir / num_batches)
 
     return tracking
 
@@ -534,7 +568,7 @@ def visualize_predictions(
             pred = pred.squeeze(0).cpu()
 
             # Reupscaliamo l'immagine a bassa risoluzione per avere un confronto diretto
-            low_res = torch.nn.functional.interpolate(
+            low_res_upscale = torch.nn.functional.interpolate(
                 low_res.unsqueeze(0),
                 scale_factor=config.model.scale,
                 mode="bilinear",
@@ -543,6 +577,7 @@ def visualize_predictions(
 
             # Converti a numpy per visualizzazione
             low_res_np = low_res.cpu().numpy()
+            low_res_upscale_np = low_res_upscale.cpu().numpy()
             high_res_np = high_res.cpu().numpy()
             pred_np = pred.numpy()
 
@@ -554,34 +589,68 @@ def visualize_predictions(
 
             # RGB
             low_rgb = low_res_np[:3, :, :]
+            low_upscale_rgb = low_res_upscale_np[:3, :, :]
             high_rgb = high_res_np[:3, :, :]
             pred_rgb = pred_np[:3, :, :]
             low_rgb = low_rgb.transpose(1, 2, 0)
+            low_upscale_rgb = low_upscale_rgb.transpose(1, 2, 0)
             high_rgb = high_rgb.transpose(1, 2, 0)
             pred_rgb = pred_rgb.transpose(1, 2, 0)
 
             # NIR
             low_nir = low_res_np[3, :, :]
+            low_upscale_nir = low_res_upscale_np[3, :, :]
             high_nir = high_res_np[3, :, :]
             pred_nir = pred_np[3, :, :]
 
-            images.append((low_rgb, high_rgb, pred_rgb, low_nir, high_nir, pred_nir))
+            images.append(
+                (
+                    low_rgb,
+                    low_upscale_rgb,
+                    high_rgb,
+                    pred_rgb,
+                    low_nir,
+                    low_upscale_nir,
+                    high_nir,
+                    pred_nir,
+                )
+            )
 
     if config.test.run_napari:
         viewer = napari.Viewer()
         for img_set in images:
-            low_rgb, high_rgb, pred_rgb, low_nir, high_nir, pred_nir = img_set
+            (
+                low_rgb,
+                low_upscale_rgb,
+                high_rgb,
+                pred_rgb,
+                low_nir,
+                low_upscale_nir,
+                high_nir,
+                pred_nir,
+            ) = img_set
             viewer.add_image(low_rgb, name="Low Resolution RGB")
+            viewer.add_image(low_upscale_rgb, name="Low Upscale RGB")
             viewer.add_image(high_rgb, name="High Resolution RGB")
             viewer.add_image(pred_rgb, name="Predicted RGB")
             viewer.add_image(low_nir, name="Low Resolution NIR")
+            viewer.add_image(low_upscale_nir, name="Low Upscale NIR")
             viewer.add_image(high_nir, name="High Resolution NIR")
             viewer.add_image(pred_nir, name="Predicted NIR")
         napari.run()
 
     # Salviamo le immagini come file PNG
     for i, img_set in enumerate(images):
-        low_rgb, high_rgb, pred_rgb, low_nir, high_nir, pred_nir = img_set
+        (
+            low_rgb,
+            low_upscale_rgb,
+            high_rgb,
+            pred_rgb,
+            low_nir,
+            low_upscale_nir,
+            high_nir,
+            pred_nir,
+        ) = img_set
         plt.figure(figsize=(15, 10))
 
         plt.subplot(2, 3, 1)
@@ -798,7 +867,12 @@ def launch_all(
         # Allenamento
         print("Starting training...")
         losses = train_model(
-            model, train_loader, device, config, params_override=trainable_params
+            model,
+            train_loader,
+            test_loader,
+            device,
+            config,
+            params_override=trainable_params,
         )
 
         # Plot dinamico solo delle componenti attive
@@ -831,6 +905,40 @@ def launch_all(
 
         plt.tight_layout()
         plt.savefig(f"{config.model.dir_path}{config.model.name}/loss.png")
+        if config.test.run_napari:
+            plt.show()
+
+        n_plots = 3
+        cols = 3
+        rows = (n_plots + cols - 1) // cols
+        _, axs = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), sharex=True)
+        axs = np.atleast_1d(axs).ravel()
+        axs[0].set_title("PSNR")
+        axs[0].set_xlabel("Epoch")
+        axs[0].set_ylabel("PSNR (dB)")
+        axs[0].grid(True)
+        axs[0].legend()
+
+        axs[0].plot(losses["psnr_total"], label="Total (RGB+NIR)")
+        axs[1].plot(losses["psnr_rgb"], label="RGB")
+        axs[1].set_title("PSNR RGB")
+        axs[1].set_xlabel("Epoch")
+        axs[1].set_ylabel("PSNR (dB)")
+        axs[1].grid(True)
+        axs[1].legend()
+
+        axs[2].plot(losses["psnr_nir"], label="NIR")
+        axs[2].set_title("PSNR NIR")
+        axs[2].set_xlabel("Epoch")
+        axs[2].set_ylabel("PSNR (dB)")
+        axs[2].grid(True)
+        axs[2].legend()
+
+        for j in range(3, len(axs)):
+            axs[j].axis("off")
+
+        plt.tight_layout()
+        plt.savefig(f"{config.model.dir_path}{config.model.name}/psnr.png")
         if config.test.run_napari:
             plt.show()
 

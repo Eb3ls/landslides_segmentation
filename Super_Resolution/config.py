@@ -77,6 +77,7 @@ class DRCTModelConfig(ModelConfig):
     upsampler: str
     resi_connection: Literal["1conv", "3conv"]
     gc: int
+    MoE_config: dict
 
 
 @dataclass

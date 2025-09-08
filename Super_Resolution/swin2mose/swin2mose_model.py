@@ -9,16 +9,13 @@ from torch import nn, Tensor
 
 from typing import Literal, cast
 
-from timm.layers.drop import DropPath
 from timm.layers.weight_init import trunc_normal_
 
-from Super_Resolution.config import ConfigSwin2Mose
+from Super_Resolution.config import Config, ConfigSwin2Mose, Swin2MoseModelConfig
 from Super_Resolution.swin2mose.moe import MoE
 from Super_Resolution.models_functions import (
     PatchEmbed,
     PatchUnEmbed,
-    Upsample,
-    Upsample_hf,
     UpsampleOneStep,
     get_resi_connection,
     window_partition,
@@ -463,7 +460,7 @@ class RSTB(nn.Module):
 class Swin2MoSE(nn.Module):
     def __init__(
         self,
-        cfg: ConfigSwin2Mose,
+        cfg: Config[Swin2MoseModelConfig],
         norm_layer=nn.LayerNorm,
         dropout_rate: float = 0.0,
         # Parametri erediati da SwinTransformer, lascio default

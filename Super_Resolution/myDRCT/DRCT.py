@@ -272,8 +272,6 @@ class WindowAttention(nn.Module):
         # Applicata ai vettori dell'ultima dimensione
         self.softmax = nn.Softmax(dim=-1)
 
-        self.register_buffer("relative_coords_table", relative_coords_table)
-
     def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
         """
         Args:
@@ -664,11 +662,11 @@ class PatchEmbed(nn.Module):
         self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None
     ):
         super().__init__()
-        img_size = to_2tuple(img_size)
-        patch_size = to_2tuple(patch_size)
+        img_size_tuple: tuple = to_2tuple(img_size)
+        patch_size_tuple: tuple = to_2tuple(patch_size)
         patches_resolution = [
-            img_size[0] // patch_size[0],
-            img_size[1] // patch_size[1],
+            img_size_tuple[0] // patch_size_tuple[0],
+            img_size_tuple[1] // patch_size_tuple[1],
         ]
         self.img_size = img_size
         self.patch_size = patch_size
@@ -705,11 +703,13 @@ class PatchUnEmbed(nn.Module):
         self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None
     ):
         super().__init__()
-        img_size = to_2tuple(img_size)  # 图像的大小，默认为 224*224
-        patch_size = to_2tuple(patch_size)  # Patch token 的大小，默认为 4*4
+        img_size_tuple: tuple = to_2tuple(img_size)  # 图像的大小，默认为 224*224
+        patch_size_tuple: tuple = to_2tuple(
+            patch_size
+        )  # Patch token 的大小，默认为 4*4
         patches_resolution = [
-            img_size[0] // patch_size[0],
-            img_size[1] // patch_size[1],
+            img_size_tuple[0] // patch_size_tuple[0],
+            img_size_tuple[1] // patch_size_tuple[1],
         ]  # patch 的分辨率
         self.img_size = img_size
         self.patch_size = patch_size
