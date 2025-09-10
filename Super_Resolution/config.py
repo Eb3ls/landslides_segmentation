@@ -1,5 +1,6 @@
 import os
 import yaml
+import json
 from dataclasses import dataclass
 from typing import Literal, TypeVar, Generic, Type, Union
 from abc import ABC, abstractmethod
@@ -12,6 +13,7 @@ class ModelConfig:
     dir_path: str
     scale: int
     img_size: int
+    # Note: per-channel normalization stats (mean/std) are attached dynamically on the instance if available
 
 
 @dataclass
@@ -178,6 +180,28 @@ class Config(Generic[M]):
         model_dir = os.path.join(self.model.dir_path, self.model.name)
         if not os.path.exists(model_dir):
             os.makedirs(model_dir)
+
+        # Attribuisce dinamicamente self.model.mean/std
+        stats_file = "Super_Resolution/channel_stats.json"
+
+        if not stats_file or not os.path.isfile(stats_file):
+            raise FileNotFoundError(
+                f"Channel stats file not found at {stats_file}. Please run calc_mean.py first."
+            )
+
+        with open(stats_file, "r", encoding="utf-8") as f:
+            stats = json.load(f)
+        mean = stats.get("mean")
+        if mean is None:
+            raise ValueError("mean not found in stats")
+        std = stats.get("std")
+        if std is None:
+            raise ValueError("std not found in stats")
+
+        setattr(self.model, "mean", mean)
+        setattr(self.model, "std", std)
+
+        print(f"Loaded channel stats from {stats_file}:\n mean={mean}\n std={std}\n")
 
     def __repr__(self):
         return f"Config(model={self.model}, train={self.train}, test={self.test})"

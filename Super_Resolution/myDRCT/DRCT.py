@@ -785,6 +785,8 @@ class DRCT(nn.Module):
 
         num_in_ch = in_chans
         num_out_ch = in_chans
+        self.mean = torch.Tensor(config.model.mean).view(1, in_chans, 1, 1)
+        self.std = torch.Tensor(config.model.std).view(1, in_chans, 1, 1)
         self.upscale = upscale
         self.upsampler = upsampler
 
@@ -961,6 +963,11 @@ class DRCT(nn.Module):
         return x
 
     def forward(self, x):
+        # Normalizzazione
+        self.mean = self.mean.type_as(x)
+        self.std = self.std.type_as(x)
+        x = (x - self.mean) / (self.std)
+
         if self.upsampler == "pixelshuffle":
             x = self.conv_first(x)
             x = self.conv_after_body(self.forward_features(x)) + x
@@ -1041,6 +1048,10 @@ class DRCT(nn.Module):
             x = self.conv_first(x)
             x = self.conv_after_body(self.forward_features(x)) + x
             x = self.tail(x)
+
+        # Denormalizzazione
+        x = x * (self.std) + self.mean
+
         return x
 
 

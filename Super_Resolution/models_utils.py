@@ -10,7 +10,7 @@ import os
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from dataclasses import asdict
-from typing import Optional
+from typing import Optional, Sequence, Tuple
 
 from pytorch_msssim import ms_ssim
 from torchmetrics.image import (
@@ -94,6 +94,43 @@ def charbonnier_loss(
 
 # Cache dei kernel Sobel per evitare ricreazioni continue
 _SOBEL_KERNELS: dict[str, torch.Tensor] | None = None
+
+
+def _cc_single_torch(
+    raw_tensor: torch.Tensor, dst_tensor: torch.Tensor, eps: float = 1e-8
+) -> torch.Tensor:
+    """
+    Pearson Normalized Cross-Correlation per-sample e per-canale.
+    Input: (B,C,H,W) oppure (C,H,W) (in tal caso viene aggiunta B=1).
+    Ritorna: media su canali e batch (scalare in [-1,1]).
+    """
+    if raw_tensor.dim() == 3:
+        raw_tensor = raw_tensor.unsqueeze(0)
+        dst_tensor = dst_tensor.unsqueeze(0)
+
+    assert raw_tensor.shape == dst_tensor.shape, "sr e hr devono avere la stessa shape"
+    B, C, H, W = raw_tensor.shape
+
+    # usa fp32 per stabilità, poi restituisci fp16 se servisse a monte
+    dtype_out = raw_tensor.dtype
+    x = raw_tensor.float().view(B, C, -1)  # (B,C,N)
+    y = dst_tensor.float().view(B, C, -1)
+
+    x = x - x.mean(dim=2, keepdim=True)
+    y = y - y.mean(dim=2, keepdim=True)
+
+    num = (x * y).sum(dim=2)  # (B,C)
+    den = torch.sqrt((x.square().sum(dim=2) * y.square().sum(dim=2)) + eps)  # (B,C)
+    cc_bc = num / (den + eps)  # (B,C) in [-1,1] (clamped numericamente)
+    cc_b = cc_bc.mean(dim=1)  # (B,)
+    cc = cc_b.mean()  # scalare
+    return cc.to(dtype_out)
+
+
+def ncc_loss(sr: torch.Tensor, hr: torch.Tensor) -> torch.Tensor:
+    cc_value = _cc_single_torch(sr, hr)
+    # mappa [-1,1] -> [1,0]
+    return 1.0 - 0.5 * (cc_value + 1.0)
 
 
 def _get_sobel_kernels(
@@ -203,6 +240,7 @@ def _get_lpips_loss(device: torch.device) -> LearnedPerceptualImagePatchSimilari
     """Ottieni o crea LPIPS (VGG) sul device corretto per usarlo come loss."""
     global _LPIPS_LOSS
     if _LPIPS_LOSS is None or _LPIPS_LOSS.device != device:
+        print("Creating LPIPS loss module on device", device)
         _LPIPS_LOSS = LearnedPerceptualImagePatchSimilarity(
             net_type="vgg", normalize=True
         ).to(device)
@@ -227,12 +265,25 @@ def composite_loss(
 
     comps: dict[str, torch.Tensor] = {}
 
+    # HR sappiamo giá essere in [0,1]
+    sr_clamped = torch.clamp(sr, 0.0, 1.0)
+
     # Charbonnier
     if weights.get("charb", 0.0) > 0:
+        w_rgb = 1.0
+        w_nir = w_rgb / 2
         charb_v_rgb = charbonnier_loss(sr[:, :3], hr[:, :3])
-        charb_v_nir = charbonnier_loss(sr[:, 3:], hr[:, 3:])
-        avg = 0.7 * charb_v_rgb + 0.3 * charb_v_nir
-        comps["charb"] = weights["charb"] * avg
+        if sr.shape[1] > 3:
+            charb_v_nir = charbonnier_loss(sr[:, 3:], hr[:, 3:])
+        else:
+            charb_v_nir = torch.tensor(0.0, device=sr.device, dtype=sr.dtype)
+        comps["charb_rgb"] = w_rgb * charb_v_rgb
+        comps["charb_nir"] = w_nir * charb_v_nir
+        comps["charb"] = comps["charb_rgb"] + comps["charb_nir"]
+
+    if weights.get("ncc", 0.0) > 0:
+        ncc_v = ncc_loss(sr, hr)
+        comps["ncc"] = weights["ncc"] * ncc_v
 
     # High-Frequency loss (blur-subtraction)
     if weights.get("hf", 0.0) > 0:
@@ -245,28 +296,20 @@ def composite_loss(
         comps["sobel"] = weights["sobel"] * grad_v
 
     if weights.get("ssim", 0.0) > 0:
-        # MS-SSIM richiede [0,1]; clamp solo per questo termine
         ssim_v = 1 - ms_ssim(
-            torch.clamp(sr[:, :3, :, :], 0.0, 1.0),
-            torch.clamp(hr[:, :3, :, :], 0.0, 1.0),
+            sr_clamped[:, :3, :, :],
+            hr[:, :3, :, :],
             data_range=1.0,
             weights=[0.5, 0.5],
         )
         comps["ssim"] = weights["ssim"] * ssim_v
 
     if weights.get("tv", 0.0) > 0:
-        sr_clamp = torch.clamp(sr, 0.0, 1.0)
-        comps["tv"] = weights["tv"] * total_variation_loss(sr_clamp)
+        comps["tv"] = weights["tv"] * total_variation_loss(sr)
 
-    # LPIPS (solo RGB, clamped [0,1])
     if weights.get("lpips", 0.0) > 0:
         lpips_module = _get_lpips_loss(sr.device)
-        # Usa solo i primi 3 canali (RGB), clamp in [0,1]
-        sr_rgb = sr[:, :3, :, :]
-        hr_rgb = hr[:, :3, :, :]
-        sr_rgb = torch.clamp(sr_rgb, 0.0, 1.0)
-        hr_rgb = torch.clamp(hr_rgb, 0.0, 1.0)
-        lpips_v = lpips_module(sr_rgb, hr_rgb)
+        lpips_v = lpips_module(sr_clamped[:, :3, :, :], hr[:, :3, :, :])
         comps["lpips"] = weights["lpips"] * lpips_v
 
     # MoE
@@ -277,11 +320,7 @@ def composite_loss(
             moe_loss_tensor = moe_loss.to(device=sr.device, dtype=sr.dtype)
         comps["moe"] = weights["moe"] * moe_loss_tensor
 
-    total = (
-        torch.stack([v for v in comps.values()]).sum()
-        if comps
-        else torch.tensor(0.0, device=sr.device, dtype=sr.dtype)
-    )
+    total = torch.stack([v for v in comps.values()]).sum()
 
     return total, comps
 
@@ -310,20 +349,20 @@ def train_model(
         if params_override is not None
         else [p for p in model.parameters() if p.requires_grad]
     )
-    optimizer = optim.AdamW(opt_params, lr=2e-4, weight_decay=0, betas=(0.9, 0.999))
+    optimizer = optim.AdamW(opt_params, lr=2e-4, weight_decay=1e-4, betas=(0.9, 0.999))
 
     total_steps = config.train.epochs * len(dataloader) // accumulation_steps
-    milestones = [
-        int(0.3 * total_steps),
-        int(0.5 * total_steps),
-        int(0.75 * total_steps),
-        int(0.9 * total_steps),
-    ]
-    scheduler = optim.lr_scheduler.MultiStepLR(
-        optimizer,
-        milestones=milestones,
-        gamma=0.5,
-    )
+    # milestones = [
+    #     int(0.3 * total_steps),
+    #     int(0.5 * total_steps),
+    #     int(0.75 * total_steps),
+    #     int(0.9 * total_steps),
+    # ]
+    # scheduler = optim.lr_scheduler.MultiStepLR(
+    #     optimizer,
+    #     milestones=milestones,
+    #     gamma=0.5,
+    # )
     steps_per_epoch = len(dataloader) // accumulation_steps
 
     # scheduler = optim.lr_scheduler.OneCycleLR(
@@ -334,33 +373,34 @@ def train_model(
     #     pct_start=0.2,
     #     anneal_strategy="cos",
     #     div_factor=25.0,  # Lr iniziale = max_lr / div_factor
-    #     final_div_factor=1000,  # Lr finale = max_lr / final_div_factor
+    #     final_div_factor=100,  # Lr finale = max_lr / final_div_factor
     #     three_phase=False,  # solo salita e discesa
     #     last_epoch=-1,  # inizia da 0
     #     cycle_momentum=False,  # Gestito da AdamW
     # )
 
-    # warmup_epochs = 0.1 * config.train.epochs
-    # warmup_steps = int(warmup_epochs * steps_per_epoch)
+    warmup_epochs = 0.1 * config.train.epochs
+    warmup_steps = int(warmup_epochs * steps_per_epoch)
 
-    # warmup = optim.lr_scheduler.LinearLR(
-    #     optimizer, start_factor=1 / 10, end_factor=1.0, total_iters=warmup_steps
-    # )
-    # cosine = optim.lr_scheduler.CosineAnnealingLR(
-    #     optimizer,
-    #     T_max=total_steps - warmup_steps,
-    #     eta_min=1e-5,
-    # )
-    # scheduler = optim.lr_scheduler.SequentialLR(
-    #     optimizer,
-    #     schedulers=[warmup, cosine],
-    #     milestones=[warmup_steps],
-    # )
+    warmup = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1 / 10, end_factor=1.0, total_iters=warmup_steps
+    )
+    cosine = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps - warmup_steps,
+        eta_min=2e-5,
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_steps],
+    )
 
     print("Total updates:", total_steps, "and each epoch:", steps_per_epoch)
     # print("Warmup steps:", warmup_steps, "cosine steps:", total_steps - warmup_steps)
 
     # Prepara dizionario dinamico delle curve
+    print("All loss weights:", config.train.loss_weights)
     active_losses = [k for k, w in config.train.loss_weights.items() if w > 0]
     tracking: dict[str, list[float]] = {"total": []}
     # Aggiungiamo le loss al tracking
@@ -481,7 +521,9 @@ def evaluate_model(
     # Inizializza le metriche
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim_metric = ms_ssim
-    lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type="vgg").to(device)
+    lpips_metric = LearnedPerceptualImagePatchSimilarity(
+        net_type="vgg", normalize=True
+    ).to(device)
 
     with torch.no_grad():
         for low_res, high_res in dataloader:
@@ -504,7 +546,10 @@ def evaluate_model(
                 outputs_c[:, 3:, :, :], target_c[:, 3:, :, :]
             ).item()
             ssim_total += ssim_metric(
-                outputs_c, target_c, data_range=1.0, weights=[0.5, 0.5]
+                outputs_c[:, :3, :, :],
+                target_c[:, :3, :, :],
+                data_range=1.0,
+                weights=[0.5, 0.5],
             ).item()
 
             lpips_total += lpips_metric(
@@ -654,7 +699,7 @@ def visualize_predictions(
         plt.figure(figsize=(15, 10))
 
         plt.subplot(2, 3, 1)
-        plt.imshow(low_rgb)
+        plt.imshow(low_upscale_rgb)
         plt.title("Low Resolution RGB")
         plt.axis("off")
 
@@ -669,7 +714,7 @@ def visualize_predictions(
         plt.axis("off")
 
         plt.subplot(2, 3, 4)
-        plt.imshow(low_nir, cmap="gray")
+        plt.imshow(low_upscale_nir, cmap="gray")
         plt.title("Low Resolution NIR")
         plt.axis("off")
 
@@ -917,7 +962,6 @@ def launch_all(
         axs[0].set_xlabel("Epoch")
         axs[0].set_ylabel("PSNR (dB)")
         axs[0].grid(True)
-        axs[0].legend()
 
         axs[0].plot(losses["psnr_total"], label="Total (RGB+NIR)")
         axs[1].plot(losses["psnr_rgb"], label="RGB")
@@ -925,14 +969,12 @@ def launch_all(
         axs[1].set_xlabel("Epoch")
         axs[1].set_ylabel("PSNR (dB)")
         axs[1].grid(True)
-        axs[1].legend()
 
         axs[2].plot(losses["psnr_nir"], label="NIR")
         axs[2].set_title("PSNR NIR")
         axs[2].set_xlabel("Epoch")
         axs[2].set_ylabel("PSNR (dB)")
         axs[2].grid(True)
-        axs[2].legend()
 
         for j in range(3, len(axs)):
             axs[j].axis("off")

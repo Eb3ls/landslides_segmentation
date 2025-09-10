@@ -1,5 +1,4 @@
 import os
-from pathlib import Path
 import numpy as np
 from typing import Literal, Tuple, cast
 import rasterio
@@ -257,7 +256,10 @@ def get_segmentation_stack(
 
     for filename in os.listdir(directory):
         # Saltiamo i file non rilevanti
-        if any(substr in filename.lower() for substr in ["sentinel2", "s2", "ndvi", "slope"]):
+        if any(
+            substr in filename.lower()
+            for substr in ["sentinel2", "s2", "ndvi", "slope"]
+        ):
             continue
 
         path = os.path.join(directory, filename)
