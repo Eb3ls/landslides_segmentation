@@ -1,6 +1,8 @@
 import sys
 import os
 
+from Super_Resolution.models_functions import Upsample
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
@@ -50,12 +52,14 @@ class RCAB(nn.Module):
 class ResidualGroup(nn.Module):
     """Gruppo di blocchi Residual Channel Attention Block"""
 
-    def __init__(self, n_channels: int, reduction: int = 16, n_blocks: int = 4):
+    def __init__(self, n_channels: int, reduction: int = 16, n_blocks: int = 20):
         super(ResidualGroup, self).__init__()
         self.blocks = nn.Sequential(
             *[RCAB(n_channels, reduction) for _ in range(n_blocks)]
         )
-        self.conv = nn.Conv2d(n_channels, n_channels, kernel_size=3, padding=1)
+        self.conv = nn.Conv2d(
+            n_channels, n_channels, kernel_size=3, padding=1, padding_mode="reflect"
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -92,22 +96,8 @@ class RCAN(nn.Module):
             padding=1,
             padding_mode="reflect",
         )
-        self.conv_before_upsample = nn.Sequential(
-            nn.Conv2d(
-                self.n_channels, self.n_channels, 3, 1, 1, padding_mode="reflect"
-            ),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True),
-        )
-        self.conv_up1 = nn.Conv2d(
-            self.n_channels, self.n_channels, 3, 1, 1, padding_mode="reflect"
-        )
-        self.conv_up2 = nn.Conv2d(
-            self.n_channels, self.n_channels, 3, 1, 1, padding_mode="reflect"
-        )
-        self.conv_hr = nn.Conv2d(
-            self.n_channels, self.n_channels, 3, 1, 1, padding_mode="reflect"
-        )
-        self.conv_last = nn.Conv2d(self.n_channels, 4, 3, 1, 1, padding_mode="reflect")
+        # Replace the previous separate convs/upsample steps with a single Upsample block
+        self.upsample = Upsample(self.n_channels, out_channels=self.in_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
 
@@ -120,12 +110,7 @@ class RCAN(nn.Module):
             x = group(x)
 
         x = self.conv_after_body(x) + res
-        x = self.conv_before_upsample(x)
-        x = self.lrelu(self.conv_up1(F.interpolate(x, scale_factor=2, mode="nearest")))
-        x = self.lrelu(self.conv_up2(F.interpolate(x, scale_factor=2, mode="nearest")))
-        # Final 1.25x to reach 5x
-        x = F.interpolate(x, scale_factor=5 / 4, mode="bicubic", align_corners=False)
-        x = self.lrelu(self.conv_hr(x))
-        x = self.conv_last(x)
+
+        x = self.upsample(x)
 
         return x

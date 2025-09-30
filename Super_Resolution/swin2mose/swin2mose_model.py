@@ -11,7 +11,7 @@ from typing import Literal, cast
 
 from timm.layers.weight_init import trunc_normal_
 
-from Super_Resolution.config import Config, ConfigSwin2Mose, Swin2MoseModelConfig
+from Super_Resolution.config import Config, Swin2MoseModelConfig
 from Super_Resolution.swin2mose.moe import MoE
 from Super_Resolution.models_functions import (
     PatchEmbed,

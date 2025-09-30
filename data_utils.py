@@ -4,7 +4,6 @@ from typing import Literal, Tuple, cast
 import rasterio
 from torch import Tensor
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset
 from skimage.metrics import structural_similarity
 

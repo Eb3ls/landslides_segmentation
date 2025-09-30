@@ -10,7 +10,7 @@ import os
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from dataclasses import asdict
-from typing import Optional, Sequence, Tuple
+from typing import Optional
 
 from pytorch_msssim import ms_ssim
 from torchmetrics.image import (
@@ -352,17 +352,18 @@ def train_model(
     optimizer = optim.AdamW(opt_params, lr=2e-4, weight_decay=1e-4, betas=(0.9, 0.999))
 
     total_steps = config.train.epochs * len(dataloader) // accumulation_steps
-    # milestones = [
-    #     int(0.3 * total_steps),
-    #     int(0.5 * total_steps),
-    #     int(0.75 * total_steps),
-    #     int(0.9 * total_steps),
-    # ]
-    # scheduler = optim.lr_scheduler.MultiStepLR(
-    #     optimizer,
-    #     milestones=milestones,
-    #     gamma=0.5,
-    # )
+    milestones = [
+        int(0.30 * total_steps),
+        int(0.50 * total_steps),
+        int(0.65 * total_steps),
+        int(0.70 * total_steps),
+        int(0.75 * total_steps),
+    ]
+    scheduler = optim.lr_scheduler.MultiStepLR(
+        optimizer,
+        milestones=milestones,
+        gamma=0.5,
+    )
     steps_per_epoch = len(dataloader) // accumulation_steps
 
     # scheduler = optim.lr_scheduler.OneCycleLR(
@@ -379,22 +380,22 @@ def train_model(
     #     cycle_momentum=False,  # Gestito da AdamW
     # )
 
-    warmup_epochs = 0.1 * config.train.epochs
-    warmup_steps = int(warmup_epochs * steps_per_epoch)
+    # warmup_epochs = 0.1 * config.train.epochs
+    # warmup_steps = int(warmup_epochs * steps_per_epoch)
 
-    warmup = optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=1 / 10, end_factor=1.0, total_iters=warmup_steps
-    )
-    cosine = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=total_steps - warmup_steps,
-        eta_min=2e-5,
-    )
-    scheduler = optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup, cosine],
-        milestones=[warmup_steps],
-    )
+    # warmup = optim.lr_scheduler.LinearLR(
+    #     optimizer, start_factor=1 / 10, end_factor=1.0, total_iters=warmup_steps
+    # )
+    # cosine = optim.lr_scheduler.CosineAnnealingLR(
+    #     optimizer,
+    #     T_max=total_steps - warmup_steps,
+    #     eta_min=2e-5,
+    # )
+    # scheduler = optim.lr_scheduler.SequentialLR(
+    #     optimizer,
+    #     schedulers=[warmup, cosine],
+    #     milestones=[warmup_steps],
+    # )
 
     print("Total updates:", total_steps, "and each epoch:", steps_per_epoch)
     # print("Warmup steps:", warmup_steps, "cosine steps:", total_steps - warmup_steps)

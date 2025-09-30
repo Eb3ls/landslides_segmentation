@@ -1,6 +1,7 @@
-import math
 from typing import Literal
 from torch import Tensor, nn
+import torch
+from torch.nn import functional as F
 
 
 def window_reverse(windows: Tensor, window_size: int, H: int, W: int) -> Tensor:
@@ -145,54 +146,6 @@ class PatchUnEmbed(nn.Module):
         return x
 
 
-class Upsample(nn.Sequential):
-    """Upsample module.
-
-    Args:
-        scale (int): Scale factor. Supported scales: 2^n and 3.
-        num_feat (int): Channel number of intermediate features.
-    """
-
-    def __init__(self, scale, num_feat):
-        m = []
-        if (scale & (scale - 1)) == 0:  # scale = 2^n
-            for _ in range(int(math.log(scale, 2))):
-                m.append(nn.Conv2d(num_feat, 4 * num_feat, 3, 1, 1))
-                m.append(nn.PixelShuffle(2))
-        elif scale == 3:
-            m.append(nn.Conv2d(num_feat, 9 * num_feat, 3, 1, 1))
-            m.append(nn.PixelShuffle(3))
-        else:
-            raise ValueError(
-                f"scale {scale} is not supported. " "Supported scales: 2^n and 3."
-            )
-        super(Upsample, self).__init__(*m)
-
-
-class Upsample_hf(nn.Sequential):
-    """Upsample module.
-
-    Args:
-        scale (int): Scale factor. Supported scales: 2^n and 3.
-        num_feat (int): Channel number of intermediate features.
-    """
-
-    def __init__(self, scale, num_feat):
-        m = []
-        if (scale & (scale - 1)) == 0:  # scale = 2^n
-            for _ in range(int(math.log(scale, 2))):
-                m.append(nn.Conv2d(num_feat, 4 * num_feat, 3, 1, 1))
-                m.append(nn.PixelShuffle(2))
-        elif scale == 3:
-            m.append(nn.Conv2d(num_feat, 9 * num_feat, 3, 1, 1))
-            m.append(nn.PixelShuffle(3))
-        else:
-            raise ValueError(
-                f"scale {scale} is not supported. " "Supported scales: 2^n and 3."
-            )
-        super(Upsample_hf, self).__init__(*m)
-
-
 class UpsampleOneStep(nn.Sequential):
     """UpsampleOneStep module (the difference with Upsample is that it always only has 1conv + 1pixelshuffle)
        Used in lightweight SR to save parameters.
@@ -226,3 +179,44 @@ def get_resi_connection(
             nn.LeakyReLU(negative_slope=0.2, inplace=True),
             nn.Conv2d(dim // 4, dim, 3, 1, 1),
         )
+
+
+# Upsample Standard
+
+
+class Upsample(nn.Module):
+    def __init__(self, n_channels: int, out_channels: int = 4):
+        super(Upsample, self).__init__()
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        # conv applied before the first interpolation (keeps behavior similar to previous conv_before_upsample)
+        self.conv_pre = nn.Sequential(
+            nn.Conv2d(n_channels, n_channels, 3, 1, 1, padding_mode="reflect"),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+        )
+        # convolutions applied after each interpolation step
+        self.conv_after_1 = nn.Conv2d(
+            n_channels, n_channels, 3, 1, 1, padding_mode="reflect"
+        )
+        self.conv_after_2 = nn.Conv2d(
+            n_channels, n_channels, 3, 1, 1, padding_mode="reflect"
+        )
+        self.conv_hr = nn.Conv2d(
+            n_channels, n_channels, 3, 1, 1, padding_mode="reflect"
+        )
+        self.conv_last = nn.Conv2d(
+            n_channels, out_channels, 3, 1, 1, padding_mode="reflect"
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # First upscale by 1.25 (5/4) using bicubic
+        x = self.conv_pre(x)
+        x = F.interpolate(x, scale_factor=5 / 4, mode="bicubic", align_corners=False)
+        x = self.lrelu(self.conv_after_1(x))
+        # Then upscale by 2 (nearest) and conv
+        x = F.interpolate(x, scale_factor=2, mode="nearest")
+        x = self.lrelu(self.conv_after_2(x))
+        # Then upscale by 2 (nearest) and final convs
+        x = F.interpolate(x, scale_factor=2, mode="nearest")
+        x = self.lrelu(self.conv_hr(x))
+        x = self.conv_last(x)
+        return x
