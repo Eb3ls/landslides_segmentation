@@ -9,7 +9,9 @@ from torch.utils.data import DataLoader
 from .seg_unet import (
     UNet,
     AttentionUNet,
-    SwinUNet,
+    SwinUNet1,
+    SwinUNet2,
+    SwinUNet3,
     evaluate_model,
     visualize_results,
     seed_everything,
@@ -18,12 +20,12 @@ from .seg_unet import (
 
 from data_utils import SegmentationSingleDataset
 
-MODEL_PATH = "best_model.pth"
+MODEL_PATH = "attention_long_model.pth"
 PATCH_SIZE = 256
 NUM_PATCHES = 1000
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 FIXED_THRESHOLD = 0.5  # Non utilizzato per soglia variabile
-VIS_SAMPLES = 5
+VIS_SAMPLES = 3
 
 
 def collect_eval_probs_and_labels(model, dataloader, device):
@@ -62,7 +64,7 @@ def main():
     else:
         threshold = FIXED_THRESHOLD
 
-    seed_everything(420) # 42, 200
+    seed_everything(200) # 42, 200, 420
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -81,7 +83,7 @@ def main():
     print(f"Canali input: {n_in}  | Canali output: {n_out}")
 
     # Modello
-    model = SwinUNet(n_channels=n_in, n_classes=n_out).to(device)
+    model = AttentionUNet(n_channels=n_in, n_classes=n_out).to(device)
 
     if not os.path.isfile(MODEL_PATH):
         raise FileNotFoundError(f"Pesi non trovati: {MODEL_PATH}")

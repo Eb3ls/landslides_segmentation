@@ -22,7 +22,7 @@ from data_utils import ComuneType, SegmentationMultiDataset, SegmentationSingleD
 
 PATCH_SIZE = 256
 NUM_PATCHES = 4000  # 2000
-BATCH_SIZE = 8
+BATCH_SIZE = 16
 NUM_EPOCHS = 60  # 120
 LR = 1e-3
 
@@ -256,7 +256,7 @@ class AttentionUNet(nn.Module):
         return logits
 
 
-class SwinUNet(nn.Module):
+class SwinUNet1(nn.Module): # versione patch 2
     """
     Swin U-Net: encoder gerarchico Swin Transformer (timm) + decoder U-Net.
     Basato su "Swin-Unet: Unet-like Pure Transformer for Medical Image Segmentation" (https://arxiv.org/abs/2105.05537)
@@ -294,14 +294,14 @@ class SwinUNet(nn.Module):
         )
 
         # Decoder: 1/16 -> 1/8 -> 1/4 -> 1/2 -> 1×
-        self.up3 = Up(self.chs[3], self.chs[2], groupnorm=True)
-        self.up2 = Up(self.chs[2], self.chs[1], groupnorm=True)
-        self.up1 = Up(self.chs[1], self.chs[0], groupnorm=True)
+        self.up3 = Up(self.chs[3], self.chs[2], groupnorm=False)
+        self.up2 = Up(self.chs[2], self.chs[1], groupnorm=False)
+        self.up1 = Up(self.chs[1], self.chs[0], groupnorm=False)
         up0_ch = self.chs[0] // 2
         self.up0 = Up(self.chs[0], up0_ch)
 
         # la backbone non genera feature a piena risoluzione che è la prima skip della unet
-        self.stem0 = DoubleConv(n_channels, 48, groupnorm=True)
+        self.stem0 = DoubleConv(n_channels, 48, groupnorm=False)
 
         # Testa di segmentazione
         self.seg_head = nn.Conv2d(up0_ch, n_classes, kernel_size=1)
@@ -331,6 +331,236 @@ class SwinUNet(nn.Module):
         logits = self.seg_head(x)
         return logits
 
+class SwinUNet2(nn.Module): # versione patch 4
+    """
+    Swin U-Net: encoder Swin (patch4) + decoder U-Net.
+    Profondità come U-Net: bottom a 1/16 (si ignora 1/32) → 4 Up fino a 1×.
+    """
+    def __init__(
+        self,
+        n_channels: int,
+        n_classes: int,
+        backbone_name: str = "swin_tiny_patch4_window7_224",
+        out_indices: tuple[int, int, int] = (0, 1, 2),  # <- 1/4, 1/8, 1/16
+    ) -> None:
+        super().__init__()
+
+        t = cast(Any, timm)
+        self.backbone = t.create_model(
+            backbone_name,
+            features_only=True,
+            pretrained=False,
+            in_chans=n_channels,
+            out_indices=out_indices,  # <- niente stadio 1/32
+            img_size=PATCH_SIZE,
+            drop_path_rate=0.1,
+        )
+
+        chs_list = cast(List[int], self.backbone.feature_info.channels())  # type: ignore[attr-defined]
+        self.chs: tuple[int, int, int] = (
+            chs_list[out_indices[0]],  # es. 96 @ 1/4
+            chs_list[out_indices[1]],  # es. 192 @ 1/8
+            chs_list[out_indices[2]],  # es. 384 @ 1/16
+        )
+
+        # Decoder: 1/16 -> 1/8 -> 1/4 -> 1/2 -> 1× (4 Up "learned")
+        self.up3 = Up(self.chs[2], self.chs[1], groupnorm=False)              # 384 -> 192
+        self.up2 = Up(self.chs[1], self.chs[0], groupnorm=False)              # 192 -> 96
+        self.up1 = Up(self.chs[0], self.chs[0] // 2, groupnorm=False)         # 96  -> 48 (skip @ 1/2)
+        self.up0 = Up(self.chs[0] // 2, self.chs[0] // 2, groupnorm=False)    # 48  -> 48 (skip @ 1×)
+
+        # Skip a 1/2 e 1× per gli ultimi due Up
+        self.stem1 = nn.Sequential(  # 1/2, canali = chs[0]//2 (es. 48)
+            nn.Conv2d(n_channels, self.chs[0] // 2, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(self.chs[0] // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.chs[0] // 2, self.chs[0] // 2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(self.chs[0] // 2),
+            nn.ReLU(inplace=True),
+        )
+        self.stem0 = DoubleConv(n_channels, self.chs[0] // 4, groupnorm=False)  # 1×, es. 24
+
+        self.seg_head = nn.Conv2d(self.chs[0] // 2, n_classes, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Feature maps: 1/4, 1/8, 1/16
+        f1, f2, f3 = self.backbone(x)
+        s1 = self.stem1(x)  # 1/2
+        s0 = self.stem0(x)  # 1×
+
+        def _to_nchw(t: torch.Tensor, exp_c: int) -> torch.Tensor:
+            if t.ndim == 4 and t.shape[1] != exp_c and t.shape[-1] == exp_c:
+                return t.permute(0, 3, 1, 2).contiguous()
+            return t
+
+        f1 = _to_nchw(f1, self.chs[0])
+        f2 = _to_nchw(f2, self.chs[1])
+        f3 = _to_nchw(f3, self.chs[2])
+
+        # Decoder (4 Up "learned")
+        x = self.up3(f3, f2)   # -> 1/8
+        x = self.up2(x, f1)    # -> 1/4
+        x = self.up1(x, s1)    # -> 1/2
+        x = self.up0(x, s0)    # -> 1×
+
+        logits = self.seg_head(x)
+        return logits
+    
+class ChannelLayerNorm(nn.Module):
+    """LayerNorm sul canale per tensori NCHW."""
+    def __init__(self, num_channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.ln = nn.LayerNorm(num_channels, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+class MLPBlock(nn.Module):
+    def __init__(self, dim: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        hidden = int(dim * mlp_ratio)
+        self.fc1 = nn.Conv2d(dim, hidden, 1)
+        self.act = nn.GELU()
+        self.fc2 = nn.Conv2d(hidden, dim, 1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.act(self.fc1(x)))
+
+class SwinLikeBlock(nn.Module):
+    """Blocco leggero in stile Swin: LN -> DWConv (local mixing) -> residual -> LN -> MLP -> residual."""
+    def __init__(self, dim: int, mlp_ratio: float = 4.0, dw_kernel: int = 3):
+        super().__init__()
+        self.norm1 = ChannelLayerNorm(dim)
+        self.dwconv = nn.Conv2d(dim, dim, dw_kernel, padding=dw_kernel // 2, groups=dim)
+        self.norm2 = ChannelLayerNorm(dim)
+        self.mlp = MLPBlock(dim, mlp_ratio)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = x
+        x = self.norm1(x)
+        x = self.dwconv(x)
+        x = x + h
+        h = x
+        x = self.norm2(x)
+        x = self.mlp(x)
+        x = x + h
+        return x
+
+class PatchExpand(nn.Module):
+    """Linear + PixelShuffle: raddoppia H,W e dimezza i canali."""
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.proj = nn.Conv2d(in_channels, in_channels * 2, kernel_size=1, bias=True)
+        self.ps = nn.PixelShuffle(2)  # (N, 2C, H, W) -> (N, C/2, 2H, 2W)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.ps(self.proj(x))
+
+class SwinUNet3(nn.Module):
+    """
+    Swin U-Net 3:
+    - Encoder: Swin (patch4, timm) fino a 1/16 (si ignora 1/32) -> out_indices=(0,1,2)
+    - Decoder: 4 stadi Transformer-like (PatchExpand + SwinLikeBlock) fino a 1×
+    - Stessa profondità di UNet/AttentionUNet (4 up parametrici)
+    """
+    def __init__(self, n_channels: int, n_classes: int,
+                backbone_name: str = "swin_tiny_patch4_window7_224",
+                out_indices: tuple[int, int, int] = (0, 1, 2)) -> None:
+        super().__init__()
+        t = cast(Any, timm)
+        self.backbone = t.create_model(
+            backbone_name,
+            features_only=True,
+            pretrained=False,         # valuta True per sfruttare pretraining
+            in_chans=n_channels,
+            out_indices=out_indices,  # 1/4, 1/8, 1/16 (stessa profondità del fondo UNet)
+            img_size=PATCH_SIZE,
+            drop_path_rate=0.1,
+        )
+        chs_list = cast(List[int], self.backbone.feature_info.channels())  # type: ignore[attr-defined]
+        self.chs: tuple[int, int, int] = (
+            chs_list[out_indices[0]],  # C0 (es. 96) @ 1/4
+            chs_list[out_indices[1]],  # C1 (es. 192) @ 1/8
+            chs_list[out_indices[2]],  # C2 (es. 384) @ 1/16
+        )
+
+        # Skip “dense” per gli ultimi due livelli (1/2 e 1×) come nelle altre reti
+        self.stem1 = nn.Sequential(  # -> 1/2, canali = C0//2 (es. 48)
+            nn.Conv2d(n_channels, self.chs[0] // 2, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(self.chs[0] // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.chs[0] // 2, self.chs[0] // 2, 3, padding=1, bias=False),
+            nn.BatchNorm2d(self.chs[0] // 2),
+            nn.ReLU(inplace=True),
+        )
+        self.stem0 = DoubleConv(n_channels, self.chs[0] // 4, groupnorm=False)  # -> 1×, es. 24
+
+        # Decoder (4 up): 1/16->1/8->1/4->1/2->1×
+        # Dec3: 1/16 -> 1/8 (C2 -> C1), skip f2
+        self.dec3_up   = PatchExpand(self.chs[2])              # 384 -> 192
+        self.dec3_blk1 = SwinLikeBlock(self.chs[2] // 2)       # 192
+        self.dec3_fuse = nn.Conv2d(self.chs[2] // 2 + self.chs[1], self.chs[1], 1)
+        self.dec3_blk2 = SwinLikeBlock(self.chs[1])
+
+        # Dec2: 1/8 -> 1/4 (C1 -> C0), skip f1
+        self.dec2_up   = PatchExpand(self.chs[1])              # 192 -> 96
+        self.dec2_blk1 = SwinLikeBlock(self.chs[1] // 2)       # 96
+        self.dec2_fuse = nn.Conv2d(self.chs[1] // 2 + self.chs[0], self.chs[0], 1)
+        self.dec2_blk2 = SwinLikeBlock(self.chs[0])
+
+        # Dec1: 1/4 -> 1/2 (C0 -> C0/2), skip s1
+        self.dec1_up   = PatchExpand(self.chs[0])              # 96 -> 48
+        self.dec1_blk1 = SwinLikeBlock(self.chs[0] // 2)       # 48
+        self.dec1_fuse = nn.Conv2d(self.chs[0] // 2 + (self.chs[0] // 2), self.chs[0] // 2, 1)
+        self.dec1_blk2 = SwinLikeBlock(self.chs[0] // 2)
+
+        # Dec0: 1/2 -> 1× (C0/2 -> C0/4 -> fuse -> C0/2), skip s0
+        self.dec0_up   = PatchExpand(self.chs[0] // 2)         # 48 -> 24
+        self.dec0_blk1 = SwinLikeBlock(self.chs[0] // 4)       # 24
+        self.dec0_fuse = nn.Conv2d(self.chs[0] // 4 + (self.chs[0] // 4), self.chs[0] // 2, 1)
+        self.dec0_blk2 = SwinLikeBlock(self.chs[0] // 2)       # 48
+
+        self.seg_head = nn.Conv2d(self.chs[0] // 2, n_classes, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Encoder
+        f1, f2, f3 = self.backbone(x)  # 1/4, 1/8, 1/16
+        s1 = self.stem1(x)             # 1/2
+        s0 = self.stem0(x)             # 1×
+
+        def _to_nchw(t: torch.Tensor, exp_c: int) -> torch.Tensor:
+            if t.ndim == 4 and t.shape[1] != exp_c and t.shape[-1] == exp_c:
+                return t.permute(0, 3, 1, 2).contiguous()
+            return t
+
+        C0, C1, C2 = self.chs[0], self.chs[1], self.chs[2]
+        f1 = _to_nchw(f1, C0)
+        f2 = _to_nchw(f2, C1)
+        f3 = _to_nchw(f3, C2)
+
+        # Decoder
+        # 1/16 -> 1/8
+        x3 = self.dec3_up(f3)
+        x3 = self.dec3_blk1(x3)
+        x3 = self.dec3_fuse(torch.cat([x3, f2], dim=1))
+        x3 = self.dec3_blk2(x3)
+
+        # 1/8 -> 1/4
+        x2 = self.dec2_up(x3)
+        x2 = self.dec2_blk1(x2)
+        x2 = self.dec2_fuse(torch.cat([x2, f1], dim=1))
+        x2 = self.dec2_blk2(x2)
+
+        # 1/4 -> 1/2
+        x1 = self.dec1_up(x2)
+        x1 = self.dec1_blk1(x1)
+        x1 = self.dec1_fuse(torch.cat([x1, s1], dim=1))
+        x1 = self.dec1_blk2(x1)
+
+        # 1/2 -> 1×
+        x0 = self.dec0_up(x1)
+        x0 = self.dec0_blk1(x0)
+        x0 = self.dec0_fuse(torch.cat([x0, s0], dim=1))
+        x0 = self.dec0_blk2(x0)
+
+        return self.seg_head(x0)
 
 def log_attention_stats(model: nn.Module, prefix: str = "") -> None:
     """Stampa statistiche delle mappe di attenzione (mean/min/max) per ogni gate."""
@@ -643,13 +873,13 @@ def main():
 
         # Creazione
         print("Creating model...")
-        model = SwinUNet(n_channels=n_channels_in, n_classes=n_channels_out).to(device)
+        model = UNet(n_channels=n_channels_in, n_classes=n_channels_out).to(device)
         total_params = sum(p.numel() for p in model.parameters())
         print(f"Parametri totali: {total_params:,}")
 
         # Loss and optimizer
         criterion = nn.BCEWithLogitsLoss()
-        if isinstance(model, SwinUNet):
+        if isinstance(model, SwinUNet1) or isinstance(model, SwinUNet2) or isinstance(model, SwinUNet3):
             bb_params = [
                 p
                 for n, p in model.named_parameters()
