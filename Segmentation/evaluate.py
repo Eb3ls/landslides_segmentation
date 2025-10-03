@@ -10,7 +10,7 @@ from typing import Tuple
 import sys
 from pathlib import Path
 
-from .unet import UNet, AttentionUNet, log_attention_stats
+from .unet import UNet, AttentionUNet
 from .swin_unet import SwinUnet
 from .swin_config import get_config
 
@@ -211,13 +211,6 @@ def build_parser():
         action="store_true",
         help="Usa soglia variabile invece di una fissa",
     )
-    # Nuovi parametri: architettura e percorso pesi
-    p.add_argument(
-        "--arch",
-        choices=["swin", "unet", "attunet"],
-        default="swin",
-        help="Architettura del modello da usare in valutazione.",
-    )
     p.add_argument(
         "--weights",
         default=MODEL_PATH,
@@ -240,32 +233,35 @@ def main():
 
     comune = args.comune
 
-    # Dataset di sola valutazione
+    weights_path = args.weights
+    if not os.path.isfile(weights_path):
+        raise FileNotFoundError(f"Pesi non trovati: {weights_path}")
+    
+    if "_slope_ndvi" in weights_path:
+        include_slope_ndvi = True
+    else:
+        include_slope_ndvi = False
+
     eval_dataset = SegmentationSingleDataset(
         comune=comune,
         patch_size=PATCH_SIZE,
         num_patches=NUM_PATCHES,
+        include_slope_ndvi=include_slope_ndvi,
     )
 
     sample_in, sample_out = eval_dataset[0]
     n_in, n_out = sample_in.shape[0], sample_out.shape[0]
     print(f"Canali input: {n_in}  | Canali output: {n_out}")
 
-    # Modello in base all'architettura richiesta
-    if args.arch == "swin":
+    if "swin" in weights_path:
         cfg = get_config()
         model = SwinUnet(config=cfg).to(device)
-    elif args.arch == "unet":
+    elif "unet" in weights_path:
         model = UNet(n_channels=n_in, n_classes=n_out).to(device)
-    elif args.arch == "attunet":
+    elif "attunet" in weights_path:
         model = AttentionUNet(n_channels=n_in, n_classes=n_out).to(device)
     else:
-        raise ValueError(f"Architettura non supportata: {args.arch}")
-
-    # Caricamento pesi dal percorso passato
-    weights_path = args.weights
-    if not os.path.isfile(weights_path):
-        raise FileNotFoundError(f"Pesi non trovati: {weights_path}")
+        raise ValueError(f"Architettura non supportata nel percorso pesi: {weights_path}")
 
     state = torch.load(weights_path, map_location=device)
     model.load_state_dict(state)

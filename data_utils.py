@@ -255,10 +255,11 @@ def get_segmentation_stack(
     mask = generate_dataset_mask(comune)
 
     for filename in os.listdir(directory):
+        to_exclude = ["sentinel2", "s2", "ndvi", "slope"] if not include_slope_ndvi else ["sentinel2", "s2"]
         # Saltiamo i file non rilevanti
         if any(
             substr in filename.lower()
-            for substr in ["sentinel2", "s2"]
+            for substr in to_exclude
         ):
             continue
 
@@ -280,7 +281,7 @@ def get_segmentation_stack(
                 input_stack.extend(bands)
             elif include_slope_ndvi and "ndvi" in filename.lower():
                 input_stack.extend(bands)
-            elif "Frane" in filename:
+            elif "frane" in filename.lower():
                 landslide_mask = get_landslide_mask(bands)
                 output_stack.extend(landslide_mask)
             else:

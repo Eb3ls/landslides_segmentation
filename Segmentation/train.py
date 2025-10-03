@@ -32,11 +32,12 @@ from .evaluate import evaluate_model, seed_everything
 from .losses import DiceLoss, SquaredDiceLoss, BCEDiceLoss
 
 PATCH_SIZE = 256
-NUM_PATCHES = 1000
-BATCH_SIZE = 8
-NUM_EPOCHS = 100  # 120
+NUM_PATCHES = 4000
+BATCH_SIZE = 32
+NUM_EPOCHS = 120  # 120
 LR = 5e-4
-
+SWIN_WEIGHT_DECAY = 5e-2  # WD per SwinUnet (richiesto 1e-2–1e-3)
+UNET_WEIGHT_DECAY = 1e-4  # WD per UNet e AttentionUNet
 
 def train_model(
     model: nn.Module,
@@ -125,7 +126,7 @@ def train_model(
             torch.save(model.state_dict(), save_path)
         else:
             epochs_without_improvement += 1
-            if epochs_without_improvement >= early_stop_patience and epoch >= 15:
+            if epochs_without_improvement >= early_stop_patience and epoch >= 30:
                 print(
                     f"Early stopping: nessun miglioramento di IoU per {early_stop_patience} epoche (epoch {epoch+1})."
                 )
@@ -154,74 +155,6 @@ def seed_workers(worker_id: int) -> None:
     np.random.seed(worker_seed + worker_id)
     random.seed(worker_seed + worker_id)
     torch.manual_seed(worker_seed + worker_id)
-
-
-def split_decay_params(model: nn.Module, backbone_prefixes: tuple[str, ...] = ()):
-    """Gruppi decay/no-decay + separazione backbone anche se annidato (es. swin_unet.layers.*)."""
-    no_decay_name_terms = (
-        "pos_embed",
-        "absolute_pos_embed",
-        "relative_position_bias_table",
-        "rel_pos",
-        "cls_token",
-    )
-
-    bb_decay, bb_no_decay, dec_decay, dec_no_decay = [], [], [], []
-    for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        ln = n.lower()
-        # no-decay: shape-based + eccezioni per transformer
-        shape_based_no_decay = (p.ndim < 2) or ln.endswith(".bias")
-        name_based_no_decay = any(t in ln for t in no_decay_name_terms)
-        has_decay = not (shape_based_no_decay or name_based_no_decay)
-
-        # backbone: match nested ".*patch_embed.*|.*layers.*|.*norm.*" ma evita decoder
-        is_backbone = False
-        if backbone_prefixes:
-            for pref in backbone_prefixes:
-                pref = pref.lower()
-                starts = ln.startswith(pref + ".")
-                nested = f".{pref}." in ln
-                if pref == "layers" and "layers_up" in ln:
-                    continue
-                if pref == "norm" and "norm_up" in ln:
-                    continue
-                if starts or nested:
-                    is_backbone = True
-                    break
-
-        if is_backbone:
-            (bb_decay if has_decay else bb_no_decay).append(p)
-        else:
-            (dec_decay if has_decay else dec_no_decay).append(p)
-
-    return {
-        "bb_decay": bb_decay,
-        "bb_no_decay": bb_no_decay,
-        "dec_decay": dec_decay,
-        "dec_no_decay": dec_no_decay,
-    }
-
-
-def print_group_stats(
-    model: nn.Module, groups: dict[str, list[nn.Parameter]], header: str = ""
-) -> None:
-    total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    grouped_total = 0
-    if header:
-        print(header)
-    for k in ["bb_decay", "bb_no_decay", "dec_decay", "dec_no_decay"]:
-        lst = groups.get(k, [])
-        params = sum(p.numel() for p in lst)
-        grouped_total += params
-        pct = (params / total_trainable * 100) if total_trainable > 0 else 0.0
-        print(f"  {k:12s} -> tensors: {len(lst):4d} | params: {params:,} ({pct:.1f}%)")
-    if grouped_total != total_trainable:
-        diff = total_trainable - grouped_total
-        print(
-            f"  [Warn] mismatch param count: grouped={grouped_total:,}, total={total_trainable:,}, diff={diff:,}"
-        )
 
 
 def main():
@@ -337,34 +270,17 @@ def main():
         criterion = criterion.to(device)
 
         if isinstance(model, SwinUnet):
-            # AdamW: mantieni solo la variazione di weight decay tra backbone e non-backbone
-            groups = split_decay_params(
-                model, backbone_prefixes=("patch_embed", "layers", "norm")
-            )
-            print_group_stats(model, groups, header="Param groups (Swin):")
-
-            bb_all = groups["bb_decay"] + groups["bb_no_decay"]
-            dec_all = groups["dec_decay"] + groups["dec_no_decay"]
-
+            # Semplificazione: un solo gruppo di parametri con AdamW, LR fisso e WD fisso
             optimizer = optim.AdamW(
-                [
-                    {
-                        "params": bb_all,
-                        "lr": LR * 0.3,
-                        "weight_decay": 5e-2,
-                    },
-                    {
-                        "params": dec_all,
-                        "lr": LR,
-                        "weight_decay": 1e-2,
-                    },
-                ]
+                model.parameters(),
+                lr=LR,
+                weight_decay=SWIN_WEIGHT_DECAY,
             )
         else:
             optimizer = optim.AdamW(
                 model.parameters(),
                 lr=LR,
-                weight_decay=1e-4,
+                weight_decay=UNET_WEIGHT_DECAY,
             )
 
         scheduler = ReduceLROnPlateau(
@@ -445,7 +361,6 @@ def main():
 
         traceback.print_exc()
         pass
-
 
 if __name__ == "__main__":
     main()
