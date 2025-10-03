@@ -7,11 +7,23 @@ import matplotlib.pyplot as plt
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from typing import Tuple
+import sys
+from pathlib import Path
 
 from .unet import UNet, AttentionUNet, log_attention_stats
 from .swin_unet import SwinUnet
 from .swin_config import get_config
-from data_utils import SegmentationSingleDataset
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+try:
+    from data_utils import SegmentationSingleDataset
+except Exception as e:
+    raise ImportError(
+        f"Impossibile importare data_utils. Verifica che esista '{PROJECT_ROOT / 'data_utils.py'}' "
+        f"e avvia lo script dalla root del progetto. Dettagli: {e}"
+    )
 
 MODEL_PATH = "best_model.pth"
 PATCH_SIZE = 256
@@ -199,6 +211,18 @@ def build_parser():
         action="store_true",
         help="Usa soglia variabile invece di una fissa",
     )
+    # Nuovi parametri: architettura e percorso pesi
+    p.add_argument(
+        "--arch",
+        choices=["swin", "unet", "attunet"],
+        default="swin",
+        help="Architettura del modello da usare in valutazione.",
+    )
+    p.add_argument(
+        "--weights",
+        default=MODEL_PATH,
+        help="Percorso del file .pth dei pesi da caricare.",
+    )
     return p
 
 
@@ -227,17 +251,26 @@ def main():
     n_in, n_out = sample_in.shape[0], sample_out.shape[0]
     print(f"Canali input: {n_in}  | Canali output: {n_out}")
 
-    # Modello
-    cfg = get_config()
-    model = SwinUnet(config=cfg).to(device)
+    # Modello in base all'architettura richiesta
+    if args.arch == "swin":
+        cfg = get_config()
+        model = SwinUnet(config=cfg).to(device)
+    elif args.arch == "unet":
+        model = UNet(n_channels=n_in, n_classes=n_out).to(device)
+    elif args.arch == "attunet":
+        model = AttentionUNet(n_channels=n_in, n_classes=n_out).to(device)
+    else:
+        raise ValueError(f"Architettura non supportata: {args.arch}")
 
-    if not os.path.isfile(MODEL_PATH):
-        raise FileNotFoundError(f"Pesi non trovati: {MODEL_PATH}")
+    # Caricamento pesi dal percorso passato
+    weights_path = args.weights
+    if not os.path.isfile(weights_path):
+        raise FileNotFoundError(f"Pesi non trovati: {weights_path}")
 
-    state = torch.load(MODEL_PATH, map_location=device)
+    state = torch.load(weights_path, map_location=device)
     model.load_state_dict(state)
     model.eval()
-    print(f"Pesi caricati da: {MODEL_PATH}")
+    print(f"Pesi caricati da: {weights_path}")
 
     # Dataloader
     eval_loader = DataLoader(

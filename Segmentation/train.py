@@ -11,8 +11,20 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from typing import cast
 import argparse
+import sys
+from pathlib import Path
 
-from data_utils import ComuneType, SegmentationMultiDataset, SegmentationSingleDataset
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+try:
+    from data_utils import ComuneType, SegmentationMultiDataset, SegmentationSingleDataset
+except Exception as e:
+    raise ImportError(
+        f"Impossibile importare data_utils. Verifica che esista '{PROJECT_ROOT / 'data_utils.py'}' "
+        f"e avvia lo script dalla root del progetto. Dettagli: {e}"
+    )
+
 from .unet import UNet, AttentionUNet, log_attention_stats
 from .swin_unet import SwinUnet
 from .swin_config import get_config
@@ -20,8 +32,8 @@ from .evaluate import evaluate_model, seed_everything
 from .losses import DiceLoss, SquaredDiceLoss, BCEDiceLoss
 
 PATCH_SIZE = 256
-NUM_PATCHES = 4000  # 2000
-BATCH_SIZE = 32
+NUM_PATCHES = 1000
+BATCH_SIZE = 8
 NUM_EPOCHS = 100  # 120
 LR = 5e-4
 
@@ -37,6 +49,7 @@ def train_model(
     num_epochs: int = 20,
     early_stop_patience: int = 15,
     prefix: str = "",
+    weights_dir: str = "weights",
 ) -> Tuple[list[float], list[float], list[float], list[float], list[float]]:
     """Addestra il modello di segmentazione."""
 
@@ -108,10 +121,11 @@ def train_model(
             print(
                 f"New best model found at epoch {epoch+1} with average IoU {best_iou:.6f}"
             )
-            torch.save(model.state_dict(), f"{prefix}_model.pth")
+            save_path = os.path.join(weights_dir, f"{prefix}_model.pth")
+            torch.save(model.state_dict(), save_path)
         else:
             epochs_without_improvement += 1
-            if epochs_without_improvement >= early_stop_patience:
+            if epochs_without_improvement >= early_stop_patience and epoch >= 15:
                 print(
                     f"Early stopping: nessun miglioramento di IoU per {early_stop_patience} epoche (epoch {epoch+1})."
                 )
@@ -323,37 +337,34 @@ def main():
         criterion = criterion.to(device)
 
         if isinstance(model, SwinUnet):
-            # AdamW con no-decay su bias/norm/positional + LR/WD differenziati per backbone e decoder
-
+            # AdamW: mantieni solo la variazione di weight decay tra backbone e non-backbone
             groups = split_decay_params(
                 model, backbone_prefixes=("patch_embed", "layers", "norm")
             )
             print_group_stats(model, groups, header="Param groups (Swin):")
+
+            bb_all = groups["bb_decay"] + groups["bb_no_decay"]
+            dec_all = groups["dec_decay"] + groups["dec_no_decay"]
+
             optimizer = optim.AdamW(
                 [
                     {
-                        "params": groups["bb_decay"],
+                        "params": bb_all,
                         "lr": LR * 0.3,
                         "weight_decay": 5e-2,
                     },
                     {
-                        "params": groups["bb_no_decay"],
-                        "lr": LR * 0.3,
-                        "weight_decay": 0.0,
+                        "params": dec_all,
+                        "lr": LR,
+                        "weight_decay": 1e-2,
                     },
-                    {"params": groups["dec_decay"], "lr": LR, "weight_decay": 1e-2},
-                    {"params": groups["dec_no_decay"], "lr": LR, "weight_decay": 0.0},
                 ]
             )
         else:
-            # UNet / AttentionUNet: no-decay su bias/norm (niente backbone)
-            groups = split_decay_params(model, backbone_prefixes=())
-            print_group_stats(model, groups, header="Param groups (UNet):")
             optimizer = optim.AdamW(
-                [
-                    {"params": groups["dec_decay"], "lr": LR, "weight_decay": 1e-4},
-                    {"params": groups["dec_no_decay"], "lr": LR, "weight_decay": 0.0},
-                ]
+                model.parameters(),
+                lr=LR,
+                weight_decay=1e-4,
             )
 
         scheduler = ReduceLROnPlateau(
@@ -365,6 +376,10 @@ def main():
             min_lr=1e-7,
         )
 
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        weights_dir = os.path.join(base_dir, "weights")
+        os.makedirs(weights_dir, exist_ok=True)
+
         # Allenamento
         print("Starting training...")
         train_losses, val_losses, iou_values, oa_values, dice_values = train_model(
@@ -375,8 +390,10 @@ def main():
             optimizer,
             device,
             scheduler,
-            NUM_EPOCHS,
-            prefix,
+            num_epochs=NUM_EPOCHS,
+            early_stop_patience=15,
+            prefix=prefix,
+            weights_dir=weights_dir
         )
 
         # Crea cartella plots se non esistente
@@ -419,7 +436,7 @@ def main():
         plt.legend()
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig(os.path.join(plots_dir, f"{prefix}_dice_iou.png"), dpi=150)
+        plt.savefig(os.path.join(plots_dir, f"{prefix}_iou.png"), dpi=150)
         plt.show()
 
     except Exception as e:

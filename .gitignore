@@ -3,6 +3,8 @@
 .vscode
 Comuni
 plots
+old_plots
+weights
 __pycache__
 *.pth
 Trash

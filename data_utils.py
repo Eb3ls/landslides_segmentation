@@ -258,7 +258,7 @@ def get_segmentation_stack(
         # Saltiamo i file non rilevanti
         if any(
             substr in filename.lower()
-            for substr in ["sentinel2", "s2", "ndvi", "slope"]
+            for substr in ["sentinel2", "s2"]
         ):
             continue
 
@@ -272,19 +272,19 @@ def get_segmentation_stack(
             # Otteniamo i canali come liste di array 2D
             bands = list(data)
 
-            if "Agea" in filename:
+            if "agea" in filename.lower():
                 input_stack.extend(bands)
-            elif "Cgr" in filename:
+            elif "cgr" in filename.lower():
                 input_stack.extend(bands)
-            elif include_slope_ndvi and "Slope" in filename:
+            elif include_slope_ndvi and "slope" in filename.lower():
                 input_stack.extend(bands)
-            elif include_slope_ndvi and "Ndvi" in filename:
+            elif include_slope_ndvi and "ndvi" in filename.lower():
                 input_stack.extend(bands)
             elif "Frane" in filename:
                 landslide_mask = get_landslide_mask(bands)
                 output_stack.extend(landslide_mask)
             else:
-                print(f"File '{filename}' not recognized, skipping.")
+                print(f"File '{filename}' not included, skipping.")
 
     if not input_stack:
         raise ValueError("No input data found")
@@ -631,7 +631,7 @@ class SegmentationSingleDataset(Dataset):
         self.mask = generate_dataset_mask(comune)
 
         # Carichiamo gli stack di dati
-        self.stack_input, self.stack_landslide = get_segmentation_stack(comune, include_slope_ndvi=False)
+        self.stack_input, self.stack_landslide = get_segmentation_stack(comune, include_slope_ndvi)
 
     def __len__(self) -> int:
         return self.num_patches
@@ -672,7 +672,7 @@ class SegmentationMultiDataset(Dataset):
             # Generiamo la maschera del dataset
             self.masks.append(generate_dataset_mask(comune))
             # Carichiamo gli stack di dati
-            input, landslide = get_segmentation_stack(comune, include_slope_ndvi=False)
+            input, landslide = get_segmentation_stack(comune, include_slope_ndvi)
             self.stack_input.append(input)
             self.stack_landslide.append(landslide)
 
