@@ -239,6 +239,7 @@ def get_landslide_mask(landslides: list) -> np.ndarray:
 
 def get_segmentation_stack(
     comune: ComuneType,
+    include_slope_ndvi: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
 
     directory = os.path.join(MAIN_DIR, comune)
@@ -274,6 +275,10 @@ def get_segmentation_stack(
             if "Agea" in filename:
                 input_stack.extend(bands)
             elif "Cgr" in filename:
+                input_stack.extend(bands)
+            elif include_slope_ndvi and "Slope" in filename:
+                input_stack.extend(bands)
+            elif include_slope_ndvi and "Ndvi" in filename:
                 input_stack.extend(bands)
             elif "Frane" in filename:
                 landslide_mask = get_landslide_mask(bands)
@@ -614,7 +619,7 @@ class SegmentationSingleDataset(Dataset):
     """Dataset per il training della segmentazione con un comune."""
 
     def __init__(
-        self, comune: ComuneType, patch_size: int = 256, num_patches: int = 1000
+        self, comune: ComuneType, patch_size: int = 256, num_patches: int = 1000, include_slope_ndvi: bool = False
     ):
         self.comune = comune
         self.patch_size = patch_size
@@ -626,7 +631,7 @@ class SegmentationSingleDataset(Dataset):
         self.mask = generate_dataset_mask(comune)
 
         # Carichiamo gli stack di dati
-        self.stack_input, self.stack_landslide = get_segmentation_stack(comune)
+        self.stack_input, self.stack_landslide = get_segmentation_stack(comune, include_slope_ndvi=False)
 
     def __len__(self) -> int:
         return self.num_patches
@@ -652,7 +657,7 @@ class SegmentationMultiDataset(Dataset):
     """Dataset per il training della segmentazione con più comuni."""
 
     def __init__(
-        self, comuni: list[ComuneType], patch_size: int = 256, num_patches: int = 1000
+        self, comuni: list[ComuneType], patch_size: int = 256, num_patches: int = 1000, include_slope_ndvi: bool = False
     ):
         self.comuni = comuni
         self.patch_size = patch_size
@@ -667,7 +672,7 @@ class SegmentationMultiDataset(Dataset):
             # Generiamo la maschera del dataset
             self.masks.append(generate_dataset_mask(comune))
             # Carichiamo gli stack di dati
-            input, landslide = get_segmentation_stack(comune)
+            input, landslide = get_segmentation_stack(comune, include_slope_ndvi=False)
             self.stack_input.append(input)
             self.stack_landslide.append(landslide)
 
