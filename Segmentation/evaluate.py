@@ -226,7 +226,7 @@ def main():
     else:
         threshold = FIXED_THRESHOLD
 
-    seed_everything(200)  # 42, 200, 420
+    seed_everything(42)  # 42, 200, 420
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")

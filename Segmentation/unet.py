@@ -56,7 +56,7 @@ class AttentionGate(nn.Module):
         )
 
         self.psi = nn.Sequential(  # funzione psi dello scoring dell'attention gate
-            nn.LeakyReLU(0.1, inplace=True),
+            nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(inter_channels, 1, kernel_size=1, stride=1, padding=0, bias=True),
             nn.Sigmoid(),
         )

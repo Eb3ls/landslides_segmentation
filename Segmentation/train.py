@@ -13,6 +13,7 @@ from typing import cast
 import argparse
 import sys
 from pathlib import Path
+import json
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -34,7 +35,7 @@ from .losses import DiceLoss, SquaredDiceLoss, BCEDiceLoss
 PATCH_SIZE = 256
 NUM_PATCHES = 4000
 BATCH_SIZE = 32
-NUM_EPOCHS = 120  # 120
+NUM_EPOCHS = 120
 LR = 5e-4
 SWIN_WEIGHT_DECAY = 5e-2  # WD per SwinUnet (richiesto 1e-2–1e-3)
 UNET_WEIGHT_DECAY = 1e-4  # WD per UNet e AttentionUNet
@@ -51,7 +52,7 @@ def train_model(
     early_stop_patience: int = 15,
     prefix: str = "",
     weights_dir: str = "weights",
-) -> Tuple[list[float], list[float], list[float], list[float], list[float]]:
+) -> Tuple[list[float], list[float], list[float], list[float], list[float], list[float]]:
     """Addestra il modello di segmentazione."""
 
     model.train()
@@ -60,6 +61,7 @@ def train_model(
     oa_values = []
     iou_values = []
     dice_values = []
+    lr_values = []  # traccia LR per epoca
 
     best_iou = 0
     epochs_without_improvement = 0
@@ -109,6 +111,7 @@ def train_model(
 
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]["lr"]
+        lr_values.append(current_lr)
         print(
             f"Epoch [{epoch+1}/{num_epochs}], Average Loss: {train_loss:.6f}, Validation Loss: {val_loss:.6f}, Validation IoU: {val_iou:.6f}, Validation Dice: {dice_score:.6f}, Overall Accuracy: {oa:.6f}, LR: {current_lr:.2e}"
         )
@@ -132,7 +135,7 @@ def train_model(
                 )
                 break
 
-    return train_losses, val_losses, iou_values, oa_values, dice_values
+    return train_losses, val_losses, iou_values, oa_values, dice_values, lr_values
 
 
 def build_prefix(model_name: str, loss_name: str, include_slope_ndvi: bool) -> str:
@@ -287,7 +290,7 @@ def main():
             optimizer,
             mode="min",
             factor=0.5,
-            patience=5,
+            patience=4,
             threshold=1e-4,
             min_lr=1e-7,
         )
@@ -298,7 +301,7 @@ def main():
 
         # Allenamento
         print("Starting training...")
-        train_losses, val_losses, iou_values, oa_values, dice_values = train_model(
+        train_losses, val_losses, iou_values, oa_values, dice_values, lr_values = train_model(
             model,
             train_loader,
             eval_loader,
@@ -311,6 +314,24 @@ def main():
             prefix=prefix,
             weights_dir=weights_dir
         )
+
+        # Salvataggio metriche in JSON come liste per metrica
+        metrics_dir = os.path.join(base_dir, "metrics")
+        os.makedirs(metrics_dir, exist_ok=True)
+        metrics = {
+            "prefix": prefix,
+            "epochs": len(train_losses),
+            "train_loss": [float(x) for x in train_losses],
+            "val_loss": [float(x) for x in val_losses],
+            "val_iou": [float(x) for x in iou_values],
+            "val_dice": [float(x) for x in dice_values],
+            "val_oa": [float(x) for x in oa_values],
+            "lr": [float(x) for x in lr_values],
+        }
+        metrics_path = os.path.join(metrics_dir, f"{prefix}_metrics.json")
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
+        print(f"Metriche salvate in {metrics_path}")
 
         # Crea cartella plots se non esistente
         base_dir = os.path.dirname(os.path.abspath(__file__))

@@ -658,7 +658,7 @@ class SegmentationMultiDataset(Dataset):
     """Dataset per il training della segmentazione con più comuni."""
 
     def __init__(
-        self, comuni: list[ComuneType], patch_size: int = 256, num_patches: int = 1000, include_slope_ndvi: bool = False
+        self, comuni: list[ComuneType], patch_size: int = 256, num_patches: int = 1000, augment: bool = False, include_slope_ndvi: bool = False
     ):
         self.comuni = comuni
         self.patch_size = patch_size
@@ -666,6 +666,7 @@ class SegmentationMultiDataset(Dataset):
         self.masks = []
         self.stack_input = []
         self.stack_landslide = []
+        self.augment = augment
 
         print(f"Loading data for {comuni}...")
 
@@ -701,8 +702,9 @@ class SegmentationMultiDataset(Dataset):
         landslide_tensor = torch.nan_to_num(landslide_tensor, nan=0.0)
 
         # Aggiungiamo eventuali augmentazioni
-        input_tensor, landslide_tensor = augment_data(
-            input_tensor, landslide_tensor, patch_mask_tensor
-        )
+        if self.augment:
+            input_tensor, landslide_tensor = augment_data(
+                input_tensor, landslide_tensor, patch_mask_tensor
+            )
 
         return input_tensor, landslide_tensor
