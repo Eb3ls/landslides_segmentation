@@ -304,7 +304,6 @@ def get_segmentation_stack(
     return (input_stack, output_stack)
 
 
-# TODO: considerare la quantitá di valori validi nella maschera
 def check_similarity(
     first_img: np.ndarray,
     second_img: np.ndarray,

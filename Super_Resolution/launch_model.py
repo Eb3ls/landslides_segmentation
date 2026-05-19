@@ -1,5 +1,3 @@
-# TODO: algoritmo di valutazione differenza tra input e output
-
 import os
 import sys
 
