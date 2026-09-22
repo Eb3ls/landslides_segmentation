@@ -5,7 +5,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
 from Super_Resolution.config import load_config
-from Super_Resolution.models_utils import launch_all
 
 
 def main():
@@ -14,6 +13,13 @@ def main():
         "--model",
         type=str,
         choices=["rcan", "swin2mose", "mymodel", "drct"],
+        required=True,
+        help="Model family selected by the configuration schema",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        help="Path to a model configuration file; defaults to the model example path",
     )
     # Fine-tune flags
     parser.add_argument(
@@ -23,7 +29,6 @@ def main():
         "--ckpt",
         type=str,
         help="Path to checkpoint (.pth) to load for fine-tuning",
-        required="--finetune" in sys.argv,
     )
     parser.add_argument(
         "--scope",
@@ -34,13 +39,14 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.finetune and not args.ckpt:
+        parser.error("--ckpt is required with --finetune")
     model_type = args.model
 
     try:
-        config = load_config(model_type)
-    except ValueError as e:
-        print(f"Errore: {e}")
-        return
+        config = load_config(model_type, args.config)
+    except (OSError, ValueError, TypeError) as exc:
+        parser.error(str(exc))
 
     try:
         setattr(config.train, "finetune", bool(args.finetune))
@@ -48,6 +54,10 @@ def main():
         setattr(config.train, "finetune_scope", str(args.scope))
     except Exception:
         pass
+
+    # Training imports optional visualization dependencies, so keep --help usable
+    # in a minimal environment.
+    from Super_Resolution.models_utils import launch_all
 
     launch_all(config)
 

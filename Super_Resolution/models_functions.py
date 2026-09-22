@@ -208,6 +208,7 @@ class Upsample(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        target_size = (x.shape[-2] * 5, x.shape[-1] * 5)
         # First upscale by 1.25 (5/4) using bicubic
         x = self.conv_pre(x)
         x = F.interpolate(x, scale_factor=5 / 4, mode="bicubic", align_corners=False)
@@ -216,7 +217,7 @@ class Upsample(nn.Module):
         x = F.interpolate(x, scale_factor=2, mode="nearest")
         x = self.lrelu(self.conv_after_2(x))
         # Then upscale by 2 (nearest) and final convs
-        x = F.interpolate(x, scale_factor=2, mode="nearest")
+        x = F.interpolate(x, size=target_size, mode="nearest")
         x = self.lrelu(self.conv_hr(x))
         x = self.conv_last(x)
         return x

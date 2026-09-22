@@ -1,0 +1,43 @@
+# NEW EXAMPLE: compact 5x DRCT run. Replace stats_file with statistics from calc_mean.py.
+model:
+  name: drct_5x_example
+  dir_path: outputs/
+  scale: 5
+  img_size: 40
+  stats_file: ../channel_stats.json
+  patch_size: 1
+  in_chans: 4
+  num_feat: 16
+  embed_dim: 8
+  depths: [1]
+  num_heads: [2]
+  window_size: 8
+  overlap_ratio: 0.5
+  mlp_ratio: 2.0
+  qkv_bias: true
+  drop_rate: 0.0
+  attn_drop_rate: 0.0
+  upsampler: only_shuffle
+  resi_connection: 1conv
+  gc: 4
+  MoE_config: {}
+train:
+  seed: 42
+  workers: 0
+  dataset_size: 100
+  augment_data: true
+  synthetic_data: false
+  batch_size: 1
+  epochs: 1
+  show_progress: true
+  use_moe_loss: false
+  loss_weights:
+    charb: 1.0
+test:
+  load_model: false
+  comune: Brisighella
+  dataset_size: 20
+  batch_size: 1
+  image_samples: 1
+  run_napari: false
+  synthetic_data: false

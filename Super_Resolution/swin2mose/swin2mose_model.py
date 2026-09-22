@@ -261,7 +261,7 @@ class SwinTransformerBlock(nn.Module):
 
         self.norm2 = norm_layer(dim)
         # Definiti quanti neuroni ci sono nella MLP rispetto a dim di input
-        mlp_hidden_dim = int(dim * mlp_ratio)
+        mlp_hidden_dim = int(dim * self.mlp_ratio)
 
         # Nell'articolo si usa MoE
         self.moe = MoE(
@@ -464,7 +464,7 @@ class Swin2MoSE(nn.Module):
         norm_layer=nn.LayerNorm,
         dropout_rate: float = 0.0,
         # Parametri erediati da SwinTransformer, lascio default
-        mlp_ratio: float = 4.0,
+        mlp_ratio: float | None = None,
         qkv_bias: bool = True,
         attn_dropout_rate: float = 0.0,
     ):
@@ -485,7 +485,7 @@ class Swin2MoSE(nn.Module):
         self.num_layers = len(cfg.model.depths)
         self.embed_dim = cfg.model.embed_dim
         self.num_features = cfg.model.embed_dim
-        self.mlp_ratio = mlp_ratio
+        self.mlp_ratio = cfg.model.mlp_ratio if mlp_ratio is None else mlp_ratio
 
         # Layer di embedding in non overlapping patch
         self.patch_embed = PatchEmbed(
@@ -515,7 +515,7 @@ class Swin2MoSE(nn.Module):
                 depth=cfg.model.depths[i_layer],
                 num_heads=cfg.model.num_heads[i_layer],
                 window_size=cfg.model.window_size,
-                mlp_ratio=mlp_ratio,
+                mlp_ratio=self.mlp_ratio,
                 qkv_bias=qkv_bias,
                 drop=dropout_rate,
                 attn_drop=attn_dropout_rate,

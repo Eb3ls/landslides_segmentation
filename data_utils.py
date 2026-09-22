@@ -1,4 +1,5 @@
 import os
+import re
 import numpy as np
 from typing import Literal, Tuple, cast
 import rasterio
@@ -11,6 +12,48 @@ from skimage.metrics import structural_similarity
 ComuneType = Literal["Brisighella", "Casola-Valsenio", "Modigliana", "Predappio"]
 
 MAIN_DIR = "Comuni/"
+RASTER_EXTENSIONS = {".tif", ".tiff"}
+
+
+def _raster_filenames(directory: str) -> list[str]:
+    """Return regular GeoTIFF files in a filesystem-independent order."""
+    return sorted(
+        (
+            filename
+            for filename in os.listdir(directory)
+            if os.path.isfile(os.path.join(directory, filename))
+            and os.path.splitext(filename)[1].lower() in RASTER_EXTENSIONS
+        ),
+        key=str.casefold,
+    )
+
+
+def _filename_tokens(filename: str) -> set[str]:
+    stem = os.path.splitext(filename)[0].casefold()
+    return {token for token in re.split(r"[^a-z0-9]+", stem) if token}
+
+
+def _read_masked_raster(
+    path: str,
+    mask: np.ndarray,
+    reference_crs,
+    reference_transform,
+) -> list[np.ndarray]:
+    with rasterio.open(path) as src:
+        if src.shape != mask.shape:
+            raise ValueError(
+                f"Raster '{os.path.basename(path)}' has spatial dimensions "
+                f"{src.shape}, expected {mask.shape}"
+            )
+        if src.crs != reference_crs or src.transform != reference_transform:
+            raise ValueError(
+                f"Raster '{os.path.basename(path)}' is not aligned with "
+                "Cgr_2023_2m.tif (CRS or transform differs)"
+            )
+        data = get_data(src, True)
+
+    data[:, ~mask] = 0
+    return list(data)
 
 
 def normalize(data: np.ndarray, min_val: float, max_val: float) -> np.ndarray:
@@ -74,18 +117,13 @@ def get_data(src: rasterio.DatasetReader, to_norm: bool) -> np.ndarray:
     Raises:
         ValueError: Se i dati non hanno il numero di bande atteso
     """
-    data = src.read()
-
-    # Impostiamo il tipo comune a float32
-    if data.dtype != np.float32:
-        data = data.astype(np.float32)
-
-    # Impostiamo a NaN i valori di nodata
-    if src.nodata is not None:
-        data[data == src.nodata] = np.nan
+    # Read GDAL masks and nodata together. Casting before filling is required for
+    # integer rasters, which cannot represent NaN.
+    data = src.read(masked=True).astype(np.float32).filled(np.nan)
+    data[~np.isfinite(data)] = np.nan
 
     if to_norm:
-        name = src.name.lower()
+        name = os.path.basename(src.name).lower()
         if "change" in name:
             return normalize(data, -2, 2)
         elif "ndvi" in name:
@@ -128,9 +166,11 @@ def generate_dataset_mask(comune: ComuneType) -> np.ndarray:
         raise FileNotFoundError(f"File '{file_path}' does not exist")
 
     with rasterio.open(file_path) as src:
+        if src.count < 4:
+            raise ValueError(f"Cgr raster '{file_path}' must have at least 4 bands")
         # Leggiamo il quarto canale (NIR) per la maschera
-        data = src.read(4)
-        mask = data != src.nodata
+        data = src.read(4, masked=True)
+        mask = ~np.ma.getmaskarray(data) & np.isfinite(np.asarray(data))
 
     return mask
 
@@ -155,58 +195,69 @@ def get_super_resolution_stack(
     if not os.path.exists(directory):
         raise FileNotFoundError(f"Directory '{directory}' does not exist")
 
-    # Creiamo ndarray (C, H, W) stackiamo su i canali
-    agea_stack = []
-    cgr_stack = []
-    sentinel_pre_stack = []
-    sentinel_post_stack = []
+    stacks: dict[str, list[np.ndarray]] = {
+        "agea": [],
+        "cgr": [],
+        "sentinel_pre": [],
+        "sentinel_post": [],
+    }
 
     # Prendiamo la maschera del comune
     mask = generate_dataset_mask(comune)
+    with rasterio.open(os.path.join(directory, "Cgr_2023_2m.tif")) as reference:
+        reference_crs = reference.crs
+        reference_transform = reference.transform
 
-    for filename in os.listdir(directory):
-        # Saltiamo i file non rilevanti
-        if any(
-            substr in filename.lower()
-            for substr in ["change", "frane", "slope", "ndvi"]
-        ):
+    files_by_kind: dict[str, list[str]] = {kind: [] for kind in stacks}
+    for filename in _raster_filenames(directory):
+        tokens = _filename_tokens(filename)
+        if "agea" in tokens:
+            kind = "agea"
+        elif "cgr" in tokens:
+            kind = "cgr"
+        elif tokens & {"change", "frane", "slope", "ndvi"}:
             continue
+        elif "pre" in tokens:
+            kind = "sentinel_pre"
+        elif "post" in tokens:
+            kind = "sentinel_post"
+        else:
+            continue
+        files_by_kind[kind].append(filename)
 
-        path = os.path.join(directory, filename)
+    # Category order is part of the channel contract. Files within a category
+    # are already case-insensitively sorted by _raster_filenames.
+    for kind in ("agea", "cgr", "sentinel_pre", "sentinel_post"):
+        for filename in files_by_kind[kind]:
+            stacks[kind].extend(
+                _read_masked_raster(
+                    os.path.join(directory, filename),
+                    mask,
+                    reference_crs,
+                    reference_transform,
+                )
+            )
 
-        with rasterio.open(path) as src:
-            data = get_data(src, True)
-
-            data[:, ~mask] = 0
-
-            # Otteniamo i canali come liste di array 2D
-            bands = list(data)
-
-            if "Agea" in filename:
-                agea_stack.extend(bands)
-            elif "Cgr" in filename:
-                cgr_stack.extend(bands)
-            elif "pre" in filename:
-                sentinel_pre_stack.extend(bands)
-            elif "post" in filename:
-                sentinel_post_stack.extend(bands)
-            else:
-                print(f"File '{filename}' not recognized, skipping.")
-
-    if not agea_stack:
+    if not stacks["agea"]:
         raise ValueError("No Agea data found")
-    if not cgr_stack:
+    if not stacks["cgr"]:
         raise ValueError("No Cgr data found")
-    if not sentinel_pre_stack:
+    if not stacks["sentinel_pre"]:
         raise ValueError("No pre-event Sentinel data found")
-    if not sentinel_post_stack:
+    if not stacks["sentinel_post"]:
         raise ValueError("No post-event Sentinel data found")
+    for kind, bands in stacks.items():
+        if len(bands) != 4:
+            raise ValueError(
+                f"SR role '{kind}' must contain exactly 4 channels; "
+                f"found {len(bands)} from {files_by_kind[kind]}"
+            )
 
     # Convertiamo le liste in array numpy, stack di default sul primo asse
-    agea_stack = np.stack(agea_stack)
-    cgr_stack = np.stack(cgr_stack)
-    sentinel_pre_stack = np.stack(sentinel_pre_stack)
-    sentinel_post_stack = np.stack(sentinel_post_stack)
+    agea_stack = np.stack(stacks["agea"])
+    cgr_stack = np.stack(stacks["cgr"])
+    sentinel_pre_stack = np.stack(stacks["sentinel_pre"])
+    sentinel_post_stack = np.stack(stacks["sentinel_post"])
 
     if agea_stack.shape[1:] != sentinel_pre_stack.shape[1:]:
         raise ValueError(
@@ -247,48 +298,63 @@ def get_segmentation_stack(
     if not os.path.exists(directory):
         raise FileNotFoundError(f"Directory '{directory}' does not exist")
 
-    # Creiamo ndarray (C, H, W) stackiamo su i canali
-    input_stack = []
-    output_stack = []
+    stacks: dict[str, list[np.ndarray]] = {
+        "agea": [],
+        "cgr": [],
+        "slope": [],
+        "ndvi": [],
+        "frane": [],
+    }
 
     # Prendiamo la maschera del comune
     mask = generate_dataset_mask(comune)
+    with rasterio.open(os.path.join(directory, "Cgr_2023_2m.tif")) as reference:
+        reference_crs = reference.crs
+        reference_transform = reference.transform
 
-    for filename in os.listdir(directory):
-        to_exclude = ["sentinel2", "s2", "ndvi", "slope"] if not include_slope_ndvi else ["sentinel2", "s2"]
-        # Saltiamo i file non rilevanti
-        if any(
-            substr in filename.lower()
-            for substr in to_exclude
-        ):
+    files_by_kind: dict[str, list[str]] = {kind: [] for kind in stacks}
+    for filename in _raster_filenames(directory):
+        tokens = _filename_tokens(filename)
+        if "sentinel2" in tokens or "s2" in tokens:
             continue
+        if "agea" in tokens:
+            kind = "agea"
+        elif "cgr" in tokens:
+            kind = "cgr"
+        elif "slope" in tokens:
+            kind = "slope"
+        elif "ndvi" in tokens:
+            kind = "ndvi"
+        elif "frane" in tokens:
+            kind = "frane"
+        else:
+            continue
+        files_by_kind[kind].append(filename)
 
-        path = os.path.join(directory, filename)
-
-        with rasterio.open(path) as src:
-            data = get_data(src, True)
-
-            data[:, ~mask] = 0
-
-            # Otteniamo i canali come liste di array 2D
-            bands = list(data)
-
-            if "agea" in filename.lower():
-                input_stack.extend(bands)
-            elif "cgr" in filename.lower():
-                input_stack.extend(bands)
-            elif include_slope_ndvi and "slope" in filename.lower():
-                input_stack.extend(bands)
-            elif include_slope_ndvi and "ndvi" in filename.lower():
-                input_stack.extend(bands)
-            elif "frane" in filename.lower():
-                landslide_mask = get_landslide_mask(bands)
-                output_stack.extend(landslide_mask)
+    input_kinds = (
+        ("agea", "cgr", "slope", "ndvi")
+        if include_slope_ndvi
+        else ("agea", "cgr")
+    )
+    for kind in (*input_kinds, "frane"):
+        for filename in files_by_kind[kind]:
+            bands = _read_masked_raster(
+                os.path.join(directory, filename),
+                mask,
+                reference_crs,
+                reference_transform,
+            )
+            if kind == "frane":
+                stacks[kind].extend(get_landslide_mask(bands))
             else:
-                print(f"File '{filename}' not included, skipping.")
+                stacks[kind].extend(bands)
 
-    if not input_stack:
-        raise ValueError("No input data found")
+    input_stack = [band for kind in input_kinds for band in stacks[kind]]
+    output_stack = stacks["frane"]
+
+    for kind in input_kinds:
+        if not stacks[kind]:
+            raise ValueError(f"No {kind} data found")
     if not output_stack:
         raise ValueError("No output data found")
 
@@ -325,10 +391,10 @@ def check_similarity(
         ValueError: Se i dati non hanno la stessa forma o se non sono almeno 2D o se la maschera non è valida
     """
 
-    if first_img.shape != second_img.shape or first_img.shape[1:] != mask.shape:
-        raise ValueError("Data must have the same shape")
-    if len(first_img.shape) != 2 and len(first_img.shape) != 3:
+    if first_img.ndim not in (2, 3):
         raise ValueError("Data must be a 2D or 3D array")
+    if first_img.shape != second_img.shape or first_img.shape[-2:] != mask.shape:
+        raise ValueError("Data must have the same shape")
 
     _, ssim_img = structural_similarity(  # type: ignore
         first_img,
@@ -350,7 +416,7 @@ def check_similarity(
         ssim_masked = ssim_img[..., mask]
     mssim = ssim_masked.mean()
 
-    assert mssim >= 0 and mssim <= 1, "MSSIM must be between 0 and 1"
+    # SSIM can be negative for anti-correlated images.
     return mssim >= threshold
 
 
@@ -360,6 +426,8 @@ def get_random_patch(
     patch_size: int,
     mask: np.ndarray,
     return_similar: bool = True,
+    max_attempts: int = 100,
+    rng: np.random.Generator | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Estrae la stessa patch casuale di dimensioni patch_size x patch_size da due stack.
 
@@ -368,6 +436,8 @@ def get_random_patch(
         second_img: Secondo array numpy (CHW o HW) senza NaN
         patch_size: Dimensione della patch quadrata da estrarre
         mask: Maschera 2D che indica i pixel validi
+        max_attempts: Numero massimo di posizioni casuali da provare
+        rng: Generatore locale opzionale per il campionamento deterministico
 
     Returns:
         first_patch, second_patch, patch_mask
@@ -376,69 +446,63 @@ def get_random_patch(
         ValueError: Se gli input non rispettano i requisiti di forma o dimensione
     """
 
-    if first_img.shape[1:] != second_img.shape[1:]:
-        raise ValueError("Sentinel and drone data must have the same shape")
+    if first_img.ndim not in (2, 3) or second_img.ndim not in (2, 3):
+        raise ValueError("Data must be a 2D or 3D array")
+    if first_img.shape[-2:] != second_img.shape[-2:]:
+        raise ValueError("Data must have the same spatial dimensions")
     if patch_size <= 0:
         raise ValueError("Patch size must be positive")
-    if len(mask.shape) != 2:
+    if mask.ndim != 2:
         raise ValueError("Mask must be a 2D array")
-    if len(first_img.shape) != 2 and len(first_img.shape) != 3:
-        raise ValueError("Data must be a 2D or 3D array")
     if first_img.shape[-2:] != mask.shape:
         raise ValueError("Data and mask must have the same spatial dimensions")
     if min(first_img.shape[-2:]) < patch_size:
         raise ValueError("Data must be larger than patch size")
+    if max_attempts <= 0:
+        raise ValueError("Maximum attempts must be positive")
 
     height, width = first_img.shape[-2:]
     max_y = height - patch_size
     max_x = width - patch_size
 
-    start_y = np.random.randint(0, max_y + 1)
-    start_x = np.random.randint(0, max_x + 1)
+    for _ in range(max_attempts):
+        if rng is None:
+            start_y = np.random.randint(0, max_y + 1)
+            start_x = np.random.randint(0, max_x + 1)
+        else:
+            start_y = int(rng.integers(0, max_y + 1))
+            start_x = int(rng.integers(0, max_x + 1))
 
-    end_y = start_y + patch_size
-    end_x = start_x + patch_size
+        end_y = start_y + patch_size
+        end_x = start_x + patch_size
 
-    first_patch = first_img[..., start_y:end_y, start_x:end_x]
-    second_patch = second_img[..., start_y:end_y, start_x:end_x]
-    patch_mask = mask[start_y:end_y, start_x:end_x]
+        first_patch = first_img[..., start_y:end_y, start_x:end_x]
+        second_patch = second_img[..., start_y:end_y, start_x:end_x]
+        patch_mask = mask[start_y:end_y, start_x:end_x].copy()
 
-    # Se il patch non ha almeno l'80% di area valida, ne estraiamo un altro
-    if patch_mask.sum() < ((patch_size**2) * 0.8):
-        return get_random_patch(first_img, second_img, patch_size, mask, return_similar)
+        first_finite = np.isfinite(first_patch)
+        second_finite = np.isfinite(second_patch)
+        if first_patch.ndim == 3:
+            first_finite = first_finite.all(axis=0)
+        if second_patch.ndim == 3:
+            second_finite = second_finite.all(axis=0)
+        patch_mask &= first_finite & second_finite
 
-    # # Creiamo i tensori da numpy
-    # first_tensor = torch.from_numpy(first_patch).unsqueeze(0)
-    # second_tensor = torch.from_numpy(second_patch).unsqueeze(0)
-    # mask_tensor = torch.from_numpy(patch_mask).unsqueeze(0).unsqueeze(0).float()
+        if patch_mask.sum() < ((patch_size**2) * 0.8):
+            continue
 
-    # # Downgradiamo entrambi i patch di 5 volte per controllare che i dati siano simili
-    # first_downsampled = F.interpolate(
-    #     first_tensor, scale_factor=0.2, mode="bilinear", align_corners=False
-    # ).squeeze(0)
-    # second_downsampled = F.interpolate(
-    #     second_tensor, scale_factor=0.2, mode="bilinear", align_corners=False
-    # ).squeeze(0)
-    # mask_downsampled = (
-    #     F.interpolate(mask_tensor, scale_factor=0.2, mode="nearest")
-    #     .squeeze(0)
-    #     .squeeze(0)
-    # ).bool()
+        first_patch = np.nan_to_num(
+            first_patch, copy=True, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        second_patch = np.nan_to_num(
+            second_patch, copy=True, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        return first_patch, second_patch, patch_mask
 
-    # first_downsampled = first_downsampled.numpy()
-    # second_downsampled = second_downsampled.numpy()
-    # mask_downsampled = mask_downsampled.numpy()
-
-    # # Controlliamo la similarità tra i patch
-    # sim = check_similarity(
-    #     first_downsampled, second_downsampled, mask_downsampled, 0.20
-    # )
-
-    # if sim == return_similar:
-    return first_patch, second_patch, patch_mask
-    # else:
-    #     # Se non é quello che vogliamo, ne estraiamo un altro
-    #     return get_random_patch(first_img, second_img, patch_size, mask, return_similar)
+    raise ValueError(
+        "Could not find a finite valid patch with at least 80% valid pixels "
+        f"after {max_attempts} attempts"
+    )
 
 
 def augment_data(
@@ -465,17 +529,20 @@ def augment_data(
     if np.random.rand() < prob:
         in_data = torch.flip(in_data, dims=[2])
         out_data = torch.flip(out_data, dims=[2])
+        patch_mask = torch.flip(patch_mask, dims=[1])
 
     # Flip verticale
     if np.random.rand() < prob:
         in_data = torch.flip(in_data, dims=[1])
         out_data = torch.flip(out_data, dims=[1])
+        patch_mask = torch.flip(patch_mask, dims=[0])
 
     # Rotazione casuale di 0, 90, 180 o 270 gradi
     if np.random.rand() < prob:
         k = np.random.randint(0, 4)
         in_data = torch.rot90(in_data, k=k, dims=[1, 2])
         out_data = torch.rot90(out_data, k=k, dims=[1, 2])
+        patch_mask = torch.rot90(patch_mask, k=k, dims=[0, 1])
 
     # Scegliamo se applicare luminosità o contrasto
     do_brightness = np.random.rand() < 0.5
@@ -525,6 +592,7 @@ class SuperResolutionDataset(Dataset):
         patch_size: Dimensione delle patch quadrate da estrarre
         num_patches: Numero di patch da generare per epoch
         to_augment: Se True, applica augmentazioni casuali ai dati
+        evaluation_seed: Seed opzionale per rendere ogni indice di valutazione stabile
     """
 
     def __init__(
@@ -536,6 +604,7 @@ class SuperResolutionDataset(Dataset):
         for_training: bool = False,
         synthetic_data: bool = False,
         to_augment: bool = True,
+        evaluation_seed: int | None = None,
     ) -> None:
         self.comune = comune
         self.scale = scale
@@ -543,6 +612,11 @@ class SuperResolutionDataset(Dataset):
         self.num_patches = num_patches
         self.to_augment = to_augment
         self.synthetic_data = synthetic_data
+        if evaluation_seed is not None and evaluation_seed < 0:
+            raise ValueError("Evaluation seed must be non-negative")
+        if evaluation_seed is not None and to_augment:
+            raise ValueError("evaluation_seed requires to_augment=False")
+        self.evaluation_seed = evaluation_seed
         if for_training:
             self.set_comuni = [
                 c
@@ -566,30 +640,25 @@ class SuperResolutionDataset(Dataset):
                 cast(ComuneType, single_comune)
             )
 
-            if single_comune == "Brisighella":
-                print("Fixing NaN values in NIR band for Brisighella...")
-                # Il NIR (banda 3) contiene pochi NaN non coperti dalla maschera; imposta a 0 SOLO i NaN dentro la maschera
-                sentinel_post, _cgr = self.stack_post[single_comune]
-                nir = sentinel_post[3]
-                mask2d = self.mask[single_comune]
-
-                bad = np.isnan(nir) & mask2d
-                if bad.any():
-                    nir[bad] = 0.0
-                    sentinel_post[3] = nir.astype(np.float32)
-                    self.stack_post[single_comune] = (sentinel_post, _cgr)
-
     def __len__(self) -> int:
         return self.num_patches
 
-    def __getitem__(self, _) -> Tuple[torch.Tensor, torch.Tensor]:
-        random_comune = np.random.choice(self.set_comuni)
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.evaluation_seed is None:
+            rng = None
+            random_comune = np.random.choice(self.set_comuni)
+        else:
+            rng = np.random.default_rng(
+                np.random.SeedSequence([self.evaluation_seed, int(index)])
+            )
+            random_comune = rng.choice(self.set_comuni)
 
         low_res_patch, high_res_patch, patch_mask = get_random_patch(
             self.stack_post[random_comune][1 if self.synthetic_data else 0],
             self.stack_post[random_comune][1],
             self.patch_size * self.scale,
             self.mask[random_comune],
+            rng=rng,
         )
 
         # Convertiamo a tensori e assicuriamo il formato corretto

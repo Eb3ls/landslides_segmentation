@@ -963,6 +963,12 @@ class DRCT(nn.Module):
         return x
 
     def forward(self, x):
+        original_size = x.shape[2:]
+        mod_pad_h = (self.window_size - original_size[0] % self.window_size) % self.window_size
+        mod_pad_w = (self.window_size - original_size[1] % self.window_size) % self.window_size
+        if mod_pad_h or mod_pad_w:
+            x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), mode="reflect")
+
         # Normalizzazione
         self.mean = self.mean.type_as(x)
         self.std = self.std.type_as(x)
@@ -1052,6 +1058,8 @@ class DRCT(nn.Module):
         # Denormalizzazione
         x = x * (self.std) + self.mean
 
+        if mod_pad_h or mod_pad_w:
+            return x[:, :, : original_size[0] * self.upscale, : original_size[1] * self.upscale]
         return x
 
 

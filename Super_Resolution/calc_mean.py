@@ -3,7 +3,7 @@ import sys
 import json
 from datetime import datetime
 import argparse
-from typing import Literal, Tuple
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -11,7 +11,6 @@ from torch.utils.data import DataLoader
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from Super_Resolution.config import load_config
 from data_utils import ComuneType, SuperResolutionDataset
 
 
@@ -56,7 +55,7 @@ def _compute_stats_from_loader_on_tensor(
     return mean, std
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Compute per-channel mean/std for SR training data"
     )
@@ -67,29 +66,60 @@ def main():
         help="Number of patches for the temporary dataset (defaults to train.dataset_size)",
     )
     parser.add_argument(
+        "--patch_size",
+        type=int,
+        default=128,
+        help="Low-resolution patch side length; the source patch is scale times larger",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used while sampling patches",
+    )
+    parser.add_argument(
         "--synthetic_data",
-        default=False,
+        action="store_true",
         help="Use synthetic data for stats computation",
     )
     parser.add_argument(
         "--excluded_comune",
         type=str,
         default="Brisighella",
+        choices=["Brisighella", "Casola-Valsenio", "Modigliana", "Predappio"],
         help="Comune to exclude",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="DataLoader workers; use 0 for in-process loading",
+    )
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
+    if args.dataset_size <= 0 or args.patch_size <= 0:
+        parser.error("--dataset_size and --patch_size must be positive")
+    if args.workers < 0:
+        parser.error("--workers must be non-negative")
 
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    img_size = 128
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     # Crea un dataset analogo a quello di training ma SENZA augmentazione
     train_dataset = SuperResolutionDataset(
         comune=args.excluded_comune,
         scale=5,
-        patch_size=img_size,
+        patch_size=args.patch_size,
         num_patches=args.dataset_size,
         for_training=True,
         to_augment=False,
@@ -99,8 +129,8 @@ def main():
     loader = DataLoader(
         train_dataset,
         batch_size=16,
-        num_workers=4,
-        persistent_workers=True,
+        num_workers=args.workers,
+        persistent_workers=args.workers > 0,
         pin_memory=torch.cuda.is_available(),
     )
 
@@ -115,7 +145,8 @@ def main():
         "std": std.tolist(),
         "details": {
             "dataset_size": train_dataset.num_patches,
-            "img_size": img_size,
+            "patch_size": args.patch_size,
+            "seed": args.seed,
             "synthetic_data": args.synthetic_data,
             "training_comuni": train_dataset.set_comuni,
         },

@@ -1,0 +1,30 @@
+# NEW EXAMPLE: compact 5x RCAN run. Replace stats_file with statistics from calc_mean.py.
+model:
+  name: rcan_5x_example
+  dir_path: outputs/
+  scale: 5
+  img_size: 40
+  stats_file: ../channel_stats.json
+  residual_groups: 2
+  feature_extraction_channels: 16
+  reduction_channels: 4
+train:
+  seed: 42
+  workers: 0
+  dataset_size: 100
+  augment_data: true
+  synthetic_data: false
+  batch_size: 1
+  epochs: 1
+  show_progress: true
+  use_moe_loss: false
+  loss_weights:
+    charb: 1.0
+test:
+  load_model: false
+  comune: Brisighella
+  dataset_size: 20
+  batch_size: 1
+  image_samples: 1
+  run_napari: false
+  synthetic_data: false
