@@ -1,5 +1,4 @@
-*.csv
-*.json
+Super_Resolution/channel_stats.json
 .vscode
 Comuni
 plots
@@ -14,6 +13,10 @@ Super_Resolution/mymodel/*
 Super_Resolution/pswin/*
 Super_Resolution/myDRCT/*
 venv
+.venv/
+.pytest_cache/
+*.py[cod]
+outputs/
 
 # Files to keep
 !Super_Resolution/rcan/rcan_model.py
@@ -24,3 +27,6 @@ venv
 !Super_Resolution/pswin/pswin_model.py
 !Super_Resolution/pswin/train.py
 !Super_Resolution/myDRCT/DRCT.py
+!Super_Resolution/rcan/config.yml
+!Super_Resolution/myDRCT/config.yml
+!Super_Resolution/swin2mose/config.yml

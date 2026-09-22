@@ -1,11 +1,11 @@
 import json
+import math
 import random
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
-import napari
 import os
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -13,9 +13,6 @@ from dataclasses import asdict
 from typing import Optional
 
 from pytorch_msssim import ms_ssim
-from torchmetrics.image import (
-    PeakSignalNoiseRatio,
-)
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from datetime import datetime
 from Super_Resolution.config import (
@@ -31,25 +28,52 @@ from Super_Resolution.mymodel.mymodel_model import MyModel
 from Super_Resolution.myDRCT.DRCT import DRCT
 from data_utils import SuperResolutionDataset
 
+try:
+    import napari
+except ImportError:
+    napari = None
+
+
+def _model_output_dir(config: Config) -> str:
+    return os.path.join(config.model.dir_path, config.model.name)
+
 
 def _config_to_dict(config: Config) -> dict:
     """Converte la Config in un dizionario annidato pronto per JSON."""
+    model_config = asdict(config.model)
+    for attribute in ("mean", "std"):
+        if hasattr(config.model, attribute):
+            model_config[attribute] = getattr(config.model, attribute)
+
+    train_config = asdict(config.train)
+    for attribute in ("finetune", "finetune_scope"):
+        if hasattr(config.train, attribute):
+            train_config[attribute] = getattr(config.train, attribute)
+    if getattr(config.train, "finetune", False):
+        train_config["finetune_from"] = os.path.abspath(config.train.finetune_from)
+
     return {
-        "model": asdict(config.model),
-        "train": asdict(config.train),
+        "model": model_config,
+        "train": train_config,
         "test": asdict(config.test),
     }
 
 
-def _json_default(o):
-    """Gestione di tipi non serializzabili (es. numpy) in JSON."""
-    if isinstance(o, (np.integer,)):
-        return int(o)
-    if isinstance(o, (np.floating,)):
-        return float(o)
-    if isinstance(o, (np.ndarray,)):
-        return o.tolist()
-    return str(o)
+def _json_compatible(value):
+    """Keep metric exports valid JSON, including mathematically infinite PSNR."""
+    if isinstance(value, np.ndarray):
+        return _json_compatible(value.tolist())
+    if isinstance(value, np.generic):
+        return _json_compatible(value.item())
+    if isinstance(value, dict):
+        return {key: _json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "NaN"
+        return "Infinity" if value > 0 else "-Infinity"
+    return value
 
 
 def save_metrics(metrics_dict: dict, config: Config) -> None:
@@ -62,21 +86,18 @@ def save_metrics(metrics_dict: dict, config: Config) -> None:
         "model_config": _config_to_dict(config),
     }
 
-    with open(
-        f"{config.model.dir_path}{config.model.name}/metrics.json",
-        "w",
-        encoding="utf-8",
-    ) as f:
+    metrics_path = os.path.join(_model_output_dir(config), "metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(
-            metrics_data,
+            _json_compatible(metrics_data),
             f,
             indent=4,
             sort_keys=True,
             ensure_ascii=False,
-            default=_json_default,
+            allow_nan=False,
         )
 
-    print(f"Metrics saved to {config.model.dir_path}{config.model.name}/metrics.json")
+    print(f"Metrics saved to {metrics_path}")
 
 
 def charbonnier_loss(
@@ -253,6 +274,13 @@ def total_variation_loss(x: torch.Tensor) -> torch.Tensor:
     return loss_h + loss_w
 
 
+def _psnr_sum(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Return the sum of per-sample PSNR values without retaining metric state."""
+    squared_error = (prediction.float() - target.float()).square()
+    sample_mse = squared_error.flatten(1).mean(dim=1)
+    return (10.0 * torch.log10(1.0 / sample_mse)).sum()
+
+
 def composite_loss(
     sr: torch.Tensor,
     hr: torch.Tensor,
@@ -277,9 +305,9 @@ def composite_loss(
             charb_v_nir = charbonnier_loss(sr[:, 3:], hr[:, 3:])
         else:
             charb_v_nir = torch.tensor(0.0, device=sr.device, dtype=sr.dtype)
-        comps["charb_rgb"] = w_rgb * charb_v_rgb
-        comps["charb_nir"] = w_nir * charb_v_nir
-        comps["charb"] = comps["charb_rgb"] + comps["charb_nir"]
+        comps["charb"] = weights["charb"] * (
+            w_rgb * charb_v_rgb + w_nir * charb_v_nir
+        )
 
     if weights.get("ncc", 0.0) > 0:
         ncc_v = ncc_loss(sr, hr)
@@ -310,6 +338,7 @@ def composite_loss(
     if weights.get("lpips", 0.0) > 0:
         lpips_module = _get_lpips_loss(sr.device)
         lpips_v = lpips_module(sr_clamped[:, :3, :, :], hr[:, :3, :, :])
+        lpips_module.reset()
         comps["lpips"] = weights["lpips"] * lpips_v
 
     # MoE
@@ -320,7 +349,9 @@ def composite_loss(
             moe_loss_tensor = moe_loss.to(device=sr.device, dtype=sr.dtype)
         comps["moe"] = weights["moe"] * moe_loss_tensor
 
-    total = torch.stack([v for v in comps.values()]).sum()
+    if not comps:
+        raise ValueError("At least one loss weight must be positive")
+    total = torch.stack(list(comps.values())).sum()
 
     return total, comps
 
@@ -351,54 +382,23 @@ def train_model(
     )
     optimizer = optim.AdamW(opt_params, lr=2e-4, weight_decay=1e-4, betas=(0.9, 0.999))
 
-    total_steps = config.train.epochs * len(dataloader) // accumulation_steps
-    milestones = [
-        int(0.30 * total_steps),
-        int(0.50 * total_steps),
-        int(0.65 * total_steps),
-        int(0.70 * total_steps),
-        int(0.75 * total_steps),
-    ]
+    updates_per_epoch = math.ceil(len(dataloader) / accumulation_steps)
+    total_steps = config.train.epochs * updates_per_epoch
+    milestones = sorted(
+        {
+            step
+            for fraction in (0.30, 0.50, 0.65, 0.70, 0.75)
+            if 0 < (step := int(fraction * total_steps)) < total_steps
+        }
+    )
     scheduler = optim.lr_scheduler.MultiStepLR(
         optimizer,
         milestones=milestones,
         gamma=0.5,
     )
-    steps_per_epoch = len(dataloader) // accumulation_steps
-
-    # scheduler = optim.lr_scheduler.OneCycleLR(
-    #     optimizer,
-    #     max_lr=2e-4,
-    #     epochs=config.train.epochs,
-    #     steps_per_epoch=steps_per_epoch,
-    #     pct_start=0.2,
-    #     anneal_strategy="cos",
-    #     div_factor=25.0,  # Lr iniziale = max_lr / div_factor
-    #     final_div_factor=100,  # Lr finale = max_lr / final_div_factor
-    #     three_phase=False,  # solo salita e discesa
-    #     last_epoch=-1,  # inizia da 0
-    #     cycle_momentum=False,  # Gestito da AdamW
-    # )
-
-    # warmup_epochs = 0.1 * config.train.epochs
-    # warmup_steps = int(warmup_epochs * steps_per_epoch)
-
-    # warmup = optim.lr_scheduler.LinearLR(
-    #     optimizer, start_factor=1 / 10, end_factor=1.0, total_iters=warmup_steps
-    # )
-    # cosine = optim.lr_scheduler.CosineAnnealingLR(
-    #     optimizer,
-    #     T_max=total_steps - warmup_steps,
-    #     eta_min=2e-5,
-    # )
-    # scheduler = optim.lr_scheduler.SequentialLR(
-    #     optimizer,
-    #     schedulers=[warmup, cosine],
-    #     milestones=[warmup_steps],
-    # )
+    steps_per_epoch = updates_per_epoch
 
     print("Total updates:", total_steps, "and each epoch:", steps_per_epoch)
-    # print("Warmup steps:", warmup_steps, "cosine steps:", total_steps - warmup_steps)
 
     # Prepara dizionario dinamico delle curve
     print("All loss weights:", config.train.loss_weights)
@@ -412,13 +412,11 @@ def train_model(
     tracking["psnr_rgb"] = []
     tracking["psnr_nir"] = []
 
-    model.train()
-
-    psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
-
     for epoch in range(config.train.epochs):
+        model.train()
         accumulators = {k: 0.0 for k in ["total", *active_losses]}
-        batch_count = 0
+        sample_count = 0
+        accumulated_samples = 0
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -439,32 +437,38 @@ def train_model(
                     moe_loss_val = 0.0
 
                 total_loss, comps = criterion(outputs, high_res, config, moe_loss_val)
-                (total_loss / accumulation_steps).backward()
+                batch_size = low_res.shape[0]
+                (total_loss * batch_size).backward()
 
-                batch_count += 1
+                sample_count += batch_size
+                accumulated_samples += batch_size
 
-                accumulators["total"] += float(total_loss.detach().item())
+                accumulators["total"] += float(total_loss.detach().item()) * batch_size
                 for k in active_losses:
-                    accumulators[k] += float(comps[k].detach().item())
+                    accumulators[k] += float(comps[k].detach().item()) * batch_size
 
                 # Se è l'ultimo step di accumulazione, esegui l'update
                 do_step = ((step + 1) % accumulation_steps == 0) or (
                     (step + 1) == len(dataloader)
                 )
                 if do_step:
+                    for parameter in model.parameters():
+                        if parameter.grad is not None:
+                            parameter.grad.div_(accumulated_samples)
                     # Clip dei gradienti per stabilitá
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
                     scheduler.step()
+                    accumulated_samples = 0
 
                 pbar.set_postfix({"tot": f"{total_loss.item():.6f}"})
 
         # Fine epoca
 
-        tracking["total"].append(accumulators["total"] / batch_count)
+        tracking["total"].append(accumulators["total"] / sample_count)
         for k in active_losses:
-            tracking[k].append(accumulators[k] / batch_count)
+            tracking[k].append(accumulators[k] / sample_count)
         tracking["lr"].append(optimizer.param_groups[0]["lr"])
 
         comps_log = " | ".join(f"{k}:{tracking[k][-1]:.5f}" for k in active_losses)
@@ -477,6 +481,7 @@ def train_model(
         psnr_total = 0.0
         psnr_rgb = 0.0
         psnr_nir = 0.0
+        eval_sample_count = 0
 
         model.eval()
         with torch.no_grad():
@@ -488,17 +493,20 @@ def train_model(
                 if isinstance(outputs, tuple):
                     outputs, _ = outputs
 
-                psnr_total += psnr_metric(outputs, high_res).item()
-                psnr_rgb += psnr_metric(
-                    outputs[:, :3, :, :], high_res[:, :3, :, :]
+                batch_size = low_res.shape[0]
+                eval_sample_count += batch_size
+                outputs_c = torch.clamp(outputs, 0.0, 1.0)
+                target_c = torch.clamp(high_res, 0.0, 1.0)
+                psnr_total += _psnr_sum(outputs_c, target_c).item()
+                psnr_rgb += _psnr_sum(
+                    outputs_c[:, :3, :, :], target_c[:, :3, :, :]
                 ).item()
-                psnr_nir += psnr_metric(
-                    outputs[:, 3:, :, :], high_res[:, 3:, :, :]
+                psnr_nir += _psnr_sum(
+                    outputs_c[:, 3:, :, :], target_c[:, 3:, :, :]
                 ).item()
-        num_batches = len(eval_dataloader)
-        tracking["psnr_total"].append(psnr_total / num_batches)
-        tracking["psnr_rgb"].append(psnr_rgb / num_batches)
-        tracking["psnr_nir"].append(psnr_nir / num_batches)
+        tracking["psnr_total"].append(psnr_total / eval_sample_count)
+        tracking["psnr_rgb"].append(psnr_rgb / eval_sample_count)
+        tracking["psnr_nir"].append(psnr_nir / eval_sample_count)
 
     return tracking
 
@@ -506,7 +514,7 @@ def train_model(
 def evaluate_model(
     model: nn.Module, dataloader: DataLoader, device: torch.device
 ) -> dict:
-    """Valuta il modello con PSNR, SSIM e LPIPS"""
+    """Valuta il modello con PSNR, two-scale MS-SSIM e LPIPS."""
 
     model.eval()
     psnr_total = 0.0
@@ -514,13 +522,12 @@ def evaluate_model(
     psnr_only_nir = 0.0
     ssim_total = 0.0
     lpips_total = 0.0
-    num_batches = 0
+    num_samples = 0
 
     bicubic_list = []
     nearest_list = []
 
     # Inizializza le metriche
-    psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim_metric = ms_ssim
     lpips_metric = LearnedPerceptualImagePatchSimilarity(
         net_type="vgg", normalize=True
@@ -539,11 +546,12 @@ def evaluate_model(
             outputs_c = torch.clamp(outputs, 0.0, 1.0)
             target_c = torch.clamp(high_res, 0.0, 1.0)
 
-            psnr_total += psnr_metric(outputs_c, target_c).item()
-            psnr_total_no_nir += psnr_metric(
+            batch_size = low_res.shape[0]
+            psnr_total += _psnr_sum(outputs_c, target_c).item()
+            psnr_total_no_nir += _psnr_sum(
                 outputs_c[:, :3, :, :], target_c[:, :3, :, :]
             ).item()
-            psnr_only_nir += psnr_metric(
+            psnr_only_nir += _psnr_sum(
                 outputs_c[:, 3:, :, :], target_c[:, 3:, :, :]
             ).item()
             ssim_total += ssim_metric(
@@ -551,20 +559,21 @@ def evaluate_model(
                 target_c[:, :3, :, :],
                 data_range=1.0,
                 weights=[0.5, 0.5],
-            ).item()
+            ).item() * batch_size
 
             lpips_total += lpips_metric(
                 outputs_c[:, :3, :, :], target_c[:, :3, :, :]
-            ).item()
+            ).item() * batch_size
+            lpips_metric.reset()
 
-            num_batches += 1
+            num_samples += batch_size
 
             # Bicubica/nearest di baseline
             low_res_tensor = torch.nn.functional.interpolate(
                 low_res, scale_factor=5, mode="bicubic", align_corners=False
             )
             bicubic_list.append(
-                psnr_metric(torch.clamp(low_res_tensor, 0, 1), target_c).item()
+                _psnr_sum(torch.clamp(low_res_tensor, 0, 1), target_c).item()
             )
 
             low_res_tensor = torch.nn.functional.interpolate(
@@ -573,17 +582,21 @@ def evaluate_model(
                 mode="nearest",
             )
             nearest_list.append(
-                psnr_metric(torch.clamp(low_res_tensor, 0, 1), target_c).item()
+                _psnr_sum(torch.clamp(low_res_tensor, 0, 1), target_c).item()
             )
 
-    print(f"Avg Bicubic PSNR: {np.mean(bicubic_list):.4f}")
-    print(f"Avg Nearest PSNR: {np.mean(nearest_list):.4f}")
+    avg_bicubic = sum(bicubic_list) / num_samples
+    avg_nearest = sum(nearest_list) / num_samples
+    print(f"Avg Bicubic PSNR: {avg_bicubic:.4f}")
+    print(f"Avg Nearest PSNR: {avg_nearest:.4f}")
+    average_ms_ssim = ssim_total / num_samples
     return {
-        "psnr": psnr_total / num_batches,
-        "psnr_no_nir": psnr_total_no_nir / num_batches,
-        "psnr_only_nir": psnr_only_nir / num_batches,
-        "ssim": ssim_total / num_batches,
-        "lpips": lpips_total / num_batches,
+        "psnr": psnr_total / num_samples,
+        "psnr_no_nir": psnr_total_no_nir / num_samples,
+        "psnr_only_nir": psnr_only_nir / num_samples,
+        "ms_ssim": average_ms_ssim,
+        "ssim": average_ms_ssim,
+        "lpips": lpips_total / num_samples,
     }
 
 
@@ -663,6 +676,8 @@ def visualize_predictions(
             )
 
     if config.test.run_napari:
+        if napari is None:
+            raise RuntimeError("Napari visualization requested, but napari is not installed")
         viewer = napari.Viewer()
         for img_set in images:
             (
@@ -697,7 +712,7 @@ def visualize_predictions(
             high_nir,
             pred_nir,
         ) = img_set
-        plt.figure(figsize=(15, 10))
+        figure = plt.figure(figsize=(15, 10))
 
         plt.subplot(2, 3, 1)
         plt.imshow(low_upscale_rgb)
@@ -730,12 +745,13 @@ def visualize_predictions(
         plt.axis("off")
 
         plt.tight_layout()
-        plt.savefig(config.model.dir_path + config.model.name + f"/sample_{i}.png")
+        figure.savefig(os.path.join(_model_output_dir(config), f"sample_{i}.png"))
+        plt.close(figure)
 
 
 def save_model(model: nn.Module, config: Config) -> None:
     """Salva il modello su disco."""
-    path = config.model.dir_path + config.model.name + "/model.pth"
+    path = os.path.join(_model_output_dir(config), "model.pth")
     torch.save(model.state_dict(), path)
     print(f"Model saved to {path}")
 
@@ -755,7 +771,7 @@ def load_model(
     # Inizializziamo il modello
     model = model_class.to(device)
     # Carichiamo i pesi
-    path = config.model.dir_path + config.model.name + "/model.pth"
+    path = os.path.join(_model_output_dir(config), "model.pth")
     model.load_state_dict(torch.load(path, map_location=device))
 
     return model
@@ -772,14 +788,17 @@ def _enable_module(m: nn.Module) -> None:
 
 
 def _prepare_finetune_head_only(model: nn.Module) -> list[nn.Parameter]:
-    """Freeze everything except the SR tail for DRCT.
+    """Freeze everything except the model's SR reconstruction head.
     Returns the list of trainable parameters.
     """
     # Freeze everything first
     for p in model.parameters():
         p.requires_grad = False
 
-    if isinstance(model, DRCT) and getattr(model, "upsampler", "") == "test":
+    if isinstance(model, DRCT) and getattr(model, "upsampler", "") in {
+        "test",
+        "only_shuffle",
+    }:
         if hasattr(model, "tail") and isinstance(model.tail, nn.Module):
             _enable_module(model.tail)
             if hasattr(model.tail, "antialias") and isinstance(
@@ -789,22 +808,34 @@ def _prepare_finetune_head_only(model: nn.Module) -> list[nn.Parameter]:
     else:
         if hasattr(model, "conv_last") and isinstance(model.conv_last, nn.Module):
             _enable_module(model.conv_last)
+        elif hasattr(model, "upsample") and isinstance(model.upsample, nn.Module):
+            _enable_module(model.upsample)
 
-    return [p for p in model.parameters() if p.requires_grad]
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    if not trainable:
+        raise ValueError(f"No fine-tuning head found for {type(model).__name__}")
+    return trainable
 
 
 def _load_finetune_checkpoint(
     model: nn.Module, ckpt_path: str, device: torch.device
 ) -> None:
-    if ckpt_path and os.path.isfile(ckpt_path):
-        state = torch.load(ckpt_path, map_location=device)
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        if missing:
-            print(f"[Finetune] Missing keys: {len(missing)} (ok if tail changed)")
-        if unexpected:
-            print(f"[Finetune] Unexpected keys: {len(unexpected)}")
-    else:
-        print("[Finetune] No valid checkpoint provided; training from current init")
+    if not ckpt_path or not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Fine-tuning checkpoint not found: {ckpt_path!r}")
+
+    state = torch.load(ckpt_path, map_location=device)
+    if isinstance(state, dict) and isinstance(state.get("state_dict"), dict):
+        state = state["state_dict"]
+    if not isinstance(state, dict):
+        raise TypeError("Fine-tuning checkpoint must contain a model state dictionary")
+    if not set(model.state_dict()).intersection(state):
+        raise ValueError("Fine-tuning checkpoint has no parameters matching the model")
+    try:
+        model.load_state_dict(state, strict=True)
+    except RuntimeError as exc:
+        raise ValueError(
+            "Fine-tuning checkpoint is not fully compatible with the model"
+        ) from exc
 
 
 def launch_all(
@@ -835,14 +866,15 @@ def launch_all(
             num_patches=config.test.dataset_size,
             for_training=False,
             to_augment=False,
-            synthetic_data=config.train.synthetic_data,
+            synthetic_data=config.test.synthetic_data,
+            evaluation_seed=config.train.seed,
         )
 
         test_loader = DataLoader(
             test_dataset,
             config.test.batch_size,
             num_workers=config.train.workers,
-            persistent_workers=True,
+            persistent_workers=config.train.workers > 0,
             pin_memory=torch.cuda.is_available(),
             worker_init_fn=seed_workers,
         )
@@ -877,8 +909,8 @@ def launch_all(
             base_name = config.model.name
             if not str(base_name).endswith("_finetune"):
                 config.model.name = f"{base_name}_finetune"
-            os.makedirs(f"{config.model.dir_path}{config.model.name}", exist_ok=True)
-            print(f"[Finetune] Output dir: {config.model.dir_path}{config.model.name}")
+            os.makedirs(_model_output_dir(config), exist_ok=True)
+            print(f"[Finetune] Output dir: {_model_output_dir(config)}")
 
             _load_finetune_checkpoint(model, finetune_ckpt, device)
             if finetune_scope == "head":
@@ -887,7 +919,7 @@ def launch_all(
                 trainable_params = [p for p in model.parameters() if p.requires_grad]
         else:
             # Assicura la cartella esista comunque
-            os.makedirs(f"{config.model.dir_path}{config.model.name}", exist_ok=True)
+            os.makedirs(_model_output_dir(config), exist_ok=True)
             trainable_params = [p for p in model.parameters() if p.requires_grad]
 
         # Dataset di addestramento
@@ -905,7 +937,7 @@ def launch_all(
             train_dataset,
             config.train.batch_size,
             num_workers=config.train.workers,
-            persistent_workers=True,
+            persistent_workers=config.train.workers > 0,
             pin_memory=torch.cuda.is_available(),
             worker_init_fn=seed_workers,
         )
@@ -926,7 +958,9 @@ def launch_all(
         n_plots = 1 + len(active_components)
         cols = 3
         rows = (n_plots + cols - 1) // cols
-        _, axs = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), sharex=True)
+        loss_figure, axs = plt.subplots(
+            rows, cols, figsize=(5 * cols, 4 * rows), sharex=True
+        )
         axs = np.atleast_1d(axs).ravel()
 
         axs[0].plot(losses["total"])
@@ -950,14 +984,17 @@ def launch_all(
             axs[j].axis("off")
 
         plt.tight_layout()
-        plt.savefig(f"{config.model.dir_path}{config.model.name}/loss.png")
+        loss_figure.savefig(os.path.join(_model_output_dir(config), "loss.png"))
         if config.test.run_napari:
             plt.show()
+        plt.close(loss_figure)
 
         n_plots = 3
         cols = 3
         rows = (n_plots + cols - 1) // cols
-        _, axs = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), sharex=True)
+        psnr_figure, axs = plt.subplots(
+            rows, cols, figsize=(5 * cols, 4 * rows), sharex=True
+        )
         axs = np.atleast_1d(axs).ravel()
         axs[0].set_title("PSNR")
         axs[0].set_xlabel("Epoch")
@@ -981,15 +1018,17 @@ def launch_all(
             axs[j].axis("off")
 
         plt.tight_layout()
-        plt.savefig(f"{config.model.dir_path}{config.model.name}/psnr.png")
+        psnr_figure.savefig(os.path.join(_model_output_dir(config), "psnr.png"))
         if config.test.run_napari:
             plt.show()
+        plt.close(psnr_figure)
 
         print("Evaluating model...")
         metrics = evaluate_model(model, test_loader, device)
         # Salviamo anche le curve di loss attive nel JSON metrics
         metrics["training_curves"] = losses
         metrics["params"] = params
+        metrics["trainable_params"] = sum(p.numel() for p in trainable_params)
         save_metrics(metrics, config)
 
         visualize_predictions(model, test_dataset, device, config)
@@ -1001,3 +1040,4 @@ def launch_all(
         import traceback
 
         traceback.print_exc()
+        raise

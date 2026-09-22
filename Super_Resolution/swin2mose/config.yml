@@ -1,0 +1,42 @@
+# NEW EXAMPLE: compact 5x Swin2MoSE run. Replace stats_file with statistics from calc_mean.py.
+model:
+  name: swin2mose_5x_example
+  dir_path: outputs/
+  scale: 5
+  img_size: 40
+  stats_file: ../channel_stats.json
+  patch_size: 1
+  num_feat: 16
+  embed_dim: 8
+  depths: [1]
+  num_heads: [2]
+  window_size: 8
+  mlp_ratio: 2.0
+  upsampler: pixelshuffledirect
+  resi_connection: 1conv
+  MoE_config:
+    num_experts: 2
+    k: 1
+    noisy_gating: false
+    with_noise: false
+train:
+  seed: 42
+  workers: 0
+  dataset_size: 100
+  augment_data: true
+  synthetic_data: false
+  batch_size: 1
+  epochs: 1
+  show_progress: true
+  use_moe_loss: true
+  loss_weights:
+    charb: 1.0
+    moe: 0.01
+test:
+  load_model: false
+  comune: Brisighella
+  dataset_size: 20
+  batch_size: 1
+  image_samples: 1
+  run_napari: false
+  synthetic_data: false
